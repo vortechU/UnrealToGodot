@@ -12,9 +12,329 @@ Usage:
 """
 
 import os
+import json
+import shutil
 import unreal
 
-def export_selected_static_meshes(export_dir=None, show_dialogs=True):
+def collect_textures_from_material(material, collected_textures):
+    if not material:
+        return
+        
+    visited = set()
+    
+    def _collect_recursive(mat):
+        if not mat or mat in visited:
+            return
+        visited.add(mat)
+        
+        is_instance = isinstance(mat, unreal.MaterialInstance)
+        if not is_instance and hasattr(unreal, "MaterialInstanceConstant"):
+            is_instance = isinstance(mat, unreal.MaterialInstanceConstant)
+            
+        if is_instance:
+            try:
+                textures = mat.get_editor_property("texture_parameter_values")
+                if textures:
+                    for t in textures:
+                        tex = t.parameter_value
+                        if tex and isinstance(tex, unreal.Texture):
+                            collected_textures.add(tex)
+            except Exception:
+                pass
+                
+            try:
+                parent = mat.get_editor_property("parent")
+                if parent:
+                    _collect_recursive(parent)
+            except Exception:
+                pass
+        else:
+            try:
+                expressions = mat.get_editor_property("expressions")
+                if expressions:
+                    for expr in expressions:
+                        if expr and hasattr(unreal, "MaterialExpressionTextureSample") and isinstance(expr, unreal.MaterialExpressionTextureSample):
+                            tex = expr.get_editor_property("texture")
+                            if tex and isinstance(tex, unreal.Texture):
+                                collected_textures.add(tex)
+            except Exception as e:
+                unreal.log_warning(f"Could not read expressions from base material {mat.get_name()}: {str(e)}")
+                
+    _collect_recursive(material)
+
+def matrix_to_quat(R):
+    """
+    Converts a 3x3 rotation matrix to a normalized quaternion (qx, qy, qz, qw).
+    """
+    tr = R[0][0] + R[1][1] + R[2][2]
+    if tr > 0.0:
+        s = max(0.0001, (tr + 1.0) ** 0.5 * 2.0)
+        qw = 0.25 * s
+        qx = (R[2][1] - R[1][2]) / s
+        qy = (R[0][2] - R[2][0]) / s
+        qz = (R[1][0] - R[0][1]) / s
+    elif (R[0][0] > R[1][1]) and (R[0][0] > R[2][2]):
+        s = max(0.0001, (1.0 + R[0][0] - R[1][1] - R[2][2]) ** 0.5 * 2.0)
+        qw = (R[2][1] - R[1][2]) / s
+        qx = 0.25 * s
+        qy = (R[0][1] + R[1][0]) / s
+        qz = (R[0][2] + R[2][0]) / s
+    elif R[1][1] > R[2][2]:
+        s = max(0.0001, (1.0 + R[1][1] - R[0][0] - R[2][2]) ** 0.5 * 2.0)
+        qw = (R[0][2] - R[2][0]) / s
+        qx = (R[0][1] + R[1][0]) / s
+        qy = 0.25 * s
+        qz = (R[1][2] + R[2][1]) / s
+    else:
+        s = max(0.0001, (1.0 + R[2][2] - R[0][0] - R[1][1]) ** 0.5 * 2.0)
+        qw = (R[1][0] - R[0][1]) / s
+        qx = (R[0][2] + R[2][0]) / s
+        qy = (R[1][2] + R[2][1]) / s
+        qz = 0.25 * s
+    
+    length = (qx**2 + qy**2 + qz**2 + qw**2) ** 0.5
+    if length > 0.0:
+        return (qx / length, qy / length, qz / length, qw / length)
+    return (0.0, 0.0, 0.0, 1.0)
+
+def unreal_to_godot_transform(u_transform):
+    """
+    Converts Unreal Transform to Godot Transform.
+    """
+    ux, uy, uz = u_transform.translation.x, u_transform.translation.y, u_transform.translation.z
+    godot_translation = [uy * 0.01, uz * 0.01, -ux * 0.01]
+    
+    usx, usy, usz = u_transform.scale3d.x, u_transform.scale3d.y, u_transform.scale3d.z
+    godot_scale = [usy, usz, usx]
+    
+    u_quat = u_transform.rotation
+    qx, qy, qz, qw = u_quat.x, u_quat.y, u_quat.z, u_quat.w
+    
+    r00 = 1.0 - 2.0 * (qy**2 + qz**2)
+    r01 = 2.0 * (qx*qy - qw*qz)
+    r02 = 2.0 * (qx*qz + qw*qy)
+    
+    r10 = 2.0 * (qx*qy + qw*qz)
+    r11 = 1.0 - 2.0 * (qx**2 + qz**2)
+    r12 = 2.0 * (qy*qz - qw*qx)
+    
+    r20 = 2.0 * (qx*qz - qw*qy)
+    r21 = 2.0 * (qy*qz + qw*qx)
+    r22 = 1.0 - 2.0 * (qx**2 + qy**2)
+    
+    rg00 = r11
+    rg01 = r12
+    rg02 = -r10
+    
+    rg10 = r21
+    rg11 = r22
+    rg12 = -r20
+    
+    rg20 = -r01
+    rg21 = -r02
+    rg22 = r00
+    
+    R_godot = [
+        [rg00, rg01, rg02],
+        [rg10, rg11, rg12],
+        [rg20, rg21, rg22]
+    ]
+    
+    g_quat = matrix_to_quat(R_godot)
+    return {
+        "translation": godot_translation,
+        "rotation_quat": list(g_quat),
+        "scale": godot_scale
+    }
+
+class _SimpleTransform:
+    def __init__(self, translation, rotation, scale3d):
+        self.translation = translation
+        self.rotation = rotation
+        self.scale3d = scale3d
+
+def local_shape_to_godot_transform(translation_vec, rotation_quat):
+    mock = _SimpleTransform(translation_vec, rotation_quat, unreal.Vector(1.0, 1.0, 1.0))
+    return unreal_to_godot_transform(mock)
+
+def extract_skeletal_mesh_physics(skeletal_mesh):
+    """
+    Extracts collision shape data from a SkeletalMesh's associated UPhysicsAsset.
+    """
+    if not hasattr(unreal, "SkeletalMesh") or not isinstance(skeletal_mesh, unreal.SkeletalMesh):
+        return None
+        
+    try:
+        physics_asset = skeletal_mesh.get_editor_property("physics_asset")
+        if not physics_asset:
+            return None
+            
+        body_setups = physics_asset.get_editor_property("skeletal_body_setups")
+        if not body_setups:
+            return None
+    except Exception as e:
+        unreal.log_warning(f"Failed to read physics asset from skeletal mesh {skeletal_mesh.get_name()}: {str(e)}")
+        return None
+        
+    physics_data = {
+        "mesh_name": skeletal_mesh.get_name(),
+        "physics_asset_name": physics_asset.get_name(),
+        "bodies": []
+    }
+    
+    for body_setup in body_setups:
+        bone_name = body_setup.get_editor_property("bone_name")
+        agg_geom = body_setup.get_editor_property("agg_geom")
+        
+        collision_data = {
+            "boxes": [],
+            "spheres": [],
+            "capsules": [],
+            "convex_hulls": []
+        }
+        
+        # 1. Box Elements
+        for box in agg_geom.box_elems:
+            center = box.get_editor_property("center")
+            rot = box.get_editor_property("rotation")
+            u_quat = rot.quaternion()
+            godot_local = local_shape_to_godot_transform(center, u_quat)
+            
+            collision_data["boxes"].append({
+                "size": [
+                    box.get_editor_property("x") * 2.0,
+                    box.get_editor_property("y") * 2.0,
+                    box.get_editor_property("z") * 2.0
+                ],
+                "godot_local_transform": godot_local
+            })
+            
+        # 2. Sphere Elements
+        for sphere in agg_geom.sphere_elems:
+            center = sphere.get_editor_property("center")
+            godot_local = local_shape_to_godot_transform(center, unreal.Quat(0.0, 0.0, 0.0, 1.0))
+            
+            collision_data["spheres"].append({
+                "radius": sphere.get_editor_property("radius"),
+                "godot_local_transform": godot_local
+            })
+            
+        # 3. Capsule (Sphyl) Elements
+        for capsule in agg_geom.sphyl_elems:
+            center = capsule.get_editor_property("center")
+            rot = capsule.get_editor_property("rotation")
+            u_quat = rot.quaternion()
+            godot_local = local_shape_to_godot_transform(center, u_quat)
+            
+            collision_data["capsules"].append({
+                "radius": capsule.get_editor_property("radius"),
+                "length": capsule.get_editor_property("length"),
+                "godot_local_transform": godot_local
+            })
+            
+        # 4. Convex Elements
+        for convex in agg_geom.convex_elems:
+            try:
+                center = convex.get_editor_property("center")
+                rot = convex.get_editor_property("rotation")
+                u_quat = rot.quaternion()
+                godot_local = local_shape_to_godot_transform(center, u_quat)
+                
+                vertices = []
+                vertex_data = convex.get_editor_property("vertex_data")
+                if vertex_data:
+                    for v in vertex_data:
+                        vertices.append([v.x, v.y, v.z])
+                        
+                collision_data["convex_hulls"].append({
+                    "vertices": vertices,
+                    "godot_local_transform": godot_local
+                })
+            except Exception as e:
+                unreal.log_warning(f"Failed to read convex hull element for bone {bone_name}: {str(e)}")
+                
+        has_collision = (
+            len(collision_data["boxes"]) > 0 or 
+            len(collision_data["spheres"]) > 0 or 
+            len(collision_data["capsules"]) > 0 or
+            len(collision_data["convex_hulls"]) > 0
+        )
+        
+        if has_collision:
+            physics_data["bodies"].append({
+                "bone_name": str(bone_name),
+                "shapes": collision_data
+            })
+            
+    return physics_data if physics_data["bodies"] else None
+
+def get_mesh_lod_count(mesh):
+    """
+    Returns the number of LOD levels for a StaticMesh or SkeletalMesh.
+    """
+    if isinstance(mesh, unreal.StaticMesh):
+        if hasattr(unreal, "EditorStaticMeshLibrary"):
+            return unreal.EditorStaticMeshLibrary.get_lod_count(mesh)
+        try:
+            return mesh.get_num_lods()
+        except Exception:
+            pass
+    elif hasattr(unreal, "SkeletalMesh") and isinstance(mesh, unreal.SkeletalMesh):
+        try:
+            lod_info = mesh.get_editor_property("lod_info")
+            if lod_info:
+                return len(lod_info)
+        except Exception:
+            pass
+    return 1
+
+def export_textures_for_meshes(meshes, export_dir, separate_textures=True):
+    collected_textures = set()
+    for mesh in meshes:
+        if isinstance(mesh, unreal.StaticMesh):
+            static_materials = mesh.get_editor_property("static_materials")
+            for static_mat in static_materials:
+                mat_interface = static_mat.material_interface
+                collect_textures_from_material(mat_interface, collected_textures)
+        elif hasattr(unreal, "SkeletalMesh") and isinstance(mesh, unreal.SkeletalMesh):
+            skeletal_materials = mesh.get_editor_property("materials")
+            for skel_mat in skeletal_materials:
+                mat_interface = skel_mat.material_interface
+                collect_textures_from_material(mat_interface, collected_textures)
+                
+    if not collected_textures:
+        return
+        
+    export_dir = os.path.normpath(export_dir)
+    if separate_textures:
+        parent_dir = os.path.dirname(export_dir)
+        textures_dir = os.path.join(parent_dir, "textures")
+    else:
+        textures_dir = export_dir
+    os.makedirs(textures_dir, exist_ok=True)
+    
+    tasks = []
+    for tex in collected_textures:
+        tex_name = tex.get_name()
+        filename = os.path.join(textures_dir, f"{tex_name}.png")
+        
+        task = unreal.AssetExportTask()
+        task.object = tex
+        task.filename = filename
+        task.automated = True
+        task.prompt = False
+        task.replace_identical = True
+        
+        if hasattr(unreal, "TextureExporterPNG"):
+            task.exporter = unreal.TextureExporterPNG()
+            
+        tasks.append(task)
+        
+    if tasks:
+        unreal.log(f"Exporting {len(tasks)} referenced textures to: {textures_dir}")
+        unreal.Exporter.run_asset_export_tasks(tasks)
+
+def export_selected_static_meshes(export_dir=None, export_animations=False, export_lods=False, separate_textures=True, show_dialogs=True):
     # 1. Check requirements
     if not hasattr(unreal, "GLTFExporter"):
         if show_dialogs:
@@ -26,7 +346,7 @@ def export_selected_static_meshes(export_dir=None, show_dialogs=True):
             )
         else:
             unreal.log_error("GLTFExporter plugin is not enabled.")
-        return False
+        return 0, 0
 
     if not hasattr(unreal, "EditorUtilityLibrary"):
         if show_dialogs:
@@ -38,7 +358,7 @@ def export_selected_static_meshes(export_dir=None, show_dialogs=True):
             )
         else:
             unreal.log_error("EditorUtilityLibrary is not enabled.")
-        return False
+        return 0, 0
 
     # 2. Get selected assets in Content Browser
     selected_assets = unreal.EditorUtilityLibrary.get_selected_assets()
@@ -60,7 +380,7 @@ def export_selected_static_meshes(export_dir=None, show_dialogs=True):
             )
         else:
             unreal.log_warning("No supported meshes (Static/Skeletal) selected in Content Browser.")
-        return False
+        return 0, 0
 
     # 3. Determine the export directory
     project_dir = os.path.realpath(unreal.Paths.project_dir())
@@ -82,7 +402,7 @@ def export_selected_static_meshes(export_dir=None, show_dialogs=True):
             
             if user_choice == unreal.AppReturnType.CANCEL:
                 unreal.log("glTF Export cancelled by user.")
-                return False
+                return 0, 0
                 
             export_dir = default_export_dir
             
@@ -99,7 +419,7 @@ def export_selected_static_meshes(export_dir=None, show_dialogs=True):
                     )
                     if fallback_choice != unreal.AppReturnType.YES:
                         unreal.log("glTF Export cancelled (no folder selected).")
-                        return False
+                        return 0, 0
         else:
             export_dir = default_export_dir
 
@@ -115,7 +435,7 @@ def export_selected_static_meshes(export_dir=None, show_dialogs=True):
             )
         else:
             unreal.log_error(f"Failed to create export directory {export_dir}: {str(e)}")
-        return False
+        return 0, 0
 
     # 4. Set up glTF Export Options
     export_options = unreal.GLTFExportOptions()
@@ -125,6 +445,8 @@ def export_selected_static_meshes(export_dir=None, show_dialogs=True):
     try:
         export_options.set_editor_property("adjust_normalmaps", True) # Fix normal maps convention
         export_options.set_editor_property("export_vertex_colors", True)
+        export_options.set_editor_property("export_materials", False) # Prevent crash on complex materials baking
+        export_options.set_editor_property("export_animation_sequences", export_animations) # Avoid heavy/crashing anim exports unless requested
     except Exception as e:
         unreal.log_warning(f"Could not configure some export options: {str(e)}")
 
@@ -145,25 +467,93 @@ def export_selected_static_meshes(export_dir=None, show_dialogs=True):
             mesh_name = mesh.get_name()
             slow_task.enter_progress_frame(1, f"Exporting: {mesh_name}")
             
-            export_path = os.path.join(export_dir, f"{mesh_name}.gltf")
-            
-            try:
-                # Perform the export
-                success = unreal.GLTFExporter.export_to_gltf(
-                    mesh,
-                    export_path,
-                    export_options,
-                    selected_actors
-                )
-                if success:
-                    exported_count += 1
-                    unreal.log(f"Successfully exported: {mesh_name} -> {export_path}")
+            # Determine how many LODs to export
+            lod_count = 1
+            if export_lods:
+                lod_count = get_mesh_lod_count(mesh)
+                
+            for lod_index in range(lod_count):
+                if lod_index == 0:
+                    export_path = os.path.join(export_dir, f"{mesh_name}.gltf")
                 else:
-                    failed_exports.append(mesh_name)
-                    unreal.log_error(f"Failed to export: {mesh_name}")
-            except Exception as e:
-                failed_exports.append(mesh_name)
-                unreal.log_error(f"Error exporting {mesh_name}: {str(e)}")
+                    export_path = os.path.join(export_dir, f"{mesh_name}_LOD{lod_index}.gltf")
+                    
+                # Configure the export options for the current LOD level
+                try:
+                    export_options.set_editor_property("default_level_of_detail", lod_index)
+                except Exception as e:
+                    unreal.log_warning(f"Could not set default_level_of_detail to {lod_index}: {str(e)}")
+                    
+                try:
+                    # Perform the export with instance fallback safety
+                    success = False
+                    try:
+                        success = unreal.GLTFExporter.export_to_gltf(
+                            mesh,
+                            export_path,
+                            export_options,
+                            selected_actors
+                        )
+                    except (TypeError, AttributeError):
+                        exporter = unreal.GLTFExporter()
+                        success = exporter.export_to_gltf(
+                            mesh,
+                            export_path,
+                            export_options,
+                            selected_actors
+                        )
+                    if success:
+                        exported_count += 1
+                        unreal.log(f"Successfully exported LOD {lod_index}: {mesh_name} -> {export_path}")
+                        
+                        # Only export Physics Asset for LOD 0
+                        if lod_index == 0:
+                            # Try exporting Physics Asset companion if it is a skeletal mesh
+                            if hasattr(unreal, "SkeletalMesh") and isinstance(mesh, unreal.SkeletalMesh):
+                                try:
+                                    physics_data = extract_skeletal_mesh_physics(mesh)
+                                    if physics_data:
+                                        physics_path = os.path.join(export_dir, f"{mesh_name}_physics.json")
+                                        with open(physics_path, "w", encoding="utf-8") as pf:
+                                            json.dump(physics_data, pf, indent=4)
+                                        unreal.log(f"Exported Skeletal Mesh Physics Asset to: {physics_path}")
+                                except Exception as pe:
+                                    unreal.log_warning(f"Failed to export physics asset for {mesh_name}: {str(pe)}")
+                    else:
+                        failed_exports.append(f"{mesh_name}_LOD{lod_index}" if lod_index > 0 else mesh_name)
+                        unreal.log_error(f"Failed to export: {mesh_name} LOD {lod_index}")
+                except Exception as e:
+                    failed_exports.append(f"{mesh_name}_LOD{lod_index}" if lod_index > 0 else mesh_name)
+                    unreal.log_error(f"Error exporting {mesh_name} LOD {lod_index}: {str(e)}")
+
+    # Automatically export referenced textures
+    if exported_count > 0:
+        try:
+            export_textures_for_meshes(meshes_to_export, export_dir, separate_textures)
+        except Exception as tex_err:
+            unreal.log_warning(f"Failed to export textures for meshes: {str(tex_err)}")
+
+        if separate_textures:
+            # Post-export safety relocator: move any PNG textures generated by the glTF exporter
+            # inside the GLTF/ folder to the sibling textures/ folder.
+            try:
+                clean_export_dir = os.path.normpath(export_dir)
+                parent_dir = os.path.dirname(clean_export_dir)
+                textures_dir = os.path.join(parent_dir, "textures")
+                os.makedirs(textures_dir, exist_ok=True)
+                
+                if os.path.exists(clean_export_dir):
+                    for filename in os.listdir(clean_export_dir):
+                        if filename.lower().endswith(".png"):
+                            src_path = os.path.join(clean_export_dir, filename)
+                            dest_path = os.path.join(textures_dir, filename)
+                            try:
+                                shutil.move(src_path, dest_path)
+                                unreal.log(f"Relocated baked texture: {filename} -> {textures_dir}")
+                            except Exception as move_err:
+                                unreal.log_warning(f"Failed to relocate baked texture {filename}: {str(move_err)}")
+            except Exception as scan_err:
+                unreal.log_warning(f"Failed to scan and relocate baked textures: {str(scan_err)}")
 
     # 6. Show summary to user
     if show_dialogs:
@@ -205,7 +595,7 @@ def prompt_for_folder(initial_dir):
         unreal.log_warning(f"Could not open directory browser dialog via tkinter: {str(e)}")
     return None
 
-def export_all_level_meshes(export_dir=None, show_dialogs=True):
+def export_all_level_meshes(export_dir=None, export_animations=False, export_lods=False, separate_textures=True, show_dialogs=True):
     # 1. Check requirements
     if not hasattr(unreal, "GLTFExporter"):
         if show_dialogs:
@@ -275,6 +665,8 @@ def export_all_level_meshes(export_dir=None, show_dialogs=True):
     try:
         export_options.set_editor_property("adjust_normalmaps", True)
         export_options.set_editor_property("export_vertex_colors", True)
+        export_options.set_editor_property("export_materials", False)
+        export_options.set_editor_property("export_animation_sequences", export_animations)
     except Exception:
         pass
 
@@ -293,22 +685,89 @@ def export_all_level_meshes(export_dir=None, show_dialogs=True):
             mesh_name = mesh.get_name()
             slow_task.enter_progress_frame(1, f"Exporting: {mesh_name}")
             
-            export_path = os.path.join(export_dir, f"{mesh_name}.gltf")
-            
-            try:
-                success = unreal.GLTFExporter.export_to_gltf(
-                    mesh,
-                    export_path,
-                    export_options,
-                    selected_actors
-                )
-                if success:
-                    exported_count += 1
+            # Determine how many LODs to export
+            lod_count = 1
+            if export_lods:
+                lod_count = get_mesh_lod_count(mesh)
+                
+            for lod_index in range(lod_count):
+                if lod_index == 0:
+                    export_path = os.path.join(export_dir, f"{mesh_name}.gltf")
                 else:
-                    failed_exports.append(mesh_name)
-            except Exception as e:
-                failed_exports.append(mesh_name)
-                unreal.log_error(f"Error exporting {mesh_name}: {str(e)}")
+                    export_path = os.path.join(export_dir, f"{mesh_name}_LOD{lod_index}.gltf")
+                    
+                # Configure the export options for the current LOD level
+                try:
+                    export_options.set_editor_property("default_level_of_detail", lod_index)
+                except Exception as e:
+                    unreal.log_warning(f"Could not set default_level_of_detail to {lod_index}: {str(e)}")
+                    
+                try:
+                    success = False
+                    try:
+                        success = unreal.GLTFExporter.export_to_gltf(
+                            mesh,
+                            export_path,
+                            export_options,
+                            selected_actors
+                        )
+                    except (TypeError, AttributeError):
+                        exporter = unreal.GLTFExporter()
+                        success = exporter.export_to_gltf(
+                            mesh,
+                            export_path,
+                            export_options,
+                            selected_actors
+                        )
+                    if success:
+                        exported_count += 1
+                        # Only export Physics Asset for LOD 0
+                        if lod_index == 0:
+                            # Try exporting Physics Asset companion if it is a skeletal mesh
+                            if hasattr(unreal, "SkeletalMesh") and isinstance(mesh, unreal.SkeletalMesh):
+                                try:
+                                    physics_data = extract_skeletal_mesh_physics(mesh)
+                                    if physics_data:
+                                        physics_path = os.path.join(export_dir, f"{mesh_name}_physics.json")
+                                        with open(physics_path, "w", encoding="utf-8") as pf:
+                                            json.dump(physics_data, pf, indent=4)
+                                        unreal.log(f"Exported Skeletal Mesh Physics Asset to: {physics_path}")
+                                except Exception as pe:
+                                    unreal.log_warning(f"Failed to export physics asset for {mesh_name}: {str(pe)}")
+                    else:
+                        failed_exports.append(f"{mesh_name}_LOD{lod_index}" if lod_index > 0 else mesh_name)
+                except Exception as e:
+                    failed_exports.append(f"{mesh_name}_LOD{lod_index}" if lod_index > 0 else mesh_name)
+                    unreal.log_error(f"Error exporting {mesh_name} LOD {lod_index}: {str(e)}")
+
+    # Automatically export referenced textures
+    if exported_count > 0:
+        try:
+            export_textures_for_meshes(meshes_to_export, export_dir, separate_textures)
+        except Exception as tex_err:
+            unreal.log_warning(f"Failed to export textures for meshes: {str(tex_err)}")
+
+        if separate_textures:
+            # Post-export safety relocator: move any PNG textures generated by the glTF exporter
+            # inside the GLTF/ folder to the sibling textures/ folder.
+            try:
+                clean_export_dir = os.path.normpath(export_dir)
+                parent_dir = os.path.dirname(clean_export_dir)
+                textures_dir = os.path.join(parent_dir, "textures")
+                os.makedirs(textures_dir, exist_ok=True)
+                
+                if os.path.exists(clean_export_dir):
+                    for filename in os.listdir(clean_export_dir):
+                        if filename.lower().endswith(".png"):
+                            src_path = os.path.join(clean_export_dir, filename)
+                            dest_path = os.path.join(textures_dir, filename)
+                            try:
+                                shutil.move(src_path, dest_path)
+                                unreal.log(f"Relocated baked texture: {filename} -> {textures_dir}")
+                            except Exception as move_err:
+                                unreal.log_warning(f"Failed to relocate baked texture {filename}: {str(move_err)}")
+            except Exception as scan_err:
+                unreal.log_warning(f"Failed to scan and relocate baked textures: {str(scan_err)}")
 
     if show_dialogs:
         summary_message = f"Successfully exported {exported_count} of {len(meshes_to_export)} level mesh(es) to:\n{export_dir}"

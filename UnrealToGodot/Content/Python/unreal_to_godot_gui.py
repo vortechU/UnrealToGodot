@@ -30,14 +30,12 @@ class UnrealToGodotApp:
         self.project_dir = project_dir
         self.root = tk.Tk()
         self.root.title("Unreal ➔ Godot Exporter")
-        self.root.geometry("520x450")
+        self.root.geometry("520x540")
         self.root.configure(bg="#1e1e1e")
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
         
-        # Bring window to front
-        self.root.lift()
+        # Keep window permanently on top of the Unreal Editor
         self.root.attributes("-topmost", True)
-        self.root.after_idle(self.root.attributes, "-topmost", False)
         
         # Initialize UI layout
         self.init_ui()
@@ -129,6 +127,51 @@ class UnrealToGodotApp:
             command=self.browse_mesh_folder
         )
         browse_mesh_btn.pack(side=tk.LEFT, padx=(6, 0))
+        
+        # Checkbox for Animation Sequences
+        self.export_anims_var = tk.BooleanVar(value=False)
+        self.export_anims_cb = tk.Checkbutton(
+            mesh_inner,
+            text="Export Animation Sequences (Skeletal Meshes)",
+            variable=self.export_anims_var,
+            fg="#ffffff",
+            bg="#1e1e1e",
+            activebackground="#1e1e1e",
+            activeforeground="#ffffff",
+            selectcolor="#121212",
+            font=("Segoe UI", 9)
+        )
+        self.export_anims_cb.pack(anchor=tk.W, pady=(6, 0))
+        
+        # Checkbox for LOD Levels
+        self.export_lods_var = tk.BooleanVar(value=False)
+        self.export_lods_cb = tk.Checkbutton(
+            mesh_inner,
+            text="Export LOD Levels (Separate glTF Files)",
+            variable=self.export_lods_var,
+            fg="#ffffff",
+            bg="#1e1e1e",
+            activebackground="#1e1e1e",
+            activeforeground="#ffffff",
+            selectcolor="#121212",
+            font=("Segoe UI", 9)
+        )
+        self.export_lods_cb.pack(anchor=tk.W, pady=(4, 0))
+        
+        # Checkbox for Separate Textures Folder
+        self.separate_textures_var = tk.BooleanVar(value=True)
+        self.separate_textures_cb = tk.Checkbutton(
+            mesh_inner,
+            text="Export Textures to Sibling Folder",
+            variable=self.separate_textures_var,
+            fg="#ffffff",
+            bg="#1e1e1e",
+            activebackground="#1e1e1e",
+            activeforeground="#ffffff",
+            selectcolor="#121212",
+            font=("Segoe UI", 9)
+        )
+        self.separate_textures_cb.pack(anchor=tk.W, pady=(4, 0))
         
         self.export_mesh_btn = tk.Button(
             mesh_inner, 
@@ -244,39 +287,45 @@ class UnrealToGodotApp:
             return
             
         try:
-            state = None
-            # Keep popping to consume the latest state packet
+            latest_selection_count = None
+            latest_level_name = None
+            
+            # Process all pending packets in the queue
             while not _state_queue.empty():
-                state = _state_queue.get_nowait()
+                packet = _state_queue.get_nowait()
+                if not packet:
+                    continue
                 
-            if state:
-                # Update static mesh selection label
-                if "selection_count" in state:
-                    count = state["selection_count"]
-                    self.selection_lbl.config(text=f"Selected Content Browser Assets: {count} Mesh(es)")
-                    if count > 0:
-                        self.export_mesh_btn.config(state=tk.NORMAL)
-                    else:
-                        self.export_mesh_btn.config(state=tk.DISABLED)
-                
-                # Update level label and dynamically adjust JSON path default
-                if "level_name" in state:
-                    world_name = state["level_name"]
-                    self.level_lbl.config(text=f"Active Level: {world_name}")
-                    
-                    current_path = self.layout_path_entry.get()
-                    if current_path and world_name != "UntitledLevel" and "_layout.json" in current_path:
-                        parent_dir = os.path.dirname(current_path)
-                        expected_filename = f"{world_name}_layout.json"
-                        if os.path.basename(current_path) != expected_filename:
-                            self.layout_path_entry.delete(0, tk.END)
-                            self.layout_path_entry.insert(0, os.path.join(parent_dir, expected_filename))
-                            
-                # Update status message if sent from main thread
-                if "status" in state:
-                    msg, status_type = state["status"]
+                # If this packet contains a status message, show it immediately
+                if "status" in packet:
+                    msg, status_type = packet["status"]
                     self.show_status(msg, status_type)
                     
+                # Accumulate the latest selection and level details
+                if "selection_count" in packet:
+                    latest_selection_count = packet["selection_count"]
+                if "level_name" in packet:
+                    latest_level_name = packet["level_name"]
+            
+            # Apply the accumulated latest state details
+            if latest_selection_count is not None:
+                self.selection_lbl.config(text=f"Selected Content Browser Assets: {latest_selection_count} Mesh(es)")
+                if latest_selection_count > 0:
+                    self.export_mesh_btn.config(state=tk.NORMAL)
+                else:
+                    self.export_mesh_btn.config(state=tk.DISABLED)
+                    
+            if latest_level_name is not None:
+                self.level_lbl.config(text=f"Active Level: {latest_level_name}")
+                
+                current_path = self.layout_path_entry.get()
+                if current_path and latest_level_name != "UntitledLevel" and "_layout.json" in current_path:
+                    parent_dir = os.path.dirname(current_path)
+                    expected_filename = f"{latest_level_name}_layout.json"
+                    if os.path.basename(current_path) != expected_filename:
+                        self.layout_path_entry.delete(0, tk.END)
+                        self.layout_path_entry.insert(0, os.path.join(parent_dir, expected_filename))
+                        
         except Exception:
             pass
             
@@ -323,9 +372,12 @@ class UnrealToGodotApp:
             self.show_status("Error: Please select a valid target directory first.", "error")
             return
             
+        export_anims = self.export_anims_var.get()
+        export_lods = self.export_lods_var.get()
+        separate_tex = self.separate_textures_var.get()
         self.show_status("Export command sent to Unreal...")
         # Queue the export meshes command to run on main thread
-        _command_queue.put(("export_meshes", [export_dir]))
+        _command_queue.put(("export_meshes", [export_dir, export_anims, export_lods, separate_tex]))
 
     def run_all_meshes_export(self):
         export_dir = self.mesh_path_entry.get()
@@ -333,9 +385,12 @@ class UnrealToGodotApp:
             self.show_status("Error: Please select a valid target directory first.", "error")
             return
             
+        export_anims = self.export_anims_var.get()
+        export_lods = self.export_lods_var.get()
+        separate_tex = self.separate_textures_var.get()
         self.show_status("Batch export command sent to Unreal...")
         # Queue the export all meshes command to run on main thread
-        _command_queue.put(("export_all_meshes", [export_dir]))
+        _command_queue.put(("export_all_meshes", [export_dir, export_anims, export_lods, separate_tex]))
 
     def run_layout_export(self):
         save_path = self.layout_path_entry.get()
@@ -396,13 +451,6 @@ def check_editor_queues(delta_time):
             "level_name": world_name
         }
         
-        # Flush older states to keep the queue fresh
-        while not _state_queue.empty():
-            try:
-                _state_queue.get_nowait()
-            except queue.Empty:
-                break
-                
         _state_queue.put(state)
     except Exception:
         pass
@@ -414,10 +462,13 @@ def check_editor_queues(delta_time):
             
             if cmd == "export_meshes":
                 export_dir = args[0]
+                export_anims = args[1] if len(args) > 1 else False
+                export_lods = args[2] if len(args) > 2 else False
+                separate_tex = args[3] if len(args) > 3 else True
                 unreal.log("Unreal to Godot Exporter: Starting mesh export on main thread...")
                 try:
                     exported, failed = export_static_meshes_to_gltf.export_selected_static_meshes(
-                        export_dir=export_dir, show_dialogs=False
+                        export_dir=export_dir, export_animations=export_anims, export_lods=export_lods, separate_textures=separate_tex, show_dialogs=False
                     )
                     if failed > 0:
                         _state_queue.put({"status": (f"Export completed: {exported} exported, {failed} failed.", "warning")})
@@ -428,10 +479,13 @@ def check_editor_queues(delta_time):
                     
             elif cmd == "export_all_meshes":
                 export_dir = args[0]
+                export_anims = args[1] if len(args) > 1 else False
+                export_lods = args[2] if len(args) > 2 else False
+                separate_tex = args[3] if len(args) > 3 else True
                 unreal.log("Unreal to Godot Exporter: Starting batch level mesh export on main thread...")
                 try:
                     exported, failed = export_static_meshes_to_gltf.export_all_level_meshes(
-                        export_dir=export_dir, show_dialogs=False
+                        export_dir=export_dir, export_animations=export_anims, export_lods=export_lods, separate_textures=separate_tex, show_dialogs=False
                     )
                     if failed > 0:
                         _state_queue.put({"status": (f"Batch export completed: {exported} exported, {failed} failed.", "warning")})
@@ -460,8 +514,6 @@ def check_editor_queues(delta_time):
                     unreal.unregister_slate_post_tick_callback(_tick_handle)
                     _tick_handle = None
                 unreal.log("Unreal to Godot Exporter: Unregistered Slate tick callback.")
-                
-            _command_queue.task_done()
     except Exception as e:
         unreal.log_warning(f"Unreal to Godot Exporter: Error checking command queue: {str(e)}")
 
@@ -470,6 +522,11 @@ def show_window():
     """Launches the Tkinter GUI thread and registers the Slate tick queue handler."""
     global _tick_handle, _gui_thread
     
+    # 0. Check if thread/GUI is already running
+    if _gui_thread is not None and _gui_thread.is_alive():
+        unreal.log_warning("Unreal to Godot Exporter: GUI window is already open/running.")
+        return
+        
     # 1. Clean up any previous tick hooks
     if _tick_handle is not None:
         try:
@@ -505,6 +562,12 @@ def _do_register_menu():
         if not window_menu:
             unreal.log_warning("Unreal to Godot Exporter: Could not find Window menu.")
             return
+            
+        # Remove duplicate menu entry if already registered from previous import
+        try:
+            window_menu.remove_menu_entry("UnrealToGodotExporter")
+        except Exception:
+            pass
             
         # Register menu entry
         entry = unreal.ToolMenuEntry(

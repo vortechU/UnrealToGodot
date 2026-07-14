@@ -24,6 +24,7 @@ var USE_GDSCRIPT_TRANSFORM_CONVERSION: bool = false
 var material_cache: Dictionary = {}
 var active_scene_root: Node
 var active_textures_folder: String
+var active_models_folder: String
 
 func _run() -> void:
 	# Standalone EditorScript execution entry point
@@ -36,6 +37,7 @@ func _run() -> void:
 func do_import(json_path: String, models_folder: String, textures_folder: String, scene_root: Node) -> bool:
 	active_scene_root = scene_root
 	active_textures_folder = textures_folder
+	active_models_folder = models_folder
 	
 	# Open and read the JSON file
 	if not FileAccess.file_exists(json_path):
@@ -123,6 +125,9 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					_set_owner_recursive(instanced_mesh, active_scene_root)
 					instanced_mesh.global_transform = actor_transform
 				imported_count += 1
+			else:
+				if physics_body:
+					physics_body.queue_free()
 		else:
 			# Multi-mesh Blueprint actor
 			var actor_node := Node3D.new()
@@ -131,6 +136,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 			actor_node.owner = active_scene_root
 			actor_node.global_transform = actor_transform
 			
+			var any_component_succeeded := false
 			for comp_data in components:
 				var comp_name: String = comp_data.get("name", "Component")
 				var mesh_name: String = comp_data.get("mesh_name", "")
@@ -156,6 +162,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 				var physics_body = setup_physics_body(actor_node, comp_name, comp_transform, mesh_name, meshes_lib)
 				var instanced_mesh = instance_gltf(gltf_path)
 				if instanced_mesh:
+					any_component_succeeded = true
 					# Apply materials to mesh instance
 					var overrides = comp_data.get("material_overrides", [])
 					apply_materials_to_instance(instanced_mesh, mesh_name, overrides, meshes_lib)
@@ -173,8 +180,14 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 						instanced_mesh.owner = active_scene_root
 						_set_owner_recursive(instanced_mesh, active_scene_root)
 						instanced_mesh.transform = comp_transform
+				else:
+					if physics_body:
+						physics_body.queue_free()
 					
-			imported_count += 1
+			if actor_node.get_child_count() > 0:
+				imported_count += 1
+			else:
+				actor_node.queue_free()
 			
 	# Summary reporting
 	print("\n=================== IMPORT SUMMARY ===================")
@@ -200,10 +213,22 @@ func find_gltf_path(folder: String, mesh_name: String) -> String:
 	return ""
 
 func instance_gltf(gltf_path: String) -> Node3D:
-	"""Loads and instances a glTF scene."""
-	var gltf_scene = load(gltf_path)
-	if gltf_scene:
-		return gltf_scene.instantiate() as Node3D
+	"""Loads and instances a glTF scene, supporting both resource load and external files."""
+	if gltf_path.begins_with("res://"):
+		var gltf_scene = load(gltf_path)
+		if gltf_scene:
+			return gltf_scene.instantiate() as Node3D
+	
+	# Fallback for external paths or if load fails
+	print("Warning: Loading external glTF model: ", gltf_path, ". It is highly recommended to place glTF assets within the 'res://' directory to ensure correct scene serialization, skinning, and to prevent editor lag/crashes.")
+	var doc := GLTFDocument.new()
+	var state := GLTFState.new()
+	var err = doc.append_from_file(gltf_path, state)
+	if err == OK:
+		return doc.generate_scene(state) as Node3D
+	else:
+		printerr("Failed to load external glTF model: ", gltf_path, " Error code: ", err)
+	
 	return null
 
 func create_placeholder(parent: Node, name_str: String, local_transform: Transform3D, mesh_name: String) -> void:
@@ -214,23 +239,45 @@ func create_placeholder(parent: Node, name_str: String, local_transform: Transfo
 	marker.owner = active_scene_root
 	marker.transform = local_transform
 	# Print to console
-	print("Created placeholder for missing mesh: ", mesh_name, " at ", marker.global_position)
+	print("Created placeholder for missing mesh: ", mesh_name, " at local position: ", local_transform.origin)
 
 func _set_owner_recursive(node: Node, owner: Node) -> void:
 	"""Recursively sets the owner on all descendants so they persist in the saved scene."""
+	# If this node is a scene instance, we do not traverse into its children!
+	# Godot will serialize it as an instance of the sub-scene.
+	if node != owner and node.scene_file_path != "":
+		return
+		
 	for child in node.get_children():
+		# Skip nodes that are already part of an inherited sub-scene/instance
+		if child.owner != null:
+			continue
 		child.owner = owner
 		_set_owner_recursive(child, owner)
 
 func get_transform_from_dict(t_dict: Dictionary) -> Transform3D:
 	"""Constructs a Transform3D from a JSON transform dictionary."""
-	var trans_arr: Array = t_dict["translation"]
-	var quat_arr: Array = t_dict["rotation_quat"]
-	var scale_arr: Array = t_dict["scale"]
+	var trans_arr: Array = t_dict.get("translation", [0.0, 0.0, 0.0])
+	var quat_arr: Array = t_dict.get("rotation_quat", [0.0, 0.0, 0.0, 1.0])
+	var scale_arr: Array = t_dict.get("scale", [1.0, 1.0, 1.0])
 	
-	var translation := Vector3(trans_arr[0], trans_arr[1], trans_arr[2])
-	var quat := Quaternion(quat_arr[0], quat_arr[1], quat_arr[2], quat_arr[3])
-	var scale := Vector3(scale_arr[0], scale_arr[1], scale_arr[2])
+	# Verify size of arrays to prevent index out of bounds
+	var tx = trans_arr[0] if trans_arr.size() > 0 else 0.0
+	var ty = trans_arr[1] if trans_arr.size() > 1 else 0.0
+	var tz = trans_arr[2] if trans_arr.size() > 2 else 0.0
+	
+	var qx = quat_arr[0] if quat_arr.size() > 0 else 0.0
+	var qy = quat_arr[1] if quat_arr.size() > 1 else 0.0
+	var qz = quat_arr[2] if quat_arr.size() > 2 else 0.0
+	var qw = quat_arr[3] if quat_arr.size() > 3 else 1.0
+	
+	var sx = scale_arr[0] if scale_arr.size() > 0 else 1.0
+	var sy = scale_arr[1] if scale_arr.size() > 1 else 1.0
+	var sz = scale_arr[2] if scale_arr.size() > 2 else 1.0
+	
+	var translation := Vector3(tx, ty, tz)
+	var quat := Quaternion(qx, qy, qz, qw)
+	var scale := Vector3(sx, sy, sz)
 	
 	var basis := Basis(quat).scaled(scale)
 	return Transform3D(basis, translation)
@@ -242,17 +289,23 @@ func convert_unreal_to_godot_transform(u_loc: Array, u_rot_quat: Array, u_scale:
 	- Centimeter to Meter scale conversion (x 0.01).
 	- Remaps rotation matrix columns to correct axes.
 	"""
-	# 1. Translation: cm -> meters and axes swap
-	var translation = Vector3(u_loc[1] * 0.01, u_loc[2] * 0.01, -u_loc[0] * 0.01)
+	# 1. Translation: cm -> meters and axes swap with safety bounds checks
+	var ux = u_loc[0] if u_loc.size() > 0 else 0.0
+	var uy = u_loc[1] if u_loc.size() > 1 else 0.0
+	var uz = u_loc[2] if u_loc.size() > 2 else 0.0
+	var translation := Vector3(uy * 0.01, uz * 0.01, -ux * 0.01)
 	
-	# 2. Scale axes swap
-	var scale = Vector3(u_scale[1], u_scale[2], u_scale[0])
+	# 2. Scale axes swap with safety bounds checks
+	var sx = u_scale[0] if u_scale.size() > 0 else 1.0
+	var sy = u_scale[1] if u_scale.size() > 1 else 1.0
+	var sz = u_scale[2] if u_scale.size() > 2 else 1.0
+	var scale := Vector3(sy, sz, sx)
 	
-	# 3. Rotation (Remap 3x3 Basis using C * R_unreal * C^T)
-	var qx: float = u_rot_quat[0]
-	var qy: float = u_rot_quat[1]
-	var qz: float = u_rot_quat[2]
-	var qw: float = u_rot_quat[3]
+	# 3. Rotation (Remap 3x3 Basis using C * R_unreal * C^T) with safety bounds checks
+	var qx: float = u_rot_quat[0] if u_rot_quat.size() > 0 else 0.0
+	var qy: float = u_rot_quat[1] if u_rot_quat.size() > 1 else 0.0
+	var qz: float = u_rot_quat[2] if u_rot_quat.size() > 2 else 0.0
+	var qw: float = u_rot_quat[3] if u_rot_quat.size() > 3 else 1.0
 	
 	# Unreal Quat -> 3x3 Matrix
 	var r00 = 1.0 - 2.0 * (qy*qy + qz*qz)
@@ -377,51 +430,62 @@ func setup_physics_body(parent: Node, node_name: String, transform: Transform3D,
 func apply_materials_to_instance(instanced_mesh: Node3D, mesh_name: String, override_mats: Array, meshes_lib: Dictionary) -> void:
 	"""
 	Compiles and applies default and overridden materials to all child MeshInstance3D nodes
-	found inside the instanced scene root.
+	found inside the instanced scene root, matching by material name and slot.
+	Override materials (per-instance) always create fresh materials to support unique colors.
+	Default materials (shared base) use the material cache for efficiency.
 	"""
 	var mesh_data: Dictionary = meshes_lib.get(mesh_name, {})
 	var default_mats: Array = mesh_data.get("materials", [])
 	
-	if default_mats.size() == 0 and override_mats.size() == 0:
-		return # No material data to map
-		
-	# Compile active materials map (slot_index -> StandardMaterial3D)
-	var active_materials: Dictionary = {}
-	
-	# 1. Map default materials
-	for mat_data in default_mats:
-		var slot_idx: int = int(mat_data["slot_index"])
-		var mat_name: String = mat_data["material_name"]
-		var mat_path: String = mat_data["material_path"]
-		var params = mat_data.get("parameters", null)
-		
-		if params:
-			var godot_mat = get_or_create_material(mat_name, mat_path, params)
-			active_materials[slot_idx] = godot_mat
-			
-	# 2. Map overridden materials
-	for mat_data in override_mats:
-		var slot_idx: int = int(mat_data["slot_index"])
-		var mat_name: String = mat_data["material_name"]
-		var mat_path: String = mat_data["material_path"]
-		var params = mat_data.get("parameters", null)
-		
-		if params:
-			var godot_mat = get_or_create_material(mat_name, mat_path, params)
-			active_materials[slot_idx] = godot_mat
-			
-	# 3. Find all MeshInstance3D nodes recursively inside the sub-tree
+	# 1. Find all MeshInstance3D nodes recursively inside the sub-tree
 	var mesh_instances: Array[MeshInstance3D] = []
 	_find_mesh_instances_recursive(instanced_mesh, mesh_instances)
 	
-	# 4. Apply surface overrides
+	# Helper to find a material entry in a list by name or slot index
+	var find_in_list = func(mat_list: Array, mat_name: String, slot_idx: int) -> Dictionary:
+		# By name first
+		for mat in mat_list:
+			var o_name: String = mat.get("material_name", "")
+			if o_name != "" and o_name.to_lower() == mat_name.to_lower():
+				return mat
+		# By slot index
+		for mat in mat_list:
+			if int(mat.get("slot_index", -1)) == slot_idx:
+				return mat
+		return {}
+
+	# Apply overrides on a per-MeshInstance3D basis
 	for mesh_inst in mesh_instances:
 		if not mesh_inst.mesh:
 			continue
 		var surface_count: int = mesh_inst.mesh.get_surface_count()
-		for slot_idx in active_materials.keys():
-			if slot_idx < surface_count:
-				mesh_inst.set_surface_override_material(slot_idx, active_materials[slot_idx])
+		for slot_idx in range(surface_count):
+			var existing_mat = mesh_inst.get_active_material(slot_idx)
+			if not existing_mat:
+				existing_mat = mesh_inst.mesh.surface_get_material(slot_idx)
+				
+			var mat_name = ""
+			if existing_mat:
+				mat_name = existing_mat.resource_name
+			
+			# Check override_mats first (per-instance unique, SKIP cache)
+			var override_data = find_in_list.call(override_mats, mat_name, slot_idx)
+			if override_data.size() > 0:
+				var params = override_data.get("parameters", {})
+				if params:
+					var godot_mat = create_godot_material(params, existing_mat)
+					godot_mat.resource_name = mat_name
+					mesh_inst.set_surface_override_material(slot_idx, godot_mat)
+				continue
+			
+			# Check default_mats (shared base, USE cache)
+			var default_data = find_in_list.call(default_mats, mat_name, slot_idx)
+			if default_data.size() > 0:
+				var mat_path = default_data.get("material_path", "")
+				var params = default_data.get("parameters", {})
+				if params:
+					var godot_mat = get_or_create_material(mat_name, mat_path, params, existing_mat)
+					mesh_inst.set_surface_override_material(slot_idx, godot_mat)
 
 func _find_mesh_instances_recursive(node: Node, list: Array[MeshInstance3D]) -> void:
 	"""Recursively finds all MeshInstance3D nodes in a node tree."""
@@ -430,9 +494,9 @@ func _find_mesh_instances_recursive(node: Node, list: Array[MeshInstance3D]) -> 
 	for child in node.get_children():
 		_find_mesh_instances_recursive(child, list)
 
-func get_or_create_material(mat_name: String, mat_path: String, params: Dictionary) -> StandardMaterial3D:
+func get_or_create_material(mat_name: String, mat_path: String, params: Dictionary, existing_mat: Material = null) -> BaseMaterial3D:
 	"""
-	Material instantiation cache manager. Reuses existing StandardMaterial3D instances
+	Material instantiation cache manager. Reuses existing StandardMaterial3D/ORMMaterial3D instances
 	by path or name to preserve shared materials across mesh instances.
 	"""
 	if mat_path != "None" and material_cache.has(mat_path):
@@ -440,7 +504,7 @@ func get_or_create_material(mat_name: String, mat_path: String, params: Dictiona
 	if mat_name != "None" and material_cache.has(mat_name):
 		return material_cache[mat_name]
 		
-	var mat = create_godot_material(params)
+	var mat = create_godot_material(params, existing_mat)
 	mat.resource_name = mat_name
 	
 	if mat_path != "None":
@@ -450,12 +514,17 @@ func get_or_create_material(mat_name: String, mat_path: String, params: Dictiona
 		
 	return mat
 
-func create_godot_material(params: Dictionary) -> StandardMaterial3D:
+func create_godot_material(params: Dictionary, existing_mat: Material = null) -> BaseMaterial3D:
 	"""
-	Creates a new StandardMaterial3D, maps Unreal scalar/vector settings to Godot,
-	and attempts to find and bind bulk-exported texture files in the textures directory.
+	Creates a new StandardMaterial3D (or duplicates existing_mat if it is a BaseMaterial3D),
+	maps Unreal scalar/vector settings to Godot, and attempts to find and bind
+	bulk-exported texture files in the textures or models directory.
 	"""
-	var mat := StandardMaterial3D.new()
+	var mat: BaseMaterial3D
+	if existing_mat and existing_mat is BaseMaterial3D:
+		mat = existing_mat.duplicate()
+	else:
+		mat = StandardMaterial3D.new()
 	
 	# 1. Map Albedo color
 	var color_arr: Array = params.get("albedo_color", [1.0, 1.0, 1.0, 1.0])
@@ -469,8 +538,7 @@ func create_godot_material(params: Dictionary) -> StandardMaterial3D:
 	var tiling_arr: Array = params.get("tiling", [1.0, 1.0])
 	mat.uv1_scale = Vector3(tiling_arr[0], tiling_arr[1], 1.0)
 	
-	# 4. Find and load textures
-	# Python None serializes as JSON null, which Godot reads as Variant null, not ""
+	# 4. Find and load textures (Only override if a valid file path is resolved on disk)
 	var albedo_tex: String = _safe_str(params.get("albedo_texture"))
 	var normal_tex: String = _safe_str(params.get("normal_texture"))
 	var roughness_tex: String = _safe_str(params.get("roughness_texture"))
@@ -479,14 +547,14 @@ func create_godot_material(params: Dictionary) -> StandardMaterial3D:
 	if albedo_tex != "":
 		var tex_path = find_texture_path(active_textures_folder, albedo_tex)
 		if tex_path != "":
-			var tex = load(tex_path)
+			var tex = load_texture(tex_path)
 			if tex:
 				mat.albedo_texture = tex
 				
 	if normal_tex != "":
 		var tex_path = find_texture_path(active_textures_folder, normal_tex)
 		if tex_path != "":
-			var tex = load(tex_path)
+			var tex = load_texture(tex_path)
 			if tex:
 				mat.normal_enabled = true
 				mat.normal_texture = tex
@@ -494,18 +562,28 @@ func create_godot_material(params: Dictionary) -> StandardMaterial3D:
 	if roughness_tex != "":
 		var tex_path = find_texture_path(active_textures_folder, roughness_tex)
 		if tex_path != "":
-			var tex = load(tex_path)
+			var tex = load_texture(tex_path)
 			if tex:
 				mat.roughness_texture = tex
 				
 	if metallic_tex != "":
 		var tex_path = find_texture_path(active_textures_folder, metallic_tex)
 		if tex_path != "":
-			var tex = load(tex_path)
+			var tex = load_texture(tex_path)
 			if tex:
 				mat.metallic_texture = tex
 				
 	return mat
+
+func load_texture(tex_path: String) -> Texture2D:
+	"""Loads a texture from res:// or from the external filesystem."""
+	if tex_path.begins_with("res://"):
+		return load(tex_path) as Texture2D
+		
+	var img := Image.load_from_file(tex_path)
+	if img:
+		return ImageTexture.create_from_image(img)
+	return null
 
 func _safe_str(value) -> String:
 	"""Converts a Variant (possibly null from JSON) to a String, returning '' for null."""
@@ -517,14 +595,32 @@ func find_texture_path(folder: String, tex_name: String) -> String:
 	"""
 	Searches for matching texture file with various image extensions
 	to support standard bulk exports (PNG, TGA, JPG, DDS).
+	Falls back to active_models_folder if not found in the specified textures folder.
 	"""
 	if tex_name == "":
 		return ""
 		
 	var extensions = [".png", ".tga", ".jpg", ".jpeg", ".dds"]
-	for ext in extensions:
-		var path = folder.path_join(tex_name + ext)
-		if FileAccess.file_exists(path):
-			return path
-			
+	
+	# 1. Try the user-specified textures folder (if it is custom, i.e., not default placeholder)
+	if folder != "" and folder != "res://textures/":
+		for ext in extensions:
+			var path = folder.path_join(tex_name + ext)
+			if FileAccess.file_exists(path):
+				return path
+				
+	# 2. Try the models folder (same directory containing the glTF meshes) as fallback
+	if active_models_folder != "":
+		for ext in extensions:
+			var path = active_models_folder.path_join(tex_name + ext)
+			if FileAccess.file_exists(path):
+				return path
+				
+	# 3. Check the default textures folder path as a last resort
+	if folder != "":
+		for ext in extensions:
+			var path = folder.path_join(tex_name + ext)
+			if FileAccess.file_exists(path):
+				return path
+				
 	return ""

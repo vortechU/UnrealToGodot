@@ -206,23 +206,24 @@ def extract_mesh_collision(static_mesh):
         
     # 4. Convex Elements
     for convex in agg_geom.convex_elems:
-        center = convex.get_editor_property("center")
-        rot = convex.get_editor_property("rotation")
-        u_quat = rot.quaternion()
-        godot_local = local_shape_to_godot_transform(center, u_quat)
-        
-        vertices = []
         try:
-            vertex_data = convex.get_editor_property("vertex_data")
-            for v in vertex_data:
-                vertices.append([v.x, v.y, v.z]) # in cm, relative to shape origin
-        except Exception as e:
-            unreal.log_warning(f"Failed to read convex hull vertices: {str(e)}")
+            center = convex.get_editor_property("center")
+            rot = convex.get_editor_property("rotation")
+            u_quat = rot.quaternion()
+            godot_local = local_shape_to_godot_transform(center, u_quat)
             
-        collision_data["convex_hulls"].append({
-            "vertices": vertices,
-            "godot_local_transform": godot_local
-        })
+            vertices = []
+            vertex_data = convex.get_editor_property("vertex_data")
+            if vertex_data:
+                for v in vertex_data:
+                    vertices.append([v.x, v.y, v.z]) # in cm, relative to shape origin
+                
+            collision_data["convex_hulls"].append({
+                "vertices": vertices,
+                "godot_local_transform": godot_local
+            })
+        except Exception as e:
+            unreal.log_warning(f"Failed to read convex hull element: {str(e)}")
         
     # Check if there is any valid collision shape
     has_collision = (
@@ -233,7 +234,7 @@ def extract_mesh_collision(static_mesh):
     )
     return collision_data if has_collision else None
 
-def extract_material_parameters(material):
+def extract_material_parameters(material, collected_textures=None):
     """
     Safely queries a Material Interface for PBR parameter values (scalars, vectors, textures).
     Works on MaterialInstance assets by parsing overridden parameters.
@@ -252,58 +253,132 @@ def extract_material_parameters(material):
         "tiling": [1.0, 1.0]
     }
     
-    is_instance = isinstance(material, unreal.MaterialInstance)
-    if not is_instance and hasattr(unreal, "MaterialInstanceConstant"):
-        is_instance = isinstance(material, unreal.MaterialInstanceConstant)
-    if not is_instance:
-        # Base material: can't easily dynamically extract parameter defaults
-        return parameters
-
-    # 1. Parse Scalar parameters
-    scalars = material.get_editor_property("scalar_parameter_values")
-    for s in scalars:
-        name = str(s.parameter_info.name).lower()
-        val = s.parameter_value
+    visited = set()
+    
+    def _extract_recursive(mat):
+        if not mat or mat in visited:
+            return
+        visited.add(mat)
         
-        if "roughness" in name or name == "rough":
-            parameters["roughness"] = val
-        elif "metallic" in name or name == "metal":
-            parameters["metallic"] = val
-        elif "tiling" in name or "uvscale" in name or "uv_scale" in name:
-            parameters["tiling"] = [val, val]
-
-    # 2. Parse Vector parameters
-    vectors = material.get_editor_property("vector_parameter_values")
-    for v in vectors:
-        name = str(v.parameter_info.name).lower()
-        val = v.parameter_value
-        
-        if "color" in name or "albedo" in name or "diffuse" in name:
-            parameters["albedo_color"] = [val.r, val.g, val.b, val.a]
-
-    # 3. Parse Texture parameters
-    textures = material.get_editor_property("texture_parameter_values")
-    for t in textures:
-        name = str(t.parameter_info.name).lower()
-        tex = t.parameter_value
-        
-        if not tex:
-            continue
+        is_instance = isinstance(mat, unreal.MaterialInstance)
+        if not is_instance and hasattr(unreal, "MaterialInstanceConstant"):
+            is_instance = isinstance(mat, unreal.MaterialInstanceConstant)
             
-        tex_name = tex.get_name()
-        
-        if "albedo" in name or "basecolor" in name or "diffuse" in name or "color" in name or "maintex" in name:
-            parameters["albedo_texture"] = tex_name
-        elif "normal" in name or "bump" in name:
-            parameters["normal_texture"] = tex_name
-        elif "roughness" in name or "rough" in name:
-            parameters["roughness_texture"] = tex_name
-        elif "metallic" in name or "metal" in name:
-            parameters["metallic_texture"] = tex_name
+        if not is_instance:
+            # Base material: extract textures from its expressions graph
+            try:
+                expressions = mat.get_editor_property("expressions")
+                if expressions:
+                    for expr in expressions:
+                        if expr and hasattr(unreal, "MaterialExpressionTextureSample") and isinstance(expr, unreal.MaterialExpressionTextureSample):
+                            tex = expr.get_editor_property("texture")
+                            if tex and isinstance(tex, unreal.Texture):
+                                tex_name = tex.get_name()
+                                if collected_textures is not None:
+                                    collected_textures.add(tex)
+                                
+                                # Determine parameter/expression name
+                                name = ""
+                                if hasattr(unreal, "MaterialExpressionTextureSampleParameter2D") and isinstance(expr, unreal.MaterialExpressionTextureSampleParameter2D):
+                                    name = str(expr.get_editor_property("parameter_name")).lower()
+                                else:
+                                    name = str(expr.get_name()).lower()
+                                    
+                                if "albedo" in name or "basecolor" in name or "diffuse" in name or "color" in name or "maintex" in name:
+                                    if parameters["albedo_texture"] is None:
+                                        parameters["albedo_texture"] = tex_name
+                                elif "normal" in name or "bump" in name:
+                                    if parameters["normal_texture"] is None:
+                                        parameters["normal_texture"] = tex_name
+                                elif "roughness" in name or "rough" in name:
+                                    if parameters["roughness_texture"] is None:
+                                        parameters["roughness_texture"] = tex_name
+                                elif "metallic" in name or "metal" in name:
+                                    if parameters["metallic_texture"] is None:
+                                        parameters["metallic_texture"] = tex_name
+            except Exception as e:
+                unreal.log_warning(f"Could not read expressions from base material {mat.get_name()}: {str(e)}")
+            return
+
+        # Material Instance: Parse overridden parameters
+        # 1. Parse Scalar parameters
+        try:
+            scalars = mat.get_editor_property("scalar_parameter_values")
+            if scalars:
+                for s in scalars:
+                    name = str(s.parameter_info.name).lower()
+                    val = s.parameter_value
+                    
+                    if "roughness" in name or name == "rough":
+                        # We use instance value as it overrides parent
+                        if parameters.get("roughness") == 0.5: # default placeholder
+                            parameters["roughness"] = val
+                    elif "metallic" in name or name == "metal":
+                        if parameters.get("metallic") == 0.0:
+                            parameters["metallic"] = val
+                    elif "tiling" in name or "uvscale" in name or "uv_scale" in name:
+                        if parameters.get("tiling") == [1.0, 1.0]:
+                            parameters["tiling"] = [val, val]
+        except Exception:
+            pass
+
+        # 2. Parse Vector parameters
+        try:
+            vectors = mat.get_editor_property("vector_parameter_values")
+            if vectors:
+                for v in vectors:
+                    name = str(v.parameter_info.name).lower()
+                    val = v.parameter_value
+                    
+                    if "color" in name or "albedo" in name or "diffuse" in name:
+                        if parameters.get("albedo_color") == [1.0, 1.0, 1.0, 1.0]:
+                            parameters["albedo_color"] = [val.r, val.g, val.b, val.a]
+        except Exception:
+            pass
+
+        # 3. Parse Texture parameters
+        try:
+            textures = mat.get_editor_property("texture_parameter_values")
+            if textures:
+                for t in textures:
+                    name = str(t.parameter_info.name).lower()
+                    tex = t.parameter_value
+                    
+                    if not tex:
+                        continue
+                        
+                    tex_name = tex.get_name()
+                    
+                    if collected_textures is not None and isinstance(tex, unreal.Texture):
+                        collected_textures.add(tex)
+                    
+                    if "albedo" in name or "basecolor" in name or "diffuse" in name or "color" in name or "maintex" in name:
+                        if parameters["albedo_texture"] is None:
+                            parameters["albedo_texture"] = tex_name
+                    elif "normal" in name or "bump" in name:
+                        if parameters["normal_texture"] is None:
+                            parameters["normal_texture"] = tex_name
+                    elif "roughness" in name or "rough" in name:
+                        if parameters["roughness_texture"] is None:
+                            parameters["roughness_texture"] = tex_name
+                    elif "metallic" in name or "metal" in name:
+                        if parameters["metallic_texture"] is None:
+                            parameters["metallic_texture"] = tex_name
+        except Exception:
+            pass
             
+        # Walk up to parent
+        try:
+            parent = mat.get_editor_property("parent")
+            if parent:
+                _extract_recursive(parent)
+        except Exception:
+            pass
+
+    _extract_recursive(material)
     return parameters
 
-def extract_mesh_materials(mesh):
+def extract_mesh_materials(mesh, collected_textures=None):
     """
     Extracts all material slot descriptions and parameter details from a UStaticMesh or USkeletalMesh.
     """
@@ -326,7 +401,7 @@ def extract_mesh_materials(mesh):
             if mat_interface:
                 mat_name = mat_interface.get_name()
                 mat_path = mat_interface.get_path_name()
-                params = extract_material_parameters(mat_interface)
+                params = extract_material_parameters(mat_interface, collected_textures)
                 
             materials_data.append({
                 "slot_index": i,
@@ -348,7 +423,7 @@ def extract_mesh_materials(mesh):
             if mat_interface:
                 mat_name = mat_interface.get_name()
                 mat_path = mat_interface.get_path_name()
-                params = extract_material_parameters(mat_interface)
+                params = extract_material_parameters(mat_interface, collected_textures)
                 
             materials_data.append({
                 "slot_index": i,
@@ -360,7 +435,7 @@ def extract_mesh_materials(mesh):
         
     return materials_data
 
-def extract_component_material_overrides(comp):
+def extract_component_material_overrides(comp, collected_textures=None):
     """
     Extracts material overrides from a component.
     """
@@ -379,12 +454,39 @@ def extract_component_material_overrides(comp):
                     "slot_index": i,
                     "material_name": mat.get_name(),
                     "material_path": mat.get_path_name(),
-                    "parameters": extract_material_parameters(mat)
+                    "parameters": extract_material_parameters(mat, collected_textures)
                 })
             except Exception as e:
                 unreal.log_warning(f"Could not read material override at slot {i}: {str(e)}")
             
     return overrides_data
+
+def prompt_for_save_file(default_path):
+    """
+    Safely prompts the user to select a location to save the JSON file using tkinter.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        
+        file_path = filedialog.asksaveasfilename(
+            initialdir=os.path.dirname(default_path),
+            initialfile=os.path.basename(default_path),
+            defaultextension=".json",
+            filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")],
+            title="Save Layout JSON File"
+        )
+        
+        root.destroy()
+        if file_path:
+            return os.path.normpath(file_path)
+    except Exception as e:
+        unreal.log_warning(f"Could not open file save dialog via tkinter: {str(e)}")
+    return None
 
 def export_level_to_json(save_path=None, show_dialogs=True):
     # 1. Check requirements
@@ -409,7 +511,7 @@ def export_level_to_json(save_path=None, show_dialogs=True):
     except Exception:
         world_name = "UntitledLevel"
     
-    # Determine default save path
+    # 3. Determine save path and ensure parent directory exists
     project_dir = os.path.realpath(unreal.Paths.project_dir())
     default_save_path = os.path.join(project_dir, "Saved", "Exports", f"{world_name}_layout.json")
 
@@ -452,7 +554,9 @@ def export_level_to_json(save_path=None, show_dialogs=True):
 
     # Ensure parent directory exists
     try:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        dir_name = os.path.dirname(save_path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
     except Exception as e:
         if show_dialogs:
             unreal.EditorDialog.show_message(
@@ -469,6 +573,7 @@ def export_level_to_json(save_path=None, show_dialogs=True):
     exported_actors = []
     total_components_count = 0
     mesh_library = {}
+    collected_textures = set()
     
     with unreal.ScopedSlowTask(len(all_actors), "Scanning level actors for Static Meshes...") as slow_task:
         slow_task.make_dialog(can_cancel=True)
@@ -524,7 +629,7 @@ def export_level_to_json(save_path=None, show_dialogs=True):
                 # Extract and store collision & material data if not already in the library
                 if mesh_name not in mesh_library:
                     collision_data = extract_mesh_collision(mesh)
-                    materials_data = extract_mesh_materials(mesh)
+                    materials_data = extract_mesh_materials(mesh, collected_textures)
                     mesh_library[mesh_name] = {
                         "path": mesh_path,
                         "collision": collision_data,
@@ -543,14 +648,14 @@ def export_level_to_json(save_path=None, show_dialogs=True):
                     "godot_relative_transform": unreal_to_godot_transform(comp_relative_transform),
                     "unreal_world_transform": unreal_transform_to_dict(comp_world_transform),
                     "godot_world_transform": unreal_to_godot_transform(comp_world_transform),
-                    "material_overrides": extract_component_material_overrides(comp)
+                    "material_overrides": extract_component_material_overrides(comp, collected_textures)
                 }
                 
                 actor_data["components"].append(comp_data)
                 total_components_count += 1
                 
             exported_actors.append(actor_data)
-
+ 
     # 5. Build final layout JSON
     layout_data = {
         "level_name": world_name,
@@ -560,7 +665,7 @@ def export_level_to_json(save_path=None, show_dialogs=True):
         "meshes": mesh_library,
         "actors": exported_actors
     }
-
+ 
     # Write to JSON file
     try:
         with open(save_path, "w", encoding="utf-8") as f:
@@ -568,11 +673,49 @@ def export_level_to_json(save_path=None, show_dialogs=True):
             
         unreal.log(f"Level layout exported: {save_path}")
         
+        # Export all collected textures automatically
+        exported_textures_count = 0
+        if collected_textures:
+            try:
+                parent_dir = os.path.dirname(save_path)
+                textures_dir = os.path.join(parent_dir, "textures")
+                os.makedirs(textures_dir, exist_ok=True)
+                
+                tasks = []
+                for tex in collected_textures:
+                    if not tex or not isinstance(tex, unreal.Texture):
+                        continue
+                    tex_name = tex.get_name()
+                    filename = os.path.join(textures_dir, f"{tex_name}.png")
+                    
+                    task = unreal.AssetExportTask()
+                    task.object = tex
+                    task.filename = filename
+                    task.automated = True
+                    task.prompt = False
+                    task.replace_identical = True
+                    
+                    if hasattr(unreal, "TextureExporterPNG"):
+                        task.exporter = unreal.TextureExporterPNG()
+                        
+                    tasks.append(task)
+                    
+                if tasks:
+                    unreal.log(f"Exporting {len(tasks)} level textures to: {textures_dir}")
+                    unreal.Exporter.run_asset_export_tasks(tasks)
+                    # Verify on disk
+                    for task in tasks:
+                        if os.path.exists(task.filename):
+                            exported_textures_count += 1
+            except Exception as tex_err:
+                unreal.log_warning(f"Failed to export level textures: {str(tex_err)}")
+        
         if show_dialogs:
             summary_msg = (
                 f"Successfully exported layout for '{world_name}'!\n\n"
                 f"Actors Exported: {len(exported_actors)}\n"
                 f"Mesh Instances: {total_components_count}\n"
+                f"Textures Exported: {exported_textures_count}\n"
                 f"Saved to: {save_path}"
             )
             unreal.EditorDialog.show_message(
@@ -590,33 +733,6 @@ def export_level_to_json(save_path=None, show_dialogs=True):
                 unreal.AppMsgType.OK
             )
         return False
-
-def prompt_for_save_file(default_path):
-    """
-    Safely prompts the user to select a location to save the JSON file using tkinter.
-    """
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-        
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        
-        file_path = filedialog.asksaveasfilename(
-            initialdir=os.path.dirname(default_path),
-            initialfile=os.path.basename(default_path),
-            defaultextension=".json",
-            filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")],
-            title="Save Layout JSON File"
-        )
-        
-        root.destroy()
-        if file_path:
-            return os.path.normpath(file_path)
-    except Exception as e:
-        unreal.log_warning(f"Could not open file save dialog via tkinter: {str(e)}")
-    return None
 
 if __name__ == "__main__":
     export_level_to_json()

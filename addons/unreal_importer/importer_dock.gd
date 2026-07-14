@@ -35,7 +35,7 @@ func _enter_tree() -> void:
 	
 	var vbox := VBoxContainer.new()
 	vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	vbox.set_spacing(10)
+	vbox.add_theme_constant_override("separation", 10)
 	margin_container.add_child(vbox)
 	
 	# Title
@@ -134,55 +134,63 @@ func _enter_tree() -> void:
 	vbox.add_child(status_label)
 
 func _on_browse_json() -> void:
-	var dialog := EditorFileDialog.new()
+	var dialog := FileDialog.new()
 	dialog.title = "Select Layout JSON File"
-	dialog.file_mode = EditorFileDialog.FILE_MODE_OPEN_FILE
-	dialog.add_filter("*.json; JSON Files")
-	dialog.current_dir = json_edit.text.get_base_dir() if json_edit.text.begins_with("res://") else "res://"
-	add_child(dialog)
+	dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+	dialog.access = FileDialog.ACCESS_FILESYSTEM
+	dialog.add_filter("*.json", "JSON Files")
+	var current_path = json_edit.text
+	dialog.current_dir = current_path.get_base_dir() if (current_path.begins_with("res://") or current_path.contains("/") or current_path.contains("\\")) else "res://"
+	EditorInterface.get_base_control().add_child(dialog)
 	
 	dialog.file_selected.connect(func(path):
-		json_edit.text = path
-		dialog.queue_free()
+		json_edit.text = ProjectSettings.localize_path(path)
 	)
-	dialog.canceled.connect(func():
-		dialog.queue_free()
+	dialog.visibility_changed.connect(func():
+		if not dialog.visible:
+			dialog.queue_free()
 	)
 	dialog.popup_centered_ratio(0.6)
 
 func _on_browse_models() -> void:
-	var dialog := EditorFileDialog.new()
+	var dialog := FileDialog.new()
 	dialog.title = "Select glTF Models Folder"
-	dialog.file_mode = EditorFileDialog.FILE_MODE_OPEN_DIR
-	dialog.current_dir = models_edit.text if models_edit.text.begins_with("res://") else "res://"
-	add_child(dialog)
+	dialog.file_mode = FileDialog.FILE_MODE_OPEN_DIR
+	dialog.access = FileDialog.ACCESS_FILESYSTEM
+	var current_path = models_edit.text
+	dialog.current_dir = current_path if (current_path.begins_with("res://") or current_path.contains("/") or current_path.contains("\\")) else "res://"
+	EditorInterface.get_base_control().add_child(dialog)
 	
 	dialog.dir_selected.connect(func(path):
-		if not path.ends_with("/"):
-			path += "/"
-		models_edit.text = path
-		dialog.queue_free()
+		var localized = ProjectSettings.localize_path(path)
+		if not localized.ends_with("/"):
+			localized += "/"
+		models_edit.text = localized
 	)
-	dialog.canceled.connect(func():
-		dialog.queue_free()
+	dialog.visibility_changed.connect(func():
+		if not dialog.visible:
+			dialog.queue_free()
 	)
 	dialog.popup_centered_ratio(0.6)
 
 func _on_browse_textures() -> void:
-	var dialog := EditorFileDialog.new()
+	var dialog := FileDialog.new()
 	dialog.title = "Select Textures Folder"
-	dialog.file_mode = EditorFileDialog.FILE_MODE_OPEN_DIR
-	dialog.current_dir = textures_edit.text if textures_edit.text.begins_with("res://") else "res://"
-	add_child(dialog)
+	dialog.file_mode = FileDialog.FILE_MODE_OPEN_DIR
+	dialog.access = FileDialog.ACCESS_FILESYSTEM
+	var current_path = textures_edit.text
+	dialog.current_dir = current_path if (current_path.begins_with("res://") or current_path.contains("/") or current_path.contains("\\")) else "res://"
+	EditorInterface.get_base_control().add_child(dialog)
 	
 	dialog.dir_selected.connect(func(path):
-		if not path.ends_with("/"):
-			path += "/"
-		textures_edit.text = path
-		dialog.queue_free()
+		var localized = ProjectSettings.localize_path(path)
+		if not localized.ends_with("/"):
+			localized += "/"
+		textures_edit.text = localized
 	)
-	dialog.canceled.connect(func():
-		dialog.queue_free()
+	dialog.visibility_changed.connect(func():
+		if not dialog.visible:
+			dialog.queue_free()
 	)
 	dialog.popup_centered_ratio(0.6)
 
@@ -201,6 +209,8 @@ func _on_import_pressed() -> void:
 	# Deferred frame execution to let status label redraw
 	await get_tree().process_frame
 	
+	# Instantiate our importer class. Note that since we invoke do_import() directly 
+	# and pass the scene root, we bypass the need for EditorScript's get_scene() context.
 	var importer = ImporterClass.new()
 	importer.USE_GDSCRIPT_TRANSFORM_CONVERSION = convert_transforms_check.button_pressed
 	
@@ -211,6 +221,7 @@ func _on_import_pressed() -> void:
 	if success:
 		status_label.text = "Status: Import Completed Successfully!"
 		status_label.add_theme_color_override("font_color", Color(0.2, 0.8, 0.2))
+		EditorInterface.mark_scene_as_unsaved()
 	else:
 		status_label.text = "Status: Import Failed! Check console log for details."
 		status_label.add_theme_color_override("font_color", Color(0.9, 0.3, 0.3))
