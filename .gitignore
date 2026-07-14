@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Godot Engine
+.godot/
+.import/
+*.translation
+export_presets.cfg
+
+# Unreal Engine (if the repository is placed in an Unreal project root)
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+.vs/
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.suo
+*.user
+*.userossc
+*.sln
+*.vcproj
+*.vcxproj
+*.filters
+
+# System Files
+.DS_Store
+Thumbs.db
