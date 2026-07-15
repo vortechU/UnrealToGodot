@@ -16,6 +16,8 @@ import json
 import shutil
 import unreal
 
+import ue2g_common
+
 def collect_textures_from_material(material, collected_textures):
     if not material:
         return
@@ -355,9 +357,11 @@ def export_textures_for_meshes(meshes, export_dir, separate_textures=True, max_r
                 except Exception as e:
                     unreal.log_warning(f"Failed to restore texture size for {tex.get_name()}: {str(e)}")
 
-def copy_exports_to_godot(export_dir, meshes_exported, separate_textures, godot_project_dir):
+def copy_exports_to_godot(export_dir, meshes_exported, separate_textures, godot_project_dir, export_names=None):
     if not godot_project_dir or not os.path.isdir(godot_project_dir):
         return
+    if export_names is None:
+        export_names = {}
     
     unreal.log(f"Unreal to Godot: Automatically transferring exported files to Godot project: {godot_project_dir}")
     
@@ -369,7 +373,7 @@ def copy_exports_to_godot(export_dir, meshes_exported, separate_textures, godot_
     
     # 1. Copy mesh assets (.gltf, .bin, _physics.json)
     for mesh in meshes_exported:
-        mesh_name = mesh.get_name()
+        mesh_name = export_names.get(mesh, mesh.get_name())
         if os.path.exists(export_dir):
             for filename in os.listdir(export_dir):
                 base, ext = os.path.splitext(filename)
@@ -421,7 +425,7 @@ def copy_exports_to_godot(export_dir, meshes_exported, separate_textures, godot_
                 is_match = base_name in tex_names
                 if not is_match:
                     for mesh in meshes_exported:
-                        m_name = mesh.get_name()
+                        m_name = export_names.get(mesh, mesh.get_name())
                         if base_name == m_name or base_name.startswith(f"{m_name}_") or base_name.startswith(f"{m_name} "):
                             is_match = True
                             break
@@ -556,6 +560,8 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
     exported_count = 0
     failed_exports = []
     exported_meshes = []
+    # Deterministic collision-safe export filenames (asset packs often reuse mesh names)
+    export_names = ue2g_common.build_export_name_map(meshes_to_export)
     
     selected_actors = set() # Empty set because we are exporting static mesh assets, not world actors
     
@@ -567,7 +573,7 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
                 unreal.log_warning("glTF Export task cancelled by user.")
                 break
                 
-            mesh_name = mesh.get_name()
+            mesh_name = export_names.get(mesh, mesh.get_name())
             slow_task.enter_progress_frame(1, f"Exporting: {mesh_name}")
             
             # Determine how many LODs to export
@@ -665,7 +671,7 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
 
         if godot_project_dir:
             try:
-                copy_exports_to_godot(export_dir, exported_meshes, separate_textures, godot_project_dir)
+                copy_exports_to_godot(export_dir, exported_meshes, separate_textures, godot_project_dir, export_names)
             except Exception as copy_err:
                 unreal.log_warning(f"Failed to auto-transfer exports to Godot: {str(copy_err)}")
 
@@ -788,6 +794,8 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
     exported_count = 0
     failed_exports = []
     exported_meshes = []
+    # Deterministic collision-safe export filenames (asset packs often reuse mesh names)
+    export_names = ue2g_common.build_export_name_map(meshes_to_export)
     selected_actors = set()
     
     with unreal.ScopedSlowTask(len(meshes_to_export), "Batch Exporting Level Meshes to glTF...") as slow_task:
@@ -797,7 +805,7 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
             if slow_task.should_cancel():
                 break
                 
-            mesh_name = mesh.get_name()
+            mesh_name = export_names.get(mesh, mesh.get_name())
             slow_task.enter_progress_frame(1, f"Exporting: {mesh_name}")
             
             # Determine how many LODs to export
@@ -891,7 +899,7 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
 
         if godot_project_dir:
             try:
-                copy_exports_to_godot(export_dir, exported_meshes, separate_textures, godot_project_dir)
+                copy_exports_to_godot(export_dir, exported_meshes, separate_textures, godot_project_dir, export_names)
             except Exception as copy_err:
                 unreal.log_warning(f"Failed to auto-transfer exports to Godot: {str(copy_err)}")
 

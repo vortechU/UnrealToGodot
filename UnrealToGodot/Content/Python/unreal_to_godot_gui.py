@@ -31,7 +31,7 @@ class UnrealToGodotApp:
         self.project_dir = project_dir
         self.root = tk.Tk()
         self.root.title("Unreal ➔ Godot Exporter")
-        self.root.geometry("520x720")
+        self.root.geometry("540x880")
         self.root.configure(bg="#1e1e1e")
         self.root.resizable(True, True)
         
@@ -298,7 +298,94 @@ class UnrealToGodotApp:
             command=self.run_layout_export
         )
         self.export_layout_btn.pack(fill=tk.X, pady=(10, 0))
-        
+
+        # --- Section 2b: Level Export Features (per-feature toggles) ---
+        features_frame = tk.LabelFrame(
+            self.root,
+            text=" Level Export Features ",
+            fg="#f59e0b",
+            bg="#1e1e1e",
+            bd=1,
+            relief=tk.SOLID,
+            font=("Segoe UI", 9, "bold")
+        )
+        features_frame.pack(fill=tk.X, padx=20, pady=5)
+
+        features_inner = tk.Frame(features_frame, bg="#1e1e1e")
+        features_inner.pack(fill=tk.X, padx=12, pady=8)
+
+        features_grid = tk.Frame(features_inner, bg="#1e1e1e")
+        features_grid.pack(fill=tk.X)
+
+        self.feat_lights_var = tk.BooleanVar(value=True)
+        self.feat_decals_var = tk.BooleanVar(value=True)
+        self.feat_landscape_var = tk.BooleanVar(value=True)
+        self.feat_foliage_var = tk.BooleanVar(value=True)
+        self.feat_navigation_var = tk.BooleanVar(value=True)
+        self.feat_metadata_var = tk.BooleanVar(value=True)
+
+        feature_defs = [
+            ("Lights & Post-Process", self.feat_lights_var),
+            ("Decals", self.feat_decals_var),
+            ("Landscape / Terrain", self.feat_landscape_var),
+            ("Foliage & Instances", self.feat_foliage_var),
+            ("Navigation Volumes", self.feat_navigation_var),
+            ("Tags & Metadata", self.feat_metadata_var),
+        ]
+        for idx, (feat_label, feat_var) in enumerate(feature_defs):
+            feat_cb = tk.Checkbutton(
+                features_grid,
+                text=feat_label,
+                variable=feat_var,
+                fg="#ffffff",
+                bg="#1e1e1e",
+                activebackground="#1e1e1e",
+                activeforeground="#ffffff",
+                selectcolor="#121212",
+                font=("Segoe UI", 9)
+            )
+            feat_cb.grid(row=idx // 2, column=idx % 2, sticky="w", padx=(0, 10))
+        features_grid.grid_columnconfigure(0, weight=1)
+        features_grid.grid_columnconfigure(1, weight=1)
+
+        # Direct .tscn generation (needs the Godot project path from Section 3)
+        self.write_tscn_var = tk.BooleanVar(value=False)
+        self.write_tscn_cb = tk.Checkbutton(
+            features_inner,
+            text="Generate Godot .tscn scene directly (uses Godot Project Path below)",
+            variable=self.write_tscn_var,
+            fg="#ffffff",
+            bg="#1e1e1e",
+            activebackground="#1e1e1e",
+            activeforeground="#ffffff",
+            selectcolor="#121212",
+            font=("Segoe UI", 9)
+        )
+        self.write_tscn_cb.pack(anchor=tk.W, pady=(6, 0))
+
+        tscn_row = tk.Frame(features_inner, bg="#1e1e1e")
+        tscn_row.pack(fill=tk.X, pady=(4, 0))
+
+        tscn_lbl = tk.Label(
+            tscn_row,
+            text="Scene Name:",
+            fg="#a3a3a3",
+            bg="#1e1e1e",
+            font=("Segoe UI", 9)
+        )
+        tscn_lbl.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.tscn_name_entry = tk.Entry(
+            tscn_row,
+            bg="#121212",
+            fg="#ffffff",
+            insertbackground="#ffffff",
+            bd=1,
+            relief=tk.SOLID,
+            font=("Segoe UI", 10)
+        )
+        self.tscn_name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=2)
+
         # --- Section 3: Godot Integration Exporter ---
         godot_frame = tk.LabelFrame(
             self.root, 
@@ -488,6 +575,19 @@ class UnrealToGodotApp:
             return 4096
         return 0
 
+    def get_export_feature_options(self):
+        """Collects the per-feature export toggles (see docs/SCHEMA_V2.md)."""
+        return {
+            "lights": self.feat_lights_var.get(),
+            "decals": self.feat_decals_var.get(),
+            "landscape": self.feat_landscape_var.get(),
+            "foliage": self.feat_foliage_var.get(),
+            "navigation": self.feat_navigation_var.get(),
+            "metadata": self.feat_metadata_var.get(),
+            "write_tscn": self.write_tscn_var.get(),
+            "tscn_scene_name": self.tscn_name_entry.get().strip(),
+        }
+
     def load_settings(self):
         config_dir = os.path.join(self.project_dir, "Saved", "Config")
         config_path = os.path.join(config_dir, "UnrealToGodotSettings.json")
@@ -525,6 +625,18 @@ class UnrealToGodotApp:
                             self.max_res_combo.set("4096 (4K)")
                         else:
                             self.max_res_combo.set("Unlimited / Original")
+                    if "features" in settings and isinstance(settings["features"], dict):
+                        feats = settings["features"]
+                        self.feat_lights_var.set(feats.get("lights", True))
+                        self.feat_decals_var.set(feats.get("decals", True))
+                        self.feat_landscape_var.set(feats.get("landscape", True))
+                        self.feat_foliage_var.set(feats.get("foliage", True))
+                        self.feat_navigation_var.set(feats.get("navigation", True))
+                        self.feat_metadata_var.set(feats.get("metadata", True))
+                        self.write_tscn_var.set(feats.get("write_tscn", False))
+                        if feats.get("tscn_scene_name"):
+                            self.tscn_name_entry.delete(0, tk.END)
+                            self.tscn_name_entry.insert(0, feats["tscn_scene_name"])
             except Exception:
                 pass
 
@@ -540,7 +652,8 @@ class UnrealToGodotApp:
             "separate_textures": self.separate_textures_var.get(),
             "mesh_path": self.mesh_path_entry.get(),
             "layout_path": self.layout_path_entry.get(),
-            "max_texture_res": self.get_max_texture_resolution()
+            "max_texture_res": self.get_max_texture_resolution(),
+            "features": self.get_export_feature_options()
         }
         try:
             with open(config_path, "w", encoding="utf-8") as f:
@@ -614,11 +727,15 @@ class UnrealToGodotApp:
             return
             
         max_res = self.get_max_texture_resolution()
-        
+        feature_options = self.get_export_feature_options()
+
         self.save_settings()
-        self.show_status("Export command sent to Unreal...")
+        if feature_options.get("write_tscn") and godot_project is None:
+            self.show_status("Exporting... (.tscn skipped: enable 'Auto-transfer to Godot Project')", "warning")
+        else:
+            self.show_status("Export command sent to Unreal...")
         # Queue the export layout command to run on main thread
-        _command_queue.put(("export_layout", [save_path, godot_project, max_res]))
+        _command_queue.put(("export_layout", [save_path, godot_project, max_res, feature_options]))
 
     def close(self):
         """Pushes close signal to main thread and shuts down GUI."""
@@ -724,10 +841,11 @@ def check_editor_queues(delta_time):
                 save_path = args[0]
                 godot_project = args[1] if len(args) > 1 else None
                 max_res = args[2] if len(args) > 2 else 0
+                feature_options = args[3] if len(args) > 3 else None
                 unreal.log("Unreal to Godot Exporter: Starting level layout export on main thread...")
                 try:
                     success = export_level_to_json.export_level_to_json(
-                        save_path=save_path, show_dialogs=False, godot_project_dir=godot_project, max_texture_resolution=max_res
+                        save_path=save_path, show_dialogs=False, godot_project_dir=godot_project, max_texture_resolution=max_res, options=feature_options
                     )
                     if success:
                         _state_queue.put({"status": ("Successfully exported level layout JSON!", "success")})

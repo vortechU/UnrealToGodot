@@ -171,5 +171,25 @@ When running the import task, the GDScript compiler walks the JSON file and reco
 3. **Material Assignment**:
    - Compiles default materials and component-level material overrides.
    - Generates a `StandardMaterial3D` for each unique material name, mapping color and scalar parameter overrides.
-   - Searches the designated Textures directory for files matching the Unreal texture parameter names with common image extensions (`.png`, `.tga`, `.jpg`, `.jpeg`, `.dds`).
+   - Searches the designated Textures directory for files matching the Unreal texture parameter names with common image extensions (`.png`, `.tga`, `.jpg`, `.jpeg`, `.dds`, `.exr`, `.webp`), case-insensitively.
    - Uses a caching dictionary (`material_cache`) to reuse material resources across multiple actors, avoiding resource duplication.
+
+---
+
+## 5. Schema v2: Modular Feature Pipeline
+
+Version 2 extends the layout JSON with lights, post-processing, height fog, sky, decals, landscapes (heightmap/splatmap EXR files), packed foliage instances, navigation volumes, and per-actor tags/metadata. Every feature is an isolated module pair:
+
+| Feature | Unreal exporter | Godot importer |
+|---|---|---|
+| Lights / post-fx / fog / sky / decals | `export_environment.py` | `import_environment.gd` |
+| Landscape terrain | `export_landscape.py` | `import_terrain.gd` |
+| Foliage / ISM / HISM | `export_foliage.py` | `import_foliage.gd` |
+| Navigation + metadata | `export_gameplay.py` | `import_gameplay.gd` |
+| Direct `.tscn` generation | `tscn_writer.py` | — (plus a dock utility to bind foliage meshes) |
+
+Shared conversion math lives in `ue2g_common.py` (Python) and `import_common.gd` (GDScript). The orchestrators (`export_level_to_json.py`, `import_unreal_layout.gd`) load feature modules defensively — a missing module simply disables its feature. The full JSON schema and module contracts are specified in [docs/SCHEMA_V2.md](docs/SCHEMA_V2.md).
+
+Two reliability guarantees added in v2 for large asset packs:
+- **Collision-safe export names**: when two different mesh assets share a name, both exports get a deterministic `_<8-char-path-hash>` suffix (`meshes` library keys, glTF filenames, and component `mesh_key` references all stay consistent).
+- **Instanced-mesh routing**: `InstancedStaticMeshComponent` (including HISM and painted foliage) components are excluded from per-component actor export and instead exported as packed 12-float-per-instance transform arrays, rebuilt as `MultiMeshInstance3D`.

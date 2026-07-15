@@ -1,9 +1,9 @@
 {
 	"FileVersion": 3,
-	"Version": 1,
-	"VersionName": "1.0",
+	"Version": 2,
+	"VersionName": "2.0",
 	"FriendlyName": "Unreal to Godot Exporter",
-	"Description": "Exporter tool to migrate Static Meshes and Level layouts to Godot Engine.",
+	"Description": "Exporter tool to migrate Static Meshes, Level layouts, lighting, terrain, foliage, navigation and gameplay metadata to Godot Engine.",
 	"Category": "Importers",
 	"CreatedBy": "Antigravity",
 	"CreatedByURL": "",

@@ -15,6 +15,30 @@ import os
 import json
 import unreal
 
+import ue2g_common
+
+# Per-feature export toggles (see docs/SCHEMA_V2.md). The GUI passes a matching
+# dict; anything omitted falls back to these defaults.
+DEFAULT_EXPORT_OPTIONS = {
+    "lights": True,
+    "decals": True,
+    "landscape": True,
+    "foliage": True,
+    "navigation": True,
+    "metadata": True,
+    "write_tscn": False,
+    "tscn_scene_name": "",
+}
+
+
+def _try_import(module_name):
+    """Imports an optional feature module; a missing module just disables its feature."""
+    try:
+        return __import__(module_name)
+    except Exception as e:
+        unreal.log_warning(f"Unreal to Godot: optional module '{module_name}' unavailable: {str(e)}")
+        return None
+
 def matrix_to_quat(R):
     """
     Converts a 3x3 rotation matrix to a normalized quaternion (qx, qy, qz, qw).
@@ -488,7 +512,26 @@ def prompt_for_save_file(default_path):
         unreal.log_warning(f"Could not open file save dialog via tkinter: {str(e)}")
     return None
 
-def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=None, max_texture_resolution=0):
+def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=None, max_texture_resolution=0, options=None):
+    opts = dict(DEFAULT_EXPORT_OPTIONS)
+    if options:
+        opts.update(options)
+
+    # Optional feature modules (each missing module simply disables its feature)
+    foliage_mod = _try_import("export_foliage") if opts.get("foliage") else None
+    environment_mod = _try_import("export_environment") if (opts.get("lights") or opts.get("decals")) else None
+    landscape_mod = _try_import("export_landscape") if opts.get("landscape") else None
+    gameplay_mod = _try_import("export_gameplay") if (opts.get("navigation") or opts.get("metadata")) else None
+
+    # Instanced-mesh components (foliage/ISM/HISM) are exported as packed instance
+    # arrays, never as single per-component placements.
+    instanced_classes = ()
+    if foliage_mod:
+        try:
+            instanced_classes = foliage_mod.get_instanced_component_classes()
+        except Exception as e:
+            unreal.log_warning(f"Could not query instanced component classes: {str(e)}")
+
     # 1. Check requirements
     if not hasattr(unreal, "get_editor_subsystem"):
         if show_dialogs:
@@ -575,6 +618,42 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
     mesh_library = {}
     collected_textures = set()
     
+    # Quick pre-scan: gather every referenced mesh (including instanced/foliage meshes)
+    # so filenames can be disambiguated consistently with the glTF mesh exporter.
+    unique_meshes = set()
+    for actor in all_actors:
+        try:
+            for comp in actor.get_components_by_class(unreal.StaticMeshComponent):
+                m = ue2g_common.safe_get_prop(comp, "static_mesh")
+                if m:
+                    unique_meshes.add(m)
+            if hasattr(unreal, "SkeletalMeshComponent"):
+                for comp in actor.get_components_by_class(unreal.SkeletalMeshComponent):
+                    m = ue2g_common.safe_get_prop(comp, "skeletal_mesh")
+                    if m:
+                        unique_meshes.add(m)
+        except Exception:
+            continue
+    export_names = ue2g_common.build_export_name_map(unique_meshes)
+
+    def register_mesh(mesh):
+        """Registers a mesh in the library under its collision-safe key; returns the key."""
+        mesh_key = export_names.get(mesh)
+        if mesh_key is None:
+            base = ue2g_common.sanitize_name(mesh.get_name())
+            mesh_key = base
+            if mesh_key in mesh_library and mesh_library[mesh_key].get("path") != mesh.get_path_name():
+                mesh_key = "%s_%s" % (base, ue2g_common.short_path_hash(mesh.get_path_name()))
+            export_names[mesh] = mesh_key
+        if mesh_key not in mesh_library:
+            mesh_library[mesh_key] = {
+                "path": mesh.get_path_name(),
+                "export_name": mesh_key,
+                "collision": extract_mesh_collision(mesh),
+                "materials": extract_mesh_materials(mesh, collected_textures)
+            }
+        return mesh_key
+
     with unreal.ScopedSlowTask(len(all_actors), "Scanning level actors for Static Meshes...") as slow_task:
         slow_task.make_dialog(can_cancel=True)
         
@@ -597,6 +676,8 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
             valid_components = []
             
             for comp in static_comps:
+                if instanced_classes and isinstance(comp, instanced_classes):
+                    continue  # exported as packed instance arrays by the foliage exporter
                 mesh = comp.static_mesh if hasattr(comp, "static_mesh") else comp.get_editor_property("static_mesh")
                 if mesh:
                     valid_components.append((comp, mesh))
@@ -620,21 +701,20 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                 "godot_transform": unreal_to_godot_transform(actor_transform),
                 "components": []
             }
+
+            if gameplay_mod and opts.get("metadata"):
+                try:
+                    meta = gameplay_mod.extract_actor_metadata(actor)
+                    actor_data["tags"] = meta.get("tags", [])
+                    actor_data["properties"] = meta.get("properties", {})
+                except Exception as e:
+                    unreal.log_warning(f"Metadata extraction failed for {actor_label}: {str(e)}")
             
             for comp, mesh in valid_components:
                 comp_name = comp.get_name()
                 mesh_name = mesh.get_name()
                 mesh_path = mesh.get_path_name()
-                
-                # Extract and store collision & material data if not already in the library
-                if mesh_name not in mesh_library:
-                    collision_data = extract_mesh_collision(mesh)
-                    materials_data = extract_mesh_materials(mesh, collected_textures)
-                    mesh_library[mesh_name] = {
-                        "path": mesh_path,
-                        "collision": collision_data,
-                        "materials": materials_data
-                    }
+                mesh_key = register_mesh(mesh)
                 
                 # Fetch local relative transform and absolute world transform of the component
                 comp_relative_transform = comp.get_relative_transform()
@@ -642,6 +722,7 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                 
                 comp_data = {
                     "name": comp_name,
+                    "mesh_key": mesh_key,
                     "mesh_name": mesh_name,
                     "mesh_path": mesh_path,
                     "unreal_relative_transform": unreal_transform_to_dict(comp_relative_transform),
@@ -650,20 +731,75 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                     "godot_world_transform": unreal_to_godot_transform(comp_world_transform),
                     "material_overrides": extract_component_material_overrides(comp, collected_textures)
                 }
-                
+
+                if gameplay_mod and opts.get("metadata"):
+                    try:
+                        comp_tags = gameplay_mod.extract_component_tags(comp)
+                        if comp_tags:
+                            comp_data["tags"] = comp_tags
+                    except Exception:
+                        pass
+
                 actor_data["components"].append(comp_data)
                 total_components_count += 1
                 
             exported_actors.append(actor_data)
  
-    # 5. Build final layout JSON
+    # 5. Collect feature data (lights, post-process, decals, terrain, foliage, navigation)
+    environment_data = {}
+    if environment_mod:
+        try:
+            environment_data = environment_mod.collect_environment(all_actors, collected_textures) or {}
+        except Exception as e:
+            unreal.log_warning(f"Environment export failed: {str(e)}")
+    if not opts.get("lights"):
+        environment_data["lights"] = []
+        environment_data["post_process"] = []
+        environment_data["height_fog"] = None
+        environment_data["sky_light"] = None
+        environment_data["has_sky_atmosphere"] = False
+    if not opts.get("decals"):
+        environment_data["decals"] = []
+
+    landscapes_data = []
+    if landscape_mod:
+        try:
+            landscapes_data = landscape_mod.collect_landscapes(all_actors, os.path.dirname(save_path)) or []
+        except Exception as e:
+            unreal.log_warning(f"Landscape export failed: {str(e)}")
+
+    foliage_data = []
+    if foliage_mod:
+        try:
+            foliage_data = foliage_mod.collect_foliage(all_actors, register_mesh) or []
+        except Exception as e:
+            unreal.log_warning(f"Foliage export failed: {str(e)}")
+
+    navigation_data = None
+    if gameplay_mod and opts.get("navigation"):
+        try:
+            navigation_data = gameplay_mod.collect_navigation(all_actors)
+        except Exception as e:
+            unreal.log_warning(f"Navigation export failed: {str(e)}")
+
+    # 6. Build final layout JSON (schema v2 — see docs/SCHEMA_V2.md)
     layout_data = {
+        "format_version": 2,
         "level_name": world_name,
         "unreal_project_dir": project_dir,
         "total_actors": len(exported_actors),
         "total_mesh_instances": total_components_count,
         "meshes": mesh_library,
-        "actors": exported_actors
+        "actors": exported_actors,
+        "lights": environment_data.get("lights", []),
+        "post_process": environment_data.get("post_process", []),
+        "height_fog": environment_data.get("height_fog"),
+        "sky_light": environment_data.get("sky_light"),
+        "has_sky_atmosphere": environment_data.get("has_sky_atmosphere", False),
+        "decals": environment_data.get("decals", []),
+        "landscapes": landscapes_data,
+        "foliage": foliage_data,
+        "navigation": navigation_data
     }
  
     # Write to JSON file
@@ -753,15 +889,74 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                                 if os.path.abspath(src_tex) != os.path.abspath(dest_tex):
                                     shutil.copy2(src_tex, dest_tex)
                                     unreal.log(f"Transferred texture: {tex_name}.png -> {godot_textures_dir}")
+
+                # Copy terrain data (heightmaps / weightmaps written by the landscape exporter)
+                local_terrain_dir = os.path.join(os.path.dirname(save_path), "terrain")
+                if os.path.isdir(local_terrain_dir):
+                    godot_terrain_dir = os.path.join(godot_project_dir, "terrain")
+                    os.makedirs(godot_terrain_dir, exist_ok=True)
+                    for terrain_file in os.listdir(local_terrain_dir):
+                        src_t = os.path.join(local_terrain_dir, terrain_file)
+                        dest_t = os.path.join(godot_terrain_dir, terrain_file)
+                        if os.path.isfile(src_t) and os.path.abspath(src_t) != os.path.abspath(dest_t):
+                            shutil.copy2(src_t, dest_t)
+                    unreal.log(f"Transferred terrain data -> {godot_terrain_dir}")
             except Exception as copy_err:
                 unreal.log_warning(f"Failed to auto-transfer level layout to Godot: {str(copy_err)}")
         
+        # Optionally generate a Godot .tscn scene directly inside the Godot project
+        tscn_path = None
+        if opts.get("write_tscn") and godot_project_dir and os.path.isdir(godot_project_dir):
+            tscn_mod = _try_import("tscn_writer")
+            if tscn_mod:
+                try:
+                    scene_name = ue2g_common.sanitize_name(opts.get("tscn_scene_name") or f"{world_name}_imported")
+                    tscn_path = os.path.join(godot_project_dir, f"{scene_name}.tscn")
+                    res_paths = {"models": "res://models/", "textures": "res://textures/", "terrain": "res://terrain/"}
+                    tscn_options = {
+                        "scene_name": scene_name,
+                        "godot_project_dir": godot_project_dir,
+                        "light_energy_scale": 1.0,
+                        "lights": bool(opts.get("lights")),
+                        "decals": bool(opts.get("decals")),
+                        "foliage": bool(opts.get("foliage")),
+                        "navigation": bool(opts.get("navigation")),
+                        "metadata": bool(opts.get("metadata")),
+                        "landscape": bool(opts.get("landscape")),
+                    }
+                    if tscn_mod.write_tscn(layout_data, tscn_path, res_paths, tscn_options):
+                        unreal.log(f"Generated Godot scene: {tscn_path}")
+                    else:
+                        tscn_path = None
+                        unreal.log_warning("Godot .tscn generation failed; see log for details.")
+                except Exception as e:
+                    tscn_path = None
+                    unreal.log_warning(f"Failed to generate .tscn scene: {str(e)}")
+        elif opts.get("write_tscn"):
+            unreal.log_warning("Direct .tscn generation requires a valid Godot project path (enable auto-transfer).")
+
         if show_dialogs:
+            feature_lines = []
+            if layout_data.get("lights"):
+                feature_lines.append(f"Lights: {len(layout_data['lights'])}")
+            if layout_data.get("decals"):
+                feature_lines.append(f"Decals: {len(layout_data['decals'])}")
+            if layout_data.get("landscapes"):
+                feature_lines.append(f"Landscapes: {len(layout_data['landscapes'])}")
+            if layout_data.get("foliage"):
+                total_foliage = sum(int(f.get("instance_count", 0)) for f in layout_data["foliage"])
+                feature_lines.append(f"Foliage Instances: {total_foliage}")
+            if layout_data.get("navigation"):
+                feature_lines.append(f"Nav Volumes: {len(layout_data['navigation'].get('bounds_volumes', []))}")
+            if tscn_path:
+                feature_lines.append(f"Godot Scene: {tscn_path}")
+            extra = ("\n" + "\n".join(feature_lines)) if feature_lines else ""
             summary_msg = (
                 f"Successfully exported layout for '{world_name}'!\n\n"
                 f"Actors Exported: {len(exported_actors)}\n"
                 f"Mesh Instances: {total_components_count}\n"
-                f"Textures Exported: {exported_textures_count}\n"
+                f"Textures Exported: {exported_textures_count}"
+                f"{extra}\n"
                 f"Saved to: {save_path}"
             )
             unreal.EditorDialog.show_message(

@@ -16,6 +16,23 @@ const JSON_FILE_PATH: String = "res://level_layout.json"
 const GLTF_MODELS_FOLDER: String = "res://models/"
 const TEXTURES_FOLDER_PATH: String = "res://textures/"
 
+const Common = preload("res://addons/unreal_importer/import_common.gd")
+
+# Per-feature import toggles (see docs/SCHEMA_V2.md). The dock passes a matching
+# dictionary; anything omitted falls back to these defaults.
+const DEFAULT_IMPORT_OPTIONS := {
+	"apply_lights": true,
+	"apply_environment": true,
+	"apply_decals": true,
+	"build_terrain": true,
+	"terrain_mode": "auto",   # auto | terrain3d | hterrain | mesh
+	"apply_foliage": true,
+	"apply_navigation": true,
+	"navigation_bake": false,
+	"apply_metadata": true,
+	"light_energy_scale": 1.0,
+}
+
 # Set this to true to use Godot-side transform conversion calculation (Option B).
 # Set to false to use the pre-calculated "godot_transform" from the JSON (Option A - Recommended).
 var USE_GDSCRIPT_TRANSFORM_CONVERSION: bool = false
@@ -25,6 +42,7 @@ var material_cache: Dictionary = {}
 var active_scene_root: Node
 var active_textures_folder: String
 var active_models_folder: String
+var import_options: Dictionary = {}
 
 func _run() -> void:
 	# Standalone EditorScript execution entry point
@@ -34,11 +52,18 @@ func _run() -> void:
 		return
 	var _ok = do_import(JSON_FILE_PATH, GLTF_MODELS_FOLDER, TEXTURES_FOLDER_PATH, scene_root)
 
-func do_import(json_path: String, models_folder: String, textures_folder: String, scene_root: Node) -> bool:
+func do_import(json_path: String, models_folder: String, textures_folder: String, scene_root: Node, options: Dictionary = {}) -> bool:
 	active_scene_root = scene_root
 	active_textures_folder = textures_folder
 	active_models_folder = models_folder
-	
+	import_options = DEFAULT_IMPORT_OPTIONS.duplicate()
+	for key in options:
+		import_options[key] = options[key]
+	import_options["models_folder"] = models_folder
+	import_options["textures_folder"] = textures_folder
+	import_options["json_dir"] = json_path.get_base_dir()
+	import_options["material_helper"] = self
+
 	# Open and read the JSON file
 	if not FileAccess.file_exists(json_path):
 		printerr("Import Error: JSON file not found at path: ", json_path)
@@ -68,6 +93,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 	
 	var imported_count: int = 0
 	var missing_meshes: Dictionary = {}
+	var gameplay_helper = _load_feature("import_gameplay.gd")
 
 	# Iterate and instance actors
 	for actor_data in actors:
@@ -96,6 +122,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 		if components.size() == 1:
 			var comp_data = components[0]
 			var mesh_name: String = comp_data.get("mesh_name", "")
+			var mesh_key: String = comp_data.get("mesh_key", mesh_name)
 			
 			# Resolve the component's relative transform
 			var comp_transform: Transform3D
@@ -110,20 +137,20 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 				var g_trans = comp_data["godot_relative_transform"]
 				comp_transform = get_transform_from_dict(g_trans)
 			
-			var gltf_path := find_gltf_path(models_folder, mesh_name)
+			var gltf_path := find_model_for(models_folder, mesh_key, mesh_name)
 			if gltf_path == "":
-				missing_meshes[mesh_name] = true
-				create_placeholder(active_scene_root, actor_name, actor_transform, mesh_name)
+				missing_meshes[mesh_key] = true
+				create_placeholder(active_scene_root, actor_name, actor_transform, mesh_key)
 				continue
-				
-			var physics_body = setup_physics_body(active_scene_root, actor_name, actor_transform, mesh_name, meshes_lib)
+
+			var physics_body = setup_physics_body(active_scene_root, actor_name, actor_transform, mesh_key, meshes_lib)
 			var instanced_mesh = instance_gltf(gltf_path)
 			
 			if instanced_mesh:
 				# Apply materials to mesh instance
 				var overrides = comp_data.get("material_overrides", [])
-				apply_materials_to_instance(instanced_mesh, mesh_name, overrides, meshes_lib)
-				
+				apply_materials_to_instance(instanced_mesh, mesh_key, overrides, meshes_lib)
+
 				if physics_body:
 					# If there is collision, the physics body is the parent node,
 					# and the mesh is a child of it with the component's relative offset.
@@ -141,6 +168,8 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					_set_owner_recursive(instanced_mesh, active_scene_root)
 					instanced_mesh.global_transform = actor_transform * comp_transform
 				imported_count += 1
+				if gameplay_helper:
+					gameplay_helper.apply_actor_metadata(physics_body if physics_body else instanced_mesh, actor_data, import_options)
 			else:
 				if physics_body:
 					physics_body.queue_free()
@@ -156,6 +185,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 			for comp_data in components:
 				var comp_name: String = comp_data.get("name", "Component")
 				var mesh_name: String = comp_data.get("mesh_name", "")
+				var mesh_key: String = comp_data.get("mesh_key", mesh_name)
 				
 				var comp_transform: Transform3D
 				if USE_GDSCRIPT_TRANSFORM_CONVERSION:
@@ -169,19 +199,19 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					var g_trans = comp_data["godot_relative_transform"]
 					comp_transform = get_transform_from_dict(g_trans)
 					
-				var gltf_path := find_gltf_path(models_folder, mesh_name)
+				var gltf_path := find_model_for(models_folder, mesh_key, mesh_name)
 				if gltf_path == "":
-					missing_meshes[mesh_name] = true
-					create_placeholder(actor_node, comp_name, comp_transform, mesh_name)
+					missing_meshes[mesh_key] = true
+					create_placeholder(actor_node, comp_name, comp_transform, mesh_key)
 					continue
-					
-				var physics_body = setup_physics_body(actor_node, comp_name, comp_transform, mesh_name, meshes_lib)
+
+				var physics_body = setup_physics_body(actor_node, comp_name, comp_transform, mesh_key, meshes_lib)
 				var instanced_mesh = instance_gltf(gltf_path)
 				if instanced_mesh:
 					any_component_succeeded = true
 					# Apply materials to mesh instance
 					var overrides = comp_data.get("material_overrides", [])
-					apply_materials_to_instance(instanced_mesh, mesh_name, overrides, meshes_lib)
+					apply_materials_to_instance(instanced_mesh, mesh_key, overrides, meshes_lib)
 					
 					if physics_body:
 						instanced_mesh.name = mesh_name
@@ -202,12 +232,40 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					
 			if actor_node.get_child_count() > 0:
 				imported_count += 1
+				if gameplay_helper:
+					gameplay_helper.apply_actor_metadata(actor_node, actor_data, import_options)
 			else:
 				actor_node.queue_free()
 			
+	# Feature modules: lights/environment/decals, terrain, foliage, navigation.
+	# Each is optional — a missing module file simply disables that feature.
+	var feature_summary: Array[String] = []
+	var feature_warnings := PackedStringArray()
+	var feature_files := {
+		"import_environment.gd": "Environment (lights/decals/post-fx)",
+		"import_terrain.gd": "Terrain",
+		"import_foliage.gd": "Foliage",
+		"import_gameplay.gd": "Navigation",
+	}
+	for file_name in feature_files:
+		var module = _load_feature(file_name)
+		if module == null:
+			continue
+		var res = module.apply(data, active_scene_root, active_scene_root, import_options)
+		if res is Dictionary:
+			var created := int(res.get("created", 0))
+			if created > 0:
+				feature_summary.append("%s: %d node(s)" % [feature_files[file_name], created])
+			for w in res.get("warnings", []):
+				feature_warnings.append(str(w))
+
 	# Summary reporting
 	print("\n=================== IMPORT SUMMARY ===================")
 	print("Successfully imported: ", imported_count, " actors.")
+	for line in feature_summary:
+		print(line)
+	for w in feature_warnings:
+		print("Warning: ", w)
 	if missing_meshes.size() > 0:
 		print("Warning: The following meshes were missing from the models directory:")
 		for mesh in missing_meshes.keys():
@@ -217,16 +275,28 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 	return true
 
 func find_gltf_path(folder: String, mesh_name: String) -> String:
-	"""Searches for .gltf or .glb file with matching mesh name."""
-	var path_gltf = folder.path_join(mesh_name + ".gltf")
-	var path_glb = folder.path_join(mesh_name + ".glb")
-	
-	if FileAccess.file_exists(path_gltf):
-		return path_gltf
-	elif FileAccess.file_exists(path_glb):
-		return path_glb
-		
-	return ""
+	"""Searches for a .gltf/.glb file with matching mesh name (case-insensitive)."""
+	return Common.find_model_path(folder, mesh_name)
+
+
+func find_model_for(folder: String, mesh_key: String, mesh_name: String) -> String:
+	"""Resolves a model file by its collision-safe export key, falling back to
+	the raw mesh name for v1 layouts or partial exports."""
+	var path := Common.find_model_path(folder, mesh_key)
+	if path == "" and mesh_name != "" and mesh_name != mesh_key:
+		path = Common.find_model_path(folder, mesh_name)
+	return path
+
+
+func _load_feature(file_name: String):
+	"""Instantiates an optional feature module from the addon folder."""
+	var path := "res://addons/unreal_importer/" + file_name
+	if not ResourceLoader.exists(path):
+		return null
+	var script = load(path)
+	if script == null:
+		return null
+	return script.new()
 
 func instance_gltf(gltf_path: String) -> Node3D:
 	"""Loads and instances a glTF scene, supporting both resource load and external files."""
@@ -613,30 +683,10 @@ func find_texture_path(folder: String, tex_name: String) -> String:
 	to support standard bulk exports (PNG, TGA, JPG, DDS).
 	Falls back to active_models_folder if not found in the specified textures folder.
 	"""
-	if tex_name == "":
-		return ""
-		
-	var extensions = [".png", ".tga", ".jpg", ".jpeg", ".dds"]
-	
-	# 1. Try the user-specified textures folder (if it is custom, i.e., not default placeholder)
-	if folder != "" and folder != "res://textures/":
-		for ext in extensions:
-			var path = folder.path_join(tex_name + ext)
-			if FileAccess.file_exists(path):
-				return path
-				
-	# 2. Try the models folder (same directory containing the glTF meshes) as fallback
-	if active_models_folder != "":
-		for ext in extensions:
-			var path = active_models_folder.path_join(tex_name + ext)
-			if FileAccess.file_exists(path):
-				return path
-				
-	# 3. Check the default textures folder path as a last resort
-	if folder != "":
-		for ext in extensions:
-			var path = folder.path_join(tex_name + ext)
-			if FileAccess.file_exists(path):
-				return path
-				
-	return ""
+	# Ordered, case-insensitive search: textures folder, models folder, then the
+	# textures/ directory next to the layout JSON (asset packs mix casings freely).
+	var json_textures := ""
+	var json_dir := str(import_options.get("json_dir", ""))
+	if json_dir != "":
+		json_textures = json_dir.path_join("textures")
+	return Common.find_texture_path([folder, active_models_folder, json_textures], tex_name)
