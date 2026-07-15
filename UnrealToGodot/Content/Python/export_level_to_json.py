@@ -39,134 +39,16 @@ def _try_import(module_name):
         unreal.log_warning(f"Unreal to Godot: optional module '{module_name}' unavailable: {str(e)}")
         return None
 
-def matrix_to_quat(R):
-    """
-    Converts a 3x3 rotation matrix to a normalized quaternion (qx, qy, qz, qw).
-    Safely handles close-to-zero divisions.
-    """
-    tr = R[0][0] + R[1][1] + R[2][2]
-    if tr > 0.0:
-        s = max(0.0001, (tr + 1.0) ** 0.5 * 2.0)
-        qw = 0.25 * s
-        qx = (R[2][1] - R[1][2]) / s
-        qy = (R[0][2] - R[2][0]) / s
-        qz = (R[1][0] - R[0][1]) / s
-    elif (R[0][0] > R[1][1]) and (R[0][0] > R[2][2]):
-        s = max(0.0001, (1.0 + R[0][0] - R[1][1] - R[2][2]) ** 0.5 * 2.0)
-        qw = (R[2][1] - R[1][2]) / s
-        qx = 0.25 * s
-        qy = (R[0][1] + R[1][0]) / s
-        qz = (R[0][2] + R[2][0]) / s
-    elif R[1][1] > R[2][2]:
-        s = max(0.0001, (1.0 + R[1][1] - R[0][0] - R[2][2]) ** 0.5 * 2.0)
-        qw = (R[0][2] - R[2][0]) / s
-        qx = (R[0][1] + R[1][0]) / s
-        qy = 0.25 * s
-        qz = (R[1][2] + R[2][1]) / s
-    else:
-        s = max(0.0001, (1.0 + R[2][2] - R[0][0] - R[1][1]) ** 0.5 * 2.0)
-        qw = (R[1][0] - R[0][1]) / s
-        qx = (R[0][2] + R[2][0]) / s
-        qy = (R[1][2] + R[2][1]) / s
-        qz = 0.25 * s
-    
-    # Normalize to avoid numerical drift
-    length = (qx**2 + qy**2 + qz**2 + qw**2) ** 0.5
-    if length > 0.0:
-        return (qx / length, qy / length, qz / length, qw / length)
-    return (0.0, 0.0, 0.0, 1.0)
+# ---------------------------------------------------------------------------
+# Coordinate conversion math lives in ue2g_common (single source of truth).
+# These module-level aliases preserve existing call sites and any external
+# imports while guaranteeing exporter and importer never drift apart.
+# ---------------------------------------------------------------------------
+matrix_to_quat = ue2g_common.matrix_to_quat
+unreal_transform_to_dict = ue2g_common.unreal_transform_to_dict
+unreal_to_godot_transform = ue2g_common.unreal_to_godot_transform
+local_shape_to_godot_transform = ue2g_common.local_shape_to_godot_transform
 
-def unreal_transform_to_dict(transform):
-    """Converts an unreal.Transform to a simple python dict (Left-handed, Z-up, cm)."""
-    t = transform.translation
-    r = transform.rotation
-    s = transform.scale3d
-    
-    # Convert quaternion to euler degrees for helper reference
-    rotator = transform.rotation.rotator()
-    
-    return {
-        "translation": [t.x, t.y, t.z],
-        "rotation_quat": [r.x, r.y, r.z, r.w],
-        "rotation_euler": [rotator.roll, rotator.pitch, rotator.yaw], # Roll (X), Pitch (Y), Yaw (Z)
-        "scale": [s.x, s.y, s.z]
-    }
-
-def unreal_to_godot_transform(u_transform):
-    """
-    Converts Unreal Transform to Godot Transform:
-    1. Position: cm -> meters; Axis mapping: Godot_X = Unreal_Y, Godot_Y = Unreal_Z, Godot_Z = -Unreal_X
-    2. Scale: Axis mapping: Godot_X = Unreal_Y, Godot_Y = Unreal_Z, Godot_Z = Unreal_X
-    3. Rotation: Convert Unreal Quat -> 3x3 Matrix -> remap basis -> Matrix -> Godot Quat
-    """
-    # 1. Translation (cm to meters)
-    ux, uy, uz = u_transform.translation.x, u_transform.translation.y, u_transform.translation.z
-    godot_translation = [uy * 0.01, uz * 0.01, -ux * 0.01]
-    
-    # 2. Scale
-    usx, usy, usz = u_transform.scale3d.x, u_transform.scale3d.y, u_transform.scale3d.z
-    godot_scale = [usy, usz, usx]
-    
-    # 3. Rotation (Remap 3x3 Basis using C * R_unreal * C^T)
-    u_quat = u_transform.rotation
-    qx, qy, qz, qw = u_quat.x, u_quat.y, u_quat.z, u_quat.w
-    
-    # Unreal Quat -> 3x3 Matrix
-    r00 = 1.0 - 2.0 * (qy**2 + qz**2)
-    r01 = 2.0 * (qx*qy - qw*qz)
-    r02 = 2.0 * (qx*qz + qw*qy)
-    
-    r10 = 2.0 * (qx*qy + qw*qz)
-    r11 = 1.0 - 2.0 * (qx**2 + qz**2)
-    r12 = 2.0 * (qy*qz - qw*qx)
-    
-    r20 = 2.0 * (qx*qz - qw*qy)
-    r21 = 2.0 * (qy*qz + qw*qx)
-    r22 = 1.0 - 2.0 * (qx**2 + qy**2)
-    
-    # Remap basis for right-handed Y-up Godot
-    rg00 = r11
-    rg01 = r12
-    rg02 = -r10
-    
-    rg10 = r21
-    rg11 = r22
-    rg12 = -r20
-    
-    rg20 = -r01
-    rg21 = -r02
-    rg22 = r00
-    
-    R_godot = [
-        [rg00, rg01, rg02],
-        [rg10, rg11, rg12],
-        [rg20, rg21, rg22]
-    ]
-    
-    # Matrix -> Godot Quat
-    g_quat = matrix_to_quat(R_godot)
-    
-    return {
-        "translation": godot_translation,
-        "rotation_quat": list(g_quat),
-        "scale": godot_scale
-    }
-
-class _SimpleTransform:
-    """Lightweight stand-in for unreal.Transform to feed into unreal_to_godot_transform."""
-    def __init__(self, translation, rotation, scale3d):
-        self.translation = translation
-        self.rotation = rotation
-        self.scale3d = scale3d
-
-def local_shape_to_godot_transform(translation_vec, rotation_quat):
-    """
-    Converts a local collision shape offset translation (unreal.Vector)
-    and local rotation (unreal.Quat) into a Godot local transform dict.
-    Uses a lightweight wrapper to avoid fragile unreal.Transform constructor calls.
-    """
-    mock = _SimpleTransform(translation_vec, rotation_quat, unreal.Vector(1.0, 1.0, 1.0))
-    return unreal_to_godot_transform(mock)
 
 def extract_mesh_collision(static_mesh):
     """
@@ -278,7 +160,12 @@ def extract_material_parameters(material, collected_textures=None):
     }
     
     visited = set()
-    
+    # Tracks scalar/vector params that have been explicitly set, so the first
+    # (child-most) material that provides one wins — even if its value happens
+    # to equal a default (e.g. roughness exactly 0.5). Texture params already
+    # use a None sentinel below and need no tracking here.
+    assigned = set()
+
     def _extract_recursive(mat):
         if not mat or mat in visited:
             return
@@ -334,15 +221,18 @@ def extract_material_parameters(material, collected_textures=None):
                     val = s.parameter_value
                     
                     if "roughness" in name or name == "rough":
-                        # We use instance value as it overrides parent
-                        if parameters.get("roughness") == 0.5: # default placeholder
+                        # Child instances are visited before parents; first explicit value wins.
+                        if "roughness" not in assigned:
                             parameters["roughness"] = val
+                            assigned.add("roughness")
                     elif "metallic" in name or name == "metal":
-                        if parameters.get("metallic") == 0.0:
+                        if "metallic" not in assigned:
                             parameters["metallic"] = val
+                            assigned.add("metallic")
                     elif "tiling" in name or "uvscale" in name or "uv_scale" in name:
-                        if parameters.get("tiling") == [1.0, 1.0]:
+                        if "tiling" not in assigned:
                             parameters["tiling"] = [val, val]
+                            assigned.add("tiling")
         except Exception:
             pass
 
@@ -355,8 +245,9 @@ def extract_material_parameters(material, collected_textures=None):
                     val = v.parameter_value
                     
                     if "color" in name or "albedo" in name or "diffuse" in name:
-                        if parameters.get("albedo_color") == [1.0, 1.0, 1.0, 1.0]:
+                        if "albedo_color" not in assigned:
                             parameters["albedo_color"] = [val.r, val.g, val.b, val.a]
+                            assigned.add("albedo_color")
         except Exception:
             pass
 

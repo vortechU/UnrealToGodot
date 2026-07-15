@@ -143,7 +143,12 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 				create_placeholder(active_scene_root, actor_name, actor_transform, mesh_key)
 				continue
 
-			var physics_body = setup_physics_body(active_scene_root, actor_name, actor_transform, mesh_key, meshes_lib)
+			# Collision shapes are defined in mesh-local space, so the physics body
+			# must sit at the mesh's full world transform (actor * component). The
+			# mesh then sits at IDENTITY under it, keeping collision and mesh aligned
+			# even when the component has a non-identity relative offset.
+			var body_transform := actor_transform * comp_transform
+			var physics_body = setup_physics_body(active_scene_root, actor_name, body_transform, mesh_key, meshes_lib)
 			var instanced_mesh = instance_gltf(gltf_path)
 			
 			if instanced_mesh:
@@ -152,14 +157,14 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 				apply_materials_to_instance(instanced_mesh, mesh_key, overrides, meshes_lib)
 
 				if physics_body:
-					# If there is collision, the physics body is the parent node,
-					# and the mesh is a child of it with the component's relative offset.
+					# Physics body already carries actor * component; the mesh stays at
+					# identity under it so it lines up with the collision shapes.
 					instanced_mesh.name = mesh_name
 					physics_body.add_child(instanced_mesh)
 					physics_body.owner = active_scene_root
 					instanced_mesh.owner = active_scene_root
 					_set_owner_recursive(instanced_mesh, active_scene_root)
-					instanced_mesh.transform = comp_transform
+					instanced_mesh.transform = Transform3D.IDENTITY
 				else:
 					# Direct visual-only mesh instance: combine actor + component transforms
 					instanced_mesh.name = actor_name

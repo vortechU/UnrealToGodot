@@ -64,100 +64,13 @@ def collect_textures_from_material(material, collected_textures):
                 
     _collect_recursive(material)
 
-def matrix_to_quat(R):
-    """
-    Converts a 3x3 rotation matrix to a normalized quaternion (qx, qy, qz, qw).
-    """
-    tr = R[0][0] + R[1][1] + R[2][2]
-    if tr > 0.0:
-        s = max(0.0001, (tr + 1.0) ** 0.5 * 2.0)
-        qw = 0.25 * s
-        qx = (R[2][1] - R[1][2]) / s
-        qy = (R[0][2] - R[2][0]) / s
-        qz = (R[1][0] - R[0][1]) / s
-    elif (R[0][0] > R[1][1]) and (R[0][0] > R[2][2]):
-        s = max(0.0001, (1.0 + R[0][0] - R[1][1] - R[2][2]) ** 0.5 * 2.0)
-        qw = (R[2][1] - R[1][2]) / s
-        qx = 0.25 * s
-        qy = (R[0][1] + R[1][0]) / s
-        qz = (R[0][2] + R[2][0]) / s
-    elif R[1][1] > R[2][2]:
-        s = max(0.0001, (1.0 + R[1][1] - R[0][0] - R[2][2]) ** 0.5 * 2.0)
-        qw = (R[0][2] - R[2][0]) / s
-        qx = (R[0][1] + R[1][0]) / s
-        qy = 0.25 * s
-        qz = (R[1][2] + R[2][1]) / s
-    else:
-        s = max(0.0001, (1.0 + R[2][2] - R[0][0] - R[1][1]) ** 0.5 * 2.0)
-        qw = (R[1][0] - R[0][1]) / s
-        qx = (R[0][2] + R[2][0]) / s
-        qy = (R[1][2] + R[2][1]) / s
-        qz = 0.25 * s
-    
-    length = (qx**2 + qy**2 + qz**2 + qw**2) ** 0.5
-    if length > 0.0:
-        return (qx / length, qy / length, qz / length, qw / length)
-    return (0.0, 0.0, 0.0, 1.0)
+# ---------------------------------------------------------------------------
+# Coordinate conversion math lives in ue2g_common (single source of truth).
+# ---------------------------------------------------------------------------
+matrix_to_quat = ue2g_common.matrix_to_quat
+unreal_to_godot_transform = ue2g_common.unreal_to_godot_transform
+local_shape_to_godot_transform = ue2g_common.local_shape_to_godot_transform
 
-def unreal_to_godot_transform(u_transform):
-    """
-    Converts Unreal Transform to Godot Transform.
-    """
-    ux, uy, uz = u_transform.translation.x, u_transform.translation.y, u_transform.translation.z
-    godot_translation = [uy * 0.01, uz * 0.01, -ux * 0.01]
-    
-    usx, usy, usz = u_transform.scale3d.x, u_transform.scale3d.y, u_transform.scale3d.z
-    godot_scale = [usy, usz, usx]
-    
-    u_quat = u_transform.rotation
-    qx, qy, qz, qw = u_quat.x, u_quat.y, u_quat.z, u_quat.w
-    
-    r00 = 1.0 - 2.0 * (qy**2 + qz**2)
-    r01 = 2.0 * (qx*qy - qw*qz)
-    r02 = 2.0 * (qx*qz + qw*qy)
-    
-    r10 = 2.0 * (qx*qy + qw*qz)
-    r11 = 1.0 - 2.0 * (qx**2 + qz**2)
-    r12 = 2.0 * (qy*qz - qw*qx)
-    
-    r20 = 2.0 * (qx*qz - qw*qy)
-    r21 = 2.0 * (qy*qz + qw*qx)
-    r22 = 1.0 - 2.0 * (qx**2 + qy**2)
-    
-    rg00 = r11
-    rg01 = r12
-    rg02 = -r10
-    
-    rg10 = r21
-    rg11 = r22
-    rg12 = -r20
-    
-    rg20 = -r01
-    rg21 = -r02
-    rg22 = r00
-    
-    R_godot = [
-        [rg00, rg01, rg02],
-        [rg10, rg11, rg12],
-        [rg20, rg21, rg22]
-    ]
-    
-    g_quat = matrix_to_quat(R_godot)
-    return {
-        "translation": godot_translation,
-        "rotation_quat": list(g_quat),
-        "scale": godot_scale
-    }
-
-class _SimpleTransform:
-    def __init__(self, translation, rotation, scale3d):
-        self.translation = translation
-        self.rotation = rotation
-        self.scale3d = scale3d
-
-def local_shape_to_godot_transform(translation_vec, rotation_quat):
-    mock = _SimpleTransform(translation_vec, rotation_quat, unreal.Vector(1.0, 1.0, 1.0))
-    return unreal_to_godot_transform(mock)
 
 def extract_skeletal_mesh_physics(skeletal_mesh):
     """
