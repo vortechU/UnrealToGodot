@@ -9,8 +9,9 @@ import os
 import sys
 import queue
 import threading
+import json
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, ttk
 import unreal
 
 # Import underlying exporters
@@ -30,7 +31,7 @@ class UnrealToGodotApp:
         self.project_dir = project_dir
         self.root = tk.Tk()
         self.root.title("Unreal ➔ Godot Exporter")
-        self.root.geometry("520x540")
+        self.root.geometry("520x720")
         self.root.configure(bg="#1e1e1e")
         self.root.resizable(True, True)
         
@@ -39,6 +40,10 @@ class UnrealToGodotApp:
         
         # Initialize UI layout
         self.init_ui()
+        
+        # Load persisted settings and update UI
+        self.load_settings()
+        self.toggle_godot_path_state()
         
         # Bind close event
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -173,6 +178,29 @@ class UnrealToGodotApp:
         )
         self.separate_textures_cb.pack(anchor=tk.W, pady=(4, 0))
         
+        # Max Texture Resolution Row
+        res_row = tk.Frame(mesh_inner, bg="#1e1e1e")
+        res_row.pack(fill=tk.X, pady=(6, 0))
+        
+        res_lbl = tk.Label(
+            res_row,
+            text="Max Texture Resolution:",
+            fg="#e5e5e5",
+            bg="#1e1e1e",
+            font=("Segoe UI", 9)
+        )
+        res_lbl.pack(side=tk.LEFT)
+        
+        self.max_res_combo = ttk.Combobox(
+            res_row,
+            values=["Unlimited / Original", "512", "1024 (1K)", "2048 (2K)", "4096 (4K)"],
+            state="readonly",
+            width=22,
+            font=("Segoe UI", 9)
+        )
+        self.max_res_combo.set("Unlimited / Original")
+        self.max_res_combo.pack(side=tk.RIGHT)
+        
         self.export_mesh_btn = tk.Button(
             mesh_inner, 
             text="Export Selected Meshes", 
@@ -271,6 +299,73 @@ class UnrealToGodotApp:
         )
         self.export_layout_btn.pack(fill=tk.X, pady=(10, 0))
         
+        # --- Section 3: Godot Integration Exporter ---
+        godot_frame = tk.LabelFrame(
+            self.root, 
+            text=" Godot Engine Integration ", 
+            fg="#f59e0b", 
+            bg="#1e1e1e", 
+            bd=1, 
+            relief=tk.SOLID, 
+            font=("Segoe UI", 9, "bold")
+        )
+        godot_frame.pack(fill=tk.X, padx=20, pady=5)
+        
+        godot_inner = tk.Frame(godot_frame, bg="#1e1e1e")
+        godot_inner.pack(fill=tk.X, padx=12, pady=10)
+        
+        self.auto_transfer_var = tk.BooleanVar(value=False)
+        self.auto_transfer_cb = tk.Checkbutton(
+            godot_inner,
+            text="Auto-transfer exports to Godot Project",
+            variable=self.auto_transfer_var,
+            fg="#ffffff",
+            bg="#1e1e1e",
+            activebackground="#1e1e1e",
+            activeforeground="#ffffff",
+            selectcolor="#121212",
+            font=("Segoe UI", 9),
+            command=self.toggle_godot_path_state
+        )
+        self.auto_transfer_cb.pack(anchor=tk.W)
+        
+        self.godot_path_row = tk.Frame(godot_inner, bg="#1e1e1e")
+        self.godot_path_row.pack(fill=tk.X, pady=(6, 0))
+        
+        self.godot_path_lbl = tk.Label(
+            self.godot_path_row,
+            text="Godot Project Path:",
+            fg="#a3a3a3",
+            bg="#1e1e1e",
+            font=("Segoe UI", 9)
+        )
+        self.godot_path_lbl.pack(side=tk.LEFT, padx=(0, 6))
+        
+        self.godot_path_entry = tk.Entry(
+            self.godot_path_row, 
+            bg="#121212", 
+            fg="#ffffff", 
+            insertbackground="#ffffff", 
+            bd=1, 
+            relief=tk.SOLID, 
+            font=("Segoe UI", 10)
+        )
+        self.godot_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
+        
+        self.browse_godot_btn = tk.Button(
+            self.godot_path_row, 
+            text="Browse...", 
+            bg="#27272a", 
+            fg="#ffffff", 
+            activebackground="#3f3f46", 
+            activeforeground="#ffffff", 
+            bd=0, 
+            padx=10, 
+            font=("Segoe UI", 9, "bold"), 
+            command=self.browse_godot_project
+        )
+        self.browse_godot_btn.pack(side=tk.LEFT, padx=(6, 0))
+        
         # --- Footer Status Bar ---
         self.status_lbl = tk.Label(
             self.root, 
@@ -366,18 +461,127 @@ class UnrealToGodotApp:
         else:
             self.status_lbl.config(fg="#a3a3a3")
 
+    def toggle_godot_path_state(self):
+        state = tk.NORMAL if self.auto_transfer_var.get() else tk.DISABLED
+        self.godot_path_entry.config(state=state)
+        self.browse_godot_btn.config(state=state)
+
+    def browse_godot_project(self):
+        dir_path = filedialog.askdirectory(
+            initialdir=self.godot_path_entry.get(),
+            title="Select Godot Project Directory"
+        )
+        if dir_path:
+            norm_path = os.path.normpath(dir_path)
+            self.godot_path_entry.delete(0, tk.END)
+            self.godot_path_entry.insert(0, norm_path)
+
+    def get_max_texture_resolution(self):
+        text = self.max_res_combo.get()
+        if "512" in text:
+            return 512
+        elif "1024" in text:
+            return 1024
+        elif "2048" in text:
+            return 2048
+        elif "4096" in text:
+            return 4096
+        return 0
+
+    def load_settings(self):
+        config_dir = os.path.join(self.project_dir, "Saved", "Config")
+        config_path = os.path.join(config_dir, "UnrealToGodotSettings.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    settings = json.load(f)
+                if isinstance(settings, dict):
+                    if "auto_transfer" in settings:
+                        self.auto_transfer_var.set(settings["auto_transfer"])
+                    if "godot_project_path" in settings:
+                        self.godot_path_entry.delete(0, tk.END)
+                        self.godot_path_entry.insert(0, settings["godot_project_path"])
+                    if "export_anims" in settings:
+                        self.export_anims_var.set(settings["export_anims"])
+                    if "export_lods" in settings:
+                        self.export_lods_var.set(settings["export_lods"])
+                    if "separate_textures" in settings:
+                        self.separate_textures_var.set(settings["separate_textures"])
+                    if "mesh_path" in settings:
+                        self.mesh_path_entry.delete(0, tk.END)
+                        self.mesh_path_entry.insert(0, settings["mesh_path"])
+                    if "layout_path" in settings:
+                        self.layout_path_entry.delete(0, tk.END)
+                        self.layout_path_entry.insert(0, settings["layout_path"])
+                    if "max_texture_res" in settings:
+                        val = settings["max_texture_res"]
+                        if val == 512:
+                            self.max_res_combo.set("512")
+                        elif val == 1024:
+                            self.max_res_combo.set("1024 (1K)")
+                        elif val == 2048:
+                            self.max_res_combo.set("2048 (2K)")
+                        elif val == 4096:
+                            self.max_res_combo.set("4096 (4K)")
+                        else:
+                            self.max_res_combo.set("Unlimited / Original")
+            except Exception:
+                pass
+
+    def save_settings(self):
+        config_dir = os.path.join(self.project_dir, "Saved", "Config")
+        os.makedirs(config_dir, exist_ok=True)
+        config_path = os.path.join(config_dir, "UnrealToGodotSettings.json")
+        settings = {
+            "godot_project_path": self.godot_path_entry.get(),
+            "auto_transfer": self.auto_transfer_var.get(),
+            "export_anims": self.export_anims_var.get(),
+            "export_lods": self.export_lods_var.get(),
+            "separate_textures": self.separate_textures_var.get(),
+            "mesh_path": self.mesh_path_entry.get(),
+            "layout_path": self.layout_path_entry.get(),
+            "max_texture_res": self.get_max_texture_resolution()
+        }
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=4)
+        except Exception:
+            pass
+
+    def get_godot_project_dir_if_valid(self):
+        if not self.auto_transfer_var.get():
+            return None
+            
+        godot_project = self.godot_path_entry.get()
+        if not godot_project or not os.path.isdir(godot_project):
+            self.show_status("Error: Please select a valid Godot Project Path.", "error")
+            return -1
+            
+        if not os.path.exists(os.path.join(godot_project, "project.godot")):
+            self.show_status("Error: Path does not contain project.godot.", "error")
+            return -1
+            
+        return godot_project
+
     def run_mesh_export(self):
         export_dir = self.mesh_path_entry.get()
         if not export_dir:
             self.show_status("Error: Please select a valid target directory first.", "error")
             return
             
+        godot_project = self.get_godot_project_dir_if_valid()
+        if godot_project == -1:
+            return
+            
         export_anims = self.export_anims_var.get()
         export_lods = self.export_lods_var.get()
         separate_tex = self.separate_textures_var.get()
+        max_res = self.get_max_texture_resolution()
+        
+        self.save_settings()
         self.show_status("Export command sent to Unreal...")
         # Queue the export meshes command to run on main thread
-        _command_queue.put(("export_meshes", [export_dir, export_anims, export_lods, separate_tex]))
+        _command_queue.put(("export_meshes", [export_dir, export_anims, export_lods, separate_tex, godot_project, max_res]))
 
     def run_all_meshes_export(self):
         export_dir = self.mesh_path_entry.get()
@@ -385,12 +589,19 @@ class UnrealToGodotApp:
             self.show_status("Error: Please select a valid target directory first.", "error")
             return
             
+        godot_project = self.get_godot_project_dir_if_valid()
+        if godot_project == -1:
+            return
+            
         export_anims = self.export_anims_var.get()
         export_lods = self.export_lods_var.get()
         separate_tex = self.separate_textures_var.get()
+        max_res = self.get_max_texture_resolution()
+        
+        self.save_settings()
         self.show_status("Batch export command sent to Unreal...")
         # Queue the export all meshes command to run on main thread
-        _command_queue.put(("export_all_meshes", [export_dir, export_anims, export_lods, separate_tex]))
+        _command_queue.put(("export_all_meshes", [export_dir, export_anims, export_lods, separate_tex, godot_project, max_res]))
 
     def run_layout_export(self):
         save_path = self.layout_path_entry.get()
@@ -398,14 +609,25 @@ class UnrealToGodotApp:
             self.show_status("Error: Please select a valid target JSON save path first.", "error")
             return
             
+        godot_project = self.get_godot_project_dir_if_valid()
+        if godot_project == -1:
+            return
+            
+        max_res = self.get_max_texture_resolution()
+        
+        self.save_settings()
         self.show_status("Export command sent to Unreal...")
         # Queue the export layout command to run on main thread
-        _command_queue.put(("export_layout", [save_path]))
+        _command_queue.put(("export_layout", [save_path, godot_project, max_res]))
 
     def close(self):
         """Pushes close signal to main thread and shuts down GUI."""
         if not self.is_closed:
             self.is_closed = True
+            try:
+                self.save_settings()
+            except Exception:
+                pass
             _command_queue.put(("close", []))
             try:
                 self.root.destroy()
@@ -465,10 +687,12 @@ def check_editor_queues(delta_time):
                 export_anims = args[1] if len(args) > 1 else False
                 export_lods = args[2] if len(args) > 2 else False
                 separate_tex = args[3] if len(args) > 3 else True
+                godot_project = args[4] if len(args) > 4 else None
+                max_res = args[5] if len(args) > 5 else 0
                 unreal.log("Unreal to Godot Exporter: Starting mesh export on main thread...")
                 try:
                     exported, failed = export_static_meshes_to_gltf.export_selected_static_meshes(
-                        export_dir=export_dir, export_animations=export_anims, export_lods=export_lods, separate_textures=separate_tex, show_dialogs=False
+                        export_dir=export_dir, export_animations=export_anims, export_lods=export_lods, separate_textures=separate_tex, show_dialogs=False, godot_project_dir=godot_project, max_texture_resolution=max_res
                     )
                     if failed > 0:
                         _state_queue.put({"status": (f"Export completed: {exported} exported, {failed} failed.", "warning")})
@@ -482,10 +706,12 @@ def check_editor_queues(delta_time):
                 export_anims = args[1] if len(args) > 1 else False
                 export_lods = args[2] if len(args) > 2 else False
                 separate_tex = args[3] if len(args) > 3 else True
+                godot_project = args[4] if len(args) > 4 else None
+                max_res = args[5] if len(args) > 5 else 0
                 unreal.log("Unreal to Godot Exporter: Starting batch level mesh export on main thread...")
                 try:
                     exported, failed = export_static_meshes_to_gltf.export_all_level_meshes(
-                        export_dir=export_dir, export_animations=export_anims, export_lods=export_lods, separate_textures=separate_tex, show_dialogs=False
+                        export_dir=export_dir, export_animations=export_anims, export_lods=export_lods, separate_textures=separate_tex, show_dialogs=False, godot_project_dir=godot_project, max_texture_resolution=max_res
                     )
                     if failed > 0:
                         _state_queue.put({"status": (f"Batch export completed: {exported} exported, {failed} failed.", "warning")})
@@ -496,10 +722,12 @@ def check_editor_queues(delta_time):
                     
             elif cmd == "export_layout":
                 save_path = args[0]
+                godot_project = args[1] if len(args) > 1 else None
+                max_res = args[2] if len(args) > 2 else 0
                 unreal.log("Unreal to Godot Exporter: Starting level layout export on main thread...")
                 try:
                     success = export_level_to_json.export_level_to_json(
-                        save_path=save_path, show_dialogs=False
+                        save_path=save_path, show_dialogs=False, godot_project_dir=godot_project, max_texture_resolution=max_res
                     )
                     if success:
                         _state_queue.put({"status": ("Successfully exported level layout JSON!", "success")})

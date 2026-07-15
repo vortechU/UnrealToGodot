@@ -194,7 +194,7 @@ def extract_skeletal_mesh_physics(skeletal_mesh):
         }
         
         # 1. Box Elements
-        for box in agg_geom.box_elems:
+        for box in agg_geom.get_editor_property("box_elems"):
             center = box.get_editor_property("center")
             rot = box.get_editor_property("rotation")
             u_quat = rot.quaternion()
@@ -210,7 +210,7 @@ def extract_skeletal_mesh_physics(skeletal_mesh):
             })
             
         # 2. Sphere Elements
-        for sphere in agg_geom.sphere_elems:
+        for sphere in agg_geom.get_editor_property("sphere_elems"):
             center = sphere.get_editor_property("center")
             godot_local = local_shape_to_godot_transform(center, unreal.Quat(0.0, 0.0, 0.0, 1.0))
             
@@ -220,7 +220,7 @@ def extract_skeletal_mesh_physics(skeletal_mesh):
             })
             
         # 3. Capsule (Sphyl) Elements
-        for capsule in agg_geom.sphyl_elems:
+        for capsule in agg_geom.get_editor_property("sphyl_elems"):
             center = capsule.get_editor_property("center")
             rot = capsule.get_editor_property("rotation")
             u_quat = rot.quaternion()
@@ -233,7 +233,7 @@ def extract_skeletal_mesh_physics(skeletal_mesh):
             })
             
         # 4. Convex Elements
-        for convex in agg_geom.convex_elems:
+        for convex in agg_geom.get_editor_property("convex_elems"):
             try:
                 center = convex.get_editor_property("center")
                 rot = convex.get_editor_property("rotation")
@@ -288,7 +288,7 @@ def get_mesh_lod_count(mesh):
             pass
     return 1
 
-def export_textures_for_meshes(meshes, export_dir, separate_textures=True):
+def export_textures_for_meshes(meshes, export_dir, separate_textures=True, max_res_limit=0):
     collected_textures = set()
     for mesh in meshes:
         if isinstance(mesh, unreal.StaticMesh):
@@ -314,27 +314,129 @@ def export_textures_for_meshes(meshes, export_dir, separate_textures=True):
     os.makedirs(textures_dir, exist_ok=True)
     
     tasks = []
-    for tex in collected_textures:
-        tex_name = tex.get_name()
-        filename = os.path.join(textures_dir, f"{tex_name}.png")
-        
-        task = unreal.AssetExportTask()
-        task.object = tex
-        task.filename = filename
-        task.automated = True
-        task.prompt = False
-        task.replace_identical = True
-        
-        if hasattr(unreal, "TextureExporterPNG"):
-            task.exporter = unreal.TextureExporterPNG()
+    original_sizes = {}  # Store original max sizes to restore them later
+    
+    try:
+        for tex in collected_textures:
+            tex_name = tex.get_name()
+            filename = os.path.join(textures_dir, f"{tex_name}.png")
             
-        tasks.append(task)
-        
-    if tasks:
-        unreal.log(f"Exporting {len(tasks)} referenced textures to: {textures_dir}")
-        unreal.Exporter.run_asset_export_tasks(tasks)
+            # If a resolution limit is set (e.g., 1024 for 1K)
+            if max_res_limit > 0:
+                try:
+                    # Store the original max texture size setting
+                    original_sizes[tex] = tex.get_editor_property("max_texture_size")
+                    # Apply the limit temporarily
+                    tex.set_editor_property("max_texture_size", max_res_limit)
+                except Exception as e:
+                    unreal.log_warning(f"Could not limit resolution for {tex_name}: {str(e)}")
+            
+            task = unreal.AssetExportTask()
+            task.object = tex
+            task.filename = filename
+            task.automated = True
+            task.prompt = False
+            task.replace_identical = True
+            
+            if hasattr(unreal, "TextureExporterPNG"):
+                task.exporter = unreal.TextureExporterPNG()
+                
+            tasks.append(task)
+            
+        if tasks:
+            unreal.log(f"Exporting {len(tasks)} referenced textures to: {textures_dir}")
+            unreal.Exporter.run_asset_export_tasks(tasks)
+    finally:
+        # Restore the original texture sizes so we don't modify the user's source assets
+        if max_res_limit > 0 and original_sizes:
+            for tex, orig_size in original_sizes.items():
+                try:
+                    tex.set_editor_property("max_texture_size", orig_size)
+                except Exception as e:
+                    unreal.log_warning(f"Failed to restore texture size for {tex.get_name()}: {str(e)}")
 
-def export_selected_static_meshes(export_dir=None, export_animations=False, export_lods=False, separate_textures=True, show_dialogs=True):
+def copy_exports_to_godot(export_dir, meshes_exported, separate_textures, godot_project_dir):
+    if not godot_project_dir or not os.path.isdir(godot_project_dir):
+        return
+    
+    unreal.log(f"Unreal to Godot: Automatically transferring exported files to Godot project: {godot_project_dir}")
+    
+    godot_models_dir = os.path.join(godot_project_dir, "models")
+    godot_textures_dir = os.path.join(godot_project_dir, "textures")
+    
+    os.makedirs(godot_models_dir, exist_ok=True)
+    os.makedirs(godot_textures_dir, exist_ok=True)
+    
+    # 1. Copy mesh assets (.gltf, .bin, _physics.json)
+    for mesh in meshes_exported:
+        mesh_name = mesh.get_name()
+        if os.path.exists(export_dir):
+            for filename in os.listdir(export_dir):
+                base, ext = os.path.splitext(filename)
+                
+                # Check if it is the base mesh, physics json, or LOD mesh for this exact mesh_name
+                is_match = False
+                if base == mesh_name or base == f"{mesh_name}_physics":
+                    is_match = True
+                elif base.startswith(f"{mesh_name}_LOD"):
+                    lod_part = base[len(mesh_name) + len("_LOD"):]
+                    if lod_part.isdigit():
+                        is_match = True
+                        
+                if is_match and (ext.lower() in [".gltf", ".bin", ".json"]):
+                    src_path = os.path.join(export_dir, filename)
+                    dest_path = os.path.join(godot_models_dir, filename)
+                    try:
+                        if os.path.abspath(src_path) != os.path.abspath(dest_path):
+                            shutil.copy2(src_path, dest_path)
+                            unreal.log(f"Transferred mesh file: {filename} -> {godot_models_dir}")
+                    except Exception as copy_err:
+                        unreal.log_warning(f"Failed to copy {filename} to Godot: {str(copy_err)}")
+                        
+    # 2. Copy textures
+    export_dir = os.path.normpath(export_dir)
+    if separate_textures:
+        parent_dir = os.path.dirname(export_dir)
+        textures_dir = os.path.join(parent_dir, "textures")
+    else:
+        textures_dir = export_dir
+        
+    if os.path.exists(textures_dir):
+        collected_textures = set()
+        for mesh in meshes_exported:
+            if isinstance(mesh, unreal.StaticMesh):
+                static_materials = mesh.get_editor_property("static_materials")
+                for static_mat in static_materials:
+                    collect_textures_from_material(static_mat.material_interface, collected_textures)
+            elif hasattr(unreal, "SkeletalMesh") and isinstance(mesh, unreal.SkeletalMesh):
+                skeletal_materials = mesh.get_editor_property("materials")
+                for skel_mat in skeletal_materials:
+                    collect_textures_from_material(skel_mat.material_interface, collected_textures)
+                    
+        tex_names = {t.get_name() for t in collected_textures if isinstance(t, unreal.Texture)}
+        
+        for filename in os.listdir(textures_dir):
+            base_name, ext = os.path.splitext(filename)
+            if ext.lower() in [".png", ".tga", ".jpg", ".jpeg", ".dds"]:
+                is_match = base_name in tex_names
+                if not is_match:
+                    for mesh in meshes_exported:
+                        m_name = mesh.get_name()
+                        if base_name == m_name or base_name.startswith(f"{m_name}_") or base_name.startswith(f"{m_name} "):
+                            is_match = True
+                            break
+                
+                if is_match:
+                    src_path = os.path.join(textures_dir, filename)
+                    dest_path = os.path.join(godot_textures_dir, filename)
+                    try:
+                        if os.path.abspath(src_path) != os.path.abspath(dest_path):
+                            shutil.copy2(src_path, dest_path)
+                            unreal.log(f"Transferred texture file: {filename} -> {godot_textures_dir}")
+                    except Exception as copy_err:
+                        unreal.log_warning(f"Failed to copy texture {filename} to Godot: {str(copy_err)}")
+
+def export_selected_static_meshes(export_dir=None, export_animations=False, export_lods=False, separate_textures=True, show_dialogs=True, godot_project_dir=None, max_texture_resolution=0):
     # 1. Check requirements
     if not hasattr(unreal, "GLTFExporter"):
         if show_dialogs:
@@ -453,6 +555,7 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
     # 5. Export Meshes with a progress bar (ScopedSlowTask)
     exported_count = 0
     failed_exports = []
+    exported_meshes = []
     
     selected_actors = set() # Empty set because we are exporting static mesh assets, not world actors
     
@@ -472,6 +575,7 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
             if export_lods:
                 lod_count = get_mesh_lod_count(mesh)
                 
+            mesh_has_exported = False
             for lod_index in range(lod_count):
                 if lod_index == 0:
                     export_path = os.path.join(export_dir, f"{mesh_name}.gltf")
@@ -504,6 +608,7 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
                         )
                     if success:
                         exported_count += 1
+                        mesh_has_exported = True
                         unreal.log(f"Successfully exported LOD {lod_index}: {mesh_name} -> {export_path}")
                         
                         # Only export Physics Asset for LOD 0
@@ -525,11 +630,14 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
                 except Exception as e:
                     failed_exports.append(f"{mesh_name}_LOD{lod_index}" if lod_index > 0 else mesh_name)
                     unreal.log_error(f"Error exporting {mesh_name} LOD {lod_index}: {str(e)}")
+            
+            if mesh_has_exported:
+                exported_meshes.append(mesh)
 
     # Automatically export referenced textures
     if exported_count > 0:
         try:
-            export_textures_for_meshes(meshes_to_export, export_dir, separate_textures)
+            export_textures_for_meshes(meshes_to_export, export_dir, separate_textures, max_texture_resolution)
         except Exception as tex_err:
             unreal.log_warning(f"Failed to export textures for meshes: {str(tex_err)}")
 
@@ -554,6 +662,12 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
                                 unreal.log_warning(f"Failed to relocate baked texture {filename}: {str(move_err)}")
             except Exception as scan_err:
                 unreal.log_warning(f"Failed to scan and relocate baked textures: {str(scan_err)}")
+
+        if godot_project_dir:
+            try:
+                copy_exports_to_godot(export_dir, exported_meshes, separate_textures, godot_project_dir)
+            except Exception as copy_err:
+                unreal.log_warning(f"Failed to auto-transfer exports to Godot: {str(copy_err)}")
 
     # 6. Show summary to user
     if show_dialogs:
@@ -595,7 +709,7 @@ def prompt_for_folder(initial_dir):
         unreal.log_warning(f"Could not open directory browser dialog via tkinter: {str(e)}")
     return None
 
-def export_all_level_meshes(export_dir=None, export_animations=False, export_lods=False, separate_textures=True, show_dialogs=True):
+def export_all_level_meshes(export_dir=None, export_animations=False, export_lods=False, separate_textures=True, show_dialogs=True, godot_project_dir=None, max_texture_resolution=0):
     # 1. Check requirements
     if not hasattr(unreal, "GLTFExporter"):
         if show_dialogs:
@@ -673,6 +787,7 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
     # 5. Export Meshes
     exported_count = 0
     failed_exports = []
+    exported_meshes = []
     selected_actors = set()
     
     with unreal.ScopedSlowTask(len(meshes_to_export), "Batch Exporting Level Meshes to glTF...") as slow_task:
@@ -690,6 +805,7 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
             if export_lods:
                 lod_count = get_mesh_lod_count(mesh)
                 
+            mesh_has_exported = False
             for lod_index in range(lod_count):
                 if lod_index == 0:
                     export_path = os.path.join(export_dir, f"{mesh_name}.gltf")
@@ -721,6 +837,7 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
                         )
                     if success:
                         exported_count += 1
+                        mesh_has_exported = True
                         # Only export Physics Asset for LOD 0
                         if lod_index == 0:
                             # Try exporting Physics Asset companion if it is a skeletal mesh
@@ -739,11 +856,14 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
                 except Exception as e:
                     failed_exports.append(f"{mesh_name}_LOD{lod_index}" if lod_index > 0 else mesh_name)
                     unreal.log_error(f"Error exporting {mesh_name} LOD {lod_index}: {str(e)}")
+            
+            if mesh_has_exported:
+                exported_meshes.append(mesh)
 
     # Automatically export referenced textures
     if exported_count > 0:
         try:
-            export_textures_for_meshes(meshes_to_export, export_dir, separate_textures)
+            export_textures_for_meshes(meshes_to_export, export_dir, separate_textures, max_texture_resolution)
         except Exception as tex_err:
             unreal.log_warning(f"Failed to export textures for meshes: {str(tex_err)}")
 
@@ -768,6 +888,12 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
                                 unreal.log_warning(f"Failed to relocate baked texture {filename}: {str(move_err)}")
             except Exception as scan_err:
                 unreal.log_warning(f"Failed to scan and relocate baked textures: {str(scan_err)}")
+
+        if godot_project_dir:
+            try:
+                copy_exports_to_godot(export_dir, exported_meshes, separate_textures, godot_project_dir)
+            except Exception as copy_err:
+                unreal.log_warning(f"Failed to auto-transfer exports to Godot: {str(copy_err)}")
 
     if show_dialogs:
         summary_message = f"Successfully exported {exported_count} of {len(meshes_to_export)} level mesh(es) to:\n{export_dir}"

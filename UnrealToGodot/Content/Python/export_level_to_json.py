@@ -153,7 +153,7 @@ def extract_mesh_collision(static_mesh):
         body_setup = static_mesh.get_editor_property("body_setup")
         if not body_setup:
             return None
-        agg_geom = body_setup.agg_geom
+        agg_geom = body_setup.get_editor_property("agg_geom")
     except Exception:
         return None
         
@@ -165,7 +165,7 @@ def extract_mesh_collision(static_mesh):
     }
     
     # 1. Box Elements
-    for box in agg_geom.box_elems:
+    for box in agg_geom.get_editor_property("box_elems"):
         center = box.get_editor_property("center")
         rot = box.get_editor_property("rotation")
         u_quat = rot.quaternion()
@@ -181,7 +181,7 @@ def extract_mesh_collision(static_mesh):
         })
         
     # 2. Sphere Elements
-    for sphere in agg_geom.sphere_elems:
+    for sphere in agg_geom.get_editor_property("sphere_elems"):
         center = sphere.get_editor_property("center")
         # Spheres don't have rotation
         godot_local = local_shape_to_godot_transform(center, unreal.Quat(0.0, 0.0, 0.0, 1.0))
@@ -192,7 +192,7 @@ def extract_mesh_collision(static_mesh):
         })
         
     # 3. Capsule (Sphyl) Elements
-    for capsule in agg_geom.sphyl_elems:
+    for capsule in agg_geom.get_editor_property("sphyl_elems"):
         center = capsule.get_editor_property("center")
         rot = capsule.get_editor_property("rotation")
         u_quat = rot.quaternion()
@@ -205,7 +205,7 @@ def extract_mesh_collision(static_mesh):
         })
         
     # 4. Convex Elements
-    for convex in agg_geom.convex_elems:
+    for convex in agg_geom.get_editor_property("convex_elems"):
         try:
             center = convex.get_editor_property("center")
             rot = convex.get_editor_property("rotation")
@@ -488,7 +488,7 @@ def prompt_for_save_file(default_path):
         unreal.log_warning(f"Could not open file save dialog via tkinter: {str(e)}")
     return None
 
-def export_level_to_json(save_path=None, show_dialogs=True):
+def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=None, max_texture_resolution=0):
     # 1. Check requirements
     if not hasattr(unreal, "get_editor_subsystem"):
         if show_dialogs:
@@ -676,6 +676,7 @@ def export_level_to_json(save_path=None, show_dialogs=True):
         # Export all collected textures automatically
         exported_textures_count = 0
         if collected_textures:
+            original_sizes = {}
             try:
                 parent_dir = os.path.dirname(save_path)
                 textures_dir = os.path.join(parent_dir, "textures")
@@ -687,6 +688,13 @@ def export_level_to_json(save_path=None, show_dialogs=True):
                         continue
                     tex_name = tex.get_name()
                     filename = os.path.join(textures_dir, f"{tex_name}.png")
+                    
+                    if max_texture_resolution > 0:
+                        try:
+                            original_sizes[tex] = tex.get_editor_property("max_texture_size")
+                            tex.set_editor_property("max_texture_size", max_texture_resolution)
+                        except Exception as e:
+                            unreal.log_warning(f"Could not limit resolution for {tex_name}: {str(e)}")
                     
                     task = unreal.AssetExportTask()
                     task.object = tex
@@ -709,6 +717,44 @@ def export_level_to_json(save_path=None, show_dialogs=True):
                             exported_textures_count += 1
             except Exception as tex_err:
                 unreal.log_warning(f"Failed to export level textures: {str(tex_err)}")
+            finally:
+                if max_texture_resolution > 0 and original_sizes:
+                    for tex, orig_size in original_sizes.items():
+                        try:
+                            tex.set_editor_property("max_texture_size", orig_size)
+                        except Exception as e:
+                            unreal.log_warning(f"Failed to restore texture size for {tex.get_name()}: {str(e)}")
+
+        if godot_project_dir and os.path.isdir(godot_project_dir):
+            try:
+                import shutil
+                unreal.log(f"Unreal to Godot: Automatically transferring layout and textures to Godot project: {godot_project_dir}")
+                
+                # Copy JSON file
+                dest_json = os.path.join(godot_project_dir, os.path.basename(save_path))
+                if os.path.abspath(save_path) != os.path.abspath(dest_json):
+                    shutil.copy2(save_path, dest_json)
+                    unreal.log(f"Transferred layout JSON: {os.path.basename(save_path)} -> {godot_project_dir}")
+                
+                # Copy textures
+                if collected_textures:
+                    godot_textures_dir = os.path.join(godot_project_dir, "textures")
+                    os.makedirs(godot_textures_dir, exist_ok=True)
+                    
+                    local_textures_dir = os.path.join(os.path.dirname(save_path), "textures")
+                    if os.path.exists(local_textures_dir):
+                        for tex in collected_textures:
+                            if not tex or not isinstance(tex, unreal.Texture):
+                                continue
+                            tex_name = tex.get_name()
+                            src_tex = os.path.join(local_textures_dir, f"{tex_name}.png")
+                            if os.path.exists(src_tex):
+                                dest_tex = os.path.join(godot_textures_dir, f"{tex_name}.png")
+                                if os.path.abspath(src_tex) != os.path.abspath(dest_tex):
+                                    shutil.copy2(src_tex, dest_tex)
+                                    unreal.log(f"Transferred texture: {tex_name}.png -> {godot_textures_dir}")
+            except Exception as copy_err:
+                unreal.log_warning(f"Failed to auto-transfer level layout to Godot: {str(copy_err)}")
         
         if show_dialogs:
             summary_msg = (

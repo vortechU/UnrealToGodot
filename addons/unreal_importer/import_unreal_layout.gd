@@ -45,6 +45,9 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 		return false
 		
 	var file := FileAccess.open(json_path, FileAccess.READ)
+	if file == null:
+		printerr("Import Error: Could not open JSON file (may be locked or inaccessible): ", json_path)
+		return false
 	var json_string := file.get_as_text()
 	file.close()
 	
@@ -94,6 +97,19 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 			var comp_data = components[0]
 			var mesh_name: String = comp_data.get("mesh_name", "")
 			
+			# Resolve the component's relative transform
+			var comp_transform: Transform3D
+			if USE_GDSCRIPT_TRANSFORM_CONVERSION:
+				var u_trans = comp_data["unreal_relative_transform"]
+				comp_transform = convert_unreal_to_godot_transform(
+					u_trans["translation"], 
+					u_trans["rotation_quat"], 
+					u_trans["scale"]
+				)
+			else:
+				var g_trans = comp_data["godot_relative_transform"]
+				comp_transform = get_transform_from_dict(g_trans)
+			
 			var gltf_path := find_gltf_path(models_folder, mesh_name)
 			if gltf_path == "":
 				missing_meshes[mesh_name] = true
@@ -110,20 +126,20 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 				
 				if physics_body:
 					# If there is collision, the physics body is the parent node,
-					# and the mesh is a child of it at identity transform.
+					# and the mesh is a child of it with the component's relative offset.
 					instanced_mesh.name = mesh_name
 					physics_body.add_child(instanced_mesh)
 					physics_body.owner = active_scene_root
 					instanced_mesh.owner = active_scene_root
 					_set_owner_recursive(instanced_mesh, active_scene_root)
-					instanced_mesh.transform = Transform3D.IDENTITY
+					instanced_mesh.transform = comp_transform
 				else:
-					# Direct visual-only mesh instance
+					# Direct visual-only mesh instance: combine actor + component transforms
 					instanced_mesh.name = actor_name
 					active_scene_root.add_child(instanced_mesh)
 					instanced_mesh.owner = active_scene_root
 					_set_owner_recursive(instanced_mesh, active_scene_root)
-					instanced_mesh.global_transform = actor_transform
+					instanced_mesh.global_transform = actor_transform * comp_transform
 				imported_count += 1
 			else:
 				if physics_body:
@@ -249,8 +265,8 @@ func _set_owner_recursive(node: Node, owner: Node) -> void:
 		return
 		
 	for child in node.get_children():
-		# Skip nodes that are already part of an inherited sub-scene/instance
-		if child.owner != null:
+		# Skip nodes that are already correctly owned by the target scene root
+		if child.owner == owner:
 			continue
 		child.owner = owner
 		_set_owner_recursive(child, owner)
