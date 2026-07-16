@@ -1,0 +1,219 @@
+"""Builds a throwaway Godot project that exercises import_unreal_layout.gd for real.
+
+Creates: project.godot, a copy of the addon, a minimal valid glTF triangle per
+mesh, a level_layout.json shaped exactly like the exporter's output, and a
+SceneTree test script that runs do_import() and asserts node placement.
+"""
+import base64
+import json
+import os
+import shutil
+import struct
+
+HARNESS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_project")
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+if os.path.exists(HARNESS):
+    shutil.rmtree(HARNESS)
+os.makedirs(os.path.join(HARNESS, "models"))
+
+# --- minimal valid glTF: one triangle, buffer embedded as a data URI ----------
+positions = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]
+pos_bytes = b"".join(struct.pack("<3f", *p) for p in positions)
+idx_bytes = struct.pack("<3H", 0, 1, 2) + b"\x00\x00"  # padded to 4-byte alignment
+blob = pos_bytes + idx_bytes
+
+gltf = {
+    "asset": {"version": "2.0", "generator": "harness"},
+    "scene": 0,
+    "scenes": [{"nodes": [0]}],
+    "nodes": [{"mesh": 0, "name": "TriNode"}],
+    "meshes": [{"name": "Tri", "primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],
+    "buffers": [{
+        "byteLength": len(blob),
+        "uri": "data:application/octet-stream;base64," + base64.b64encode(blob).decode("ascii"),
+    }],
+    "bufferViews": [
+        {"buffer": 0, "byteOffset": 0, "byteLength": len(pos_bytes), "target": 34962},
+        {"buffer": 0, "byteOffset": len(pos_bytes), "byteLength": 6, "target": 34963},
+    ],
+    "accessors": [
+        {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+         "min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 0.0]},
+        {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"},
+    ],
+}
+
+for name in ["SM_Rock", "SM_Crate"]:
+    with open(os.path.join(HARNESS, "models", name + ".gltf"), "w", encoding="utf-8") as f:
+        json.dump(gltf, f)
+
+# --- project + addon ---------------------------------------------------------
+with open(os.path.join(HARNESS, "project.godot"), "w", encoding="utf-8") as f:
+    f.write('config_version=5\n\n[application]\n\nconfig/name="ImporterHarness"\n'
+            'config/features=PackedStringArray("4.6")\n')
+
+shutil.copytree(os.path.join(REPO, "addons"), os.path.join(HARNESS, "addons"))
+
+# --- layout fixture: exactly the shape export_level_to_json.py emits ----------
+def t(x, y, z, s=1.0):
+    return {"translation": [x, y, z], "rotation_quat": [0.0, 0.0, 0.0, 1.0], "scale": [s, s, s]}
+
+layout = {
+    "format_version": 2,
+    "level_name": "HarnessLevel",
+    "meshes": {
+        # Rock has collision -> exercises the StaticBody3D path.
+        "SM_Rock": {"path": "/Game/SM_Rock", "export_name": "SM_Rock", "materials": [],
+                    "collision": {"boxes": [{"size": [100.0, 100.0, 100.0],
+                                             "godot_local_transform": t(0, 0, 0)}],
+                                  "spheres": [], "capsules": [], "convex_hulls": []}},
+        # Crate has no collision -> exercises the plain-instance path.
+        "SM_Crate": {"path": "/Game/SM_Crate", "export_name": "SM_Crate",
+                     "collision": None, "materials": []},
+    },
+    "actors": [
+        {
+            # Plain StaticMeshActor. UE reports the root component's relative
+            # transform as the WORLD transform -- identical to the actor's.
+            # The old importer composed them into (40, 6, -100).
+            "name": "Buoy_1", "class": "StaticMeshActor",
+            "godot_transform": t(20, 3, -50),
+            "components": [{"name": "SM0", "mesh_key": "SM_Rock", "mesh_name": "SM_Rock",
+                            "godot_relative_transform": t(20, 3, -50),
+                            "godot_world_transform": t(20, 3, -50),
+                            "unreal_relative_transform": t(20, 3, -50),
+                            "unreal_world_transform": t(20, 3, -50),
+                            "material_overrides": []}],
+        },
+        {
+            # Same, but no collision -> visual-only branch.
+            "name": "Crate_1", "class": "StaticMeshActor",
+            "godot_transform": t(7, 1, 2),
+            "components": [{"name": "SM0", "mesh_key": "SM_Crate", "mesh_name": "SM_Crate",
+                            "godot_relative_transform": t(7, 1, 2),
+                            "godot_world_transform": t(7, 1, 2),
+                            "material_overrides": []}],
+        },
+        {
+            # Blueprint with a component nested TWO levels deep: its relative
+            # transform (1,0,0) is measured against an intermediate component,
+            # so only godot_world_transform reaches the true (16, 0, 0).
+            "name": "BP_Pier", "class": "BP_Pier_C",
+            "godot_transform": t(10, 0, 0),
+            "components": [
+                {"name": "Deck", "mesh_key": "SM_Crate", "mesh_name": "SM_Crate",
+                 "godot_relative_transform": t(5, 0, 0),
+                 "godot_world_transform": t(15, 0, 0), "material_overrides": []},
+                {"name": "Plank", "mesh_key": "SM_Crate", "mesh_name": "SM_Crate",
+                 "godot_relative_transform": t(1, 0, 0),
+                 "godot_world_transform": t(16, 0, 0), "material_overrides": []},
+            ],
+        },
+    ],
+    "lights": [], "post_process": [], "decals": [], "foliage": [], "landscapes": [],
+    "height_fog": None, "sky_light": None, "has_sky_atmosphere": False, "navigation": None,
+}
+
+with open(os.path.join(HARNESS, "level_layout.json"), "w", encoding="utf-8") as f:
+    json.dump(layout, f, indent=2)
+
+# --- the test script Godot will run ------------------------------------------
+TEST_GD = '''extends SceneTree
+
+const Importer = preload("res://addons/unreal_importer/import_unreal_layout.gd")
+
+var failures: Array[String] = []
+
+func check(name: String, cond: bool, detail: String = "") -> void:
+	if cond:
+		print("  PASS  ", name)
+	else:
+		print("  FAIL  ", name, "  ", detail)
+		failures.append(name)
+
+func near(a: Vector3, b: Vector3, eps: float = 0.001) -> bool:
+	return a.distance_to(b) < eps
+
+func find_node(root: Node, n: String) -> Node:
+	if root.name == n:
+		return root
+	for c in root.get_children():
+		var f := find_node(c, n)
+		if f:
+			return f
+	return null
+
+func _init() -> void:
+	var root := Node3D.new()
+	root.name = "Root"
+	get_root().add_child(root)
+
+	var importer = Importer.new()
+	var ok = importer.do_import("res://level_layout.json", "res://models/",
+		"res://textures/", root, {"apply_metadata": false})
+	check("do_import returned true", ok == true)
+
+	print("\\n--- scene tree ---")
+	_dump(root, 0)
+	print("")
+
+	# 1. StaticMeshActor WITH collision -> StaticBody3D at the true world transform.
+	var buoy := find_node(root, "Buoy_1")
+	check("Buoy_1 exists", buoy != null)
+	if buoy and buoy is Node3D:
+		var p: Vector3 = (buoy as Node3D).global_transform.origin
+		check("Buoy_1 at (20, 3, -50) not doubled", near(p, Vector3(20, 3, -50)), str(p))
+		check("Buoy_1 is NOT at the pre-fix (40, 6, -100)",
+			not near(p, Vector3(40, 6, -100)), str(p))
+		check("Buoy_1 is a StaticBody3D (collision present)", buoy is StaticBody3D,
+			buoy.get_class())
+		# The mesh must sit at identity under the body so it lines up with the shapes.
+		var mesh_child: Node3D = null
+		for c in buoy.get_children():
+			if c is Node3D and not (c is CollisionShape3D):
+				mesh_child = c
+		check("Buoy_1 mesh child sits at identity under the body",
+			mesh_child != null and near(mesh_child.transform.origin, Vector3.ZERO),
+			str(mesh_child.transform.origin) if mesh_child else "no mesh child")
+
+	# 2. StaticMeshActor WITHOUT collision -> plain instance branch.
+	var crate := find_node(root, "Crate_1")
+	check("Crate_1 exists", crate != null)
+	if crate and crate is Node3D:
+		var p2: Vector3 = (crate as Node3D).global_transform.origin
+		check("Crate_1 at (7, 1, 2) not doubled", near(p2, Vector3(7, 1, 2)), str(p2))
+
+	# 3. Blueprint: the deeply nested component must reach its true world spot.
+	var plank := find_node(root, "Plank")
+	check("BP_Pier/Plank exists", plank != null)
+	if plank and plank is Node3D:
+		var p3: Vector3 = (plank as Node3D).global_transform.origin
+		check("Plank resolves to world (16, 0, 0)", near(p3, Vector3(16, 0, 0)), str(p3))
+		check("Plank is NOT at the pre-fix (11, 0, 0)", not near(p3, Vector3(11, 0, 0)), str(p3))
+	var deck := find_node(root, "Deck")
+	if deck and deck is Node3D:
+		var p4: Vector3 = (deck as Node3D).global_transform.origin
+		check("Deck resolves to world (15, 0, 0)", near(p4, Vector3(15, 0, 0)), str(p4))
+
+	print("\\n============================================")
+	if failures.size() > 0:
+		print("FAILURES (", failures.size(), "): ", failures)
+		quit(1)
+	else:
+		print("ALL GODOT IMPORT CHECKS PASSED")
+		quit(0)
+
+func _dump(n: Node, depth: int) -> void:
+	var pos := ""
+	if n is Node3D:
+		pos = " @ " + str((n as Node3D).global_transform.origin)
+	print("  ".repeat(depth), n.name, " [", n.get_class(), "]", pos)
+	for c in n.get_children():
+		_dump(c, depth + 1)
+'''
+
+with open(os.path.join(HARNESS, "test_import.gd"), "w", encoding="utf-8") as f:
+    f.write(TEST_GD)
+
+print("harness built at:", HARNESS)

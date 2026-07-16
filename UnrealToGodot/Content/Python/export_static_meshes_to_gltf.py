@@ -18,6 +18,101 @@ import unreal
 
 import ue2g_common
 
+
+def _set_export_option(export_options, name, value):
+    """Sets one glTF export option in isolation.
+
+    Each property gets its own try/except on purpose: property names differ
+    between engine versions, and a single shared try block means the first
+    unknown name silently skips every option after it.
+    """
+    try:
+        export_options.set_editor_property(name, value)
+        return True
+    except Exception as e:
+        unreal.log_warning(f"glTF export option '{name}' not applied: {str(e)}")
+        return False
+
+
+def _enum_value(enum_name, member, fallback):
+    """Resolves unreal.<enum_name>.<member>, falling back to a raw int."""
+    enum_type = getattr(unreal, enum_name, None)
+    if enum_type is not None:
+        value = getattr(enum_type, member, None)
+        if value is not None:
+            return value
+    return fallback
+
+
+def configure_gltf_export_options(export_options, export_animations):
+    """Configures UGLTFExportOptions for a geometry-only export.
+
+    Materials are deliberately NOT baked. UE's glTF exporter bakes each material
+    into <material>_<mesh>_BaseColor.png (etc.) beside the .gltf and references
+    them as relative URIs. Baking is slow, crashes on complex material graphs,
+    and produces files this toolchain then relocates -- which would break those
+    URIs. Instead the importer rebuilds materials from the layout JSON's material
+    parameters plus the separately exported source textures.
+    """
+    _set_export_option(export_options, "adjust_normalmaps", True)
+    _set_export_option(export_options, "export_vertex_colors", True)
+    _set_export_option(export_options, "export_animation_sequences", export_animations)
+    # Belt and braces: stop the bake itself, and stop it writing image files.
+    _set_export_option(
+        export_options,
+        "bake_material_inputs",
+        _enum_value("GLTFMaterialBakeMode", "DISABLED", 0),
+    )
+    _set_export_option(
+        export_options,
+        "texture_image_format",
+        _enum_value("GLTFTextureImageFormat", "NONE", 0),
+    )
+
+
+def relocate_baked_textures(export_dir, textures_dir):
+    """Moves stray PNGs emitted beside the .gltf files into textures_dir.
+
+    Skips any PNG a .gltf actually references: those are resolved as URIs
+    relative to the .gltf, so moving them would leave the model pointing at a
+    file that is no longer there. This should be a no-op now that baking is
+    disabled, but older engine versions may ignore the bake settings.
+    """
+    if not os.path.exists(export_dir):
+        return
+    referenced = set()
+    for filename in os.listdir(export_dir):
+        if not filename.lower().endswith(".gltf"):
+            continue
+        try:
+            with open(os.path.join(export_dir, filename), "r", encoding="utf-8") as gf:
+                gltf_doc = json.load(gf)
+            for image in gltf_doc.get("images", []) or []:
+                uri = image.get("uri")
+                if uri:
+                    referenced.add(os.path.basename(uri).lower())
+        except Exception as read_err:
+            # Unreadable glTF: assume every sibling PNG is referenced rather than
+            # risk moving one out from under it.
+            unreal.log_warning(
+                f"Could not scan {filename} for texture references, "
+                f"leaving sibling PNGs in place: {str(read_err)}"
+            )
+            return
+
+    os.makedirs(textures_dir, exist_ok=True)
+    for filename in os.listdir(export_dir):
+        if not filename.lower().endswith(".png"):
+            continue
+        if filename.lower() in referenced:
+            unreal.log(f"Keeping glTF-referenced texture beside model: {filename}")
+            continue
+        try:
+            shutil.move(os.path.join(export_dir, filename), os.path.join(textures_dir, filename))
+            unreal.log(f"Relocated baked texture: {filename} -> {textures_dir}")
+        except Exception as move_err:
+            unreal.log_warning(f"Failed to relocate baked texture {filename}: {str(move_err)}")
+
 def collect_textures_from_material(material, collected_textures):
     if not material:
         return
@@ -459,15 +554,7 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
     # 4. Set up glTF Export Options
     export_options = unreal.GLTFExportOptions()
     
-    # Configure export settings (adjust as needed)
-    # We set editor properties to ensure they match common conventions
-    try:
-        export_options.set_editor_property("adjust_normalmaps", True) # Fix normal maps convention
-        export_options.set_editor_property("export_vertex_colors", True)
-        export_options.set_editor_property("export_materials", False) # Prevent crash on complex materials baking
-        export_options.set_editor_property("export_animation_sequences", export_animations) # Avoid heavy/crashing anim exports unless requested
-    except Exception as e:
-        unreal.log_warning(f"Could not configure some export options: {str(e)}")
+    configure_gltf_export_options(export_options, export_animations)
 
     # 5. Export Meshes with a progress bar (ScopedSlowTask)
     exported_count = 0
@@ -561,24 +648,14 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
             unreal.log_warning(f"Failed to export textures for meshes: {str(tex_err)}")
 
         if separate_textures:
-            # Post-export safety relocator: move any PNG textures generated by the glTF exporter
-            # inside the GLTF/ folder to the sibling textures/ folder.
+            # Post-export safety net: with baking disabled the glTF folder should
+            # contain no PNGs at all, but relocate any that appear anyway.
             try:
                 clean_export_dir = os.path.normpath(export_dir)
-                parent_dir = os.path.dirname(clean_export_dir)
-                textures_dir = os.path.join(parent_dir, "textures")
-                os.makedirs(textures_dir, exist_ok=True)
-                
-                if os.path.exists(clean_export_dir):
-                    for filename in os.listdir(clean_export_dir):
-                        if filename.lower().endswith(".png"):
-                            src_path = os.path.join(clean_export_dir, filename)
-                            dest_path = os.path.join(textures_dir, filename)
-                            try:
-                                shutil.move(src_path, dest_path)
-                                unreal.log(f"Relocated baked texture: {filename} -> {textures_dir}")
-                            except Exception as move_err:
-                                unreal.log_warning(f"Failed to relocate baked texture {filename}: {str(move_err)}")
+                relocate_baked_textures(
+                    clean_export_dir,
+                    os.path.join(os.path.dirname(clean_export_dir), "textures"),
+                )
             except Exception as scan_err:
                 unreal.log_warning(f"Failed to scan and relocate baked textures: {str(scan_err)}")
 
@@ -695,13 +772,7 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
 
     # 4. Set up glTF Export Options
     export_options = unreal.GLTFExportOptions()
-    try:
-        export_options.set_editor_property("adjust_normalmaps", True)
-        export_options.set_editor_property("export_vertex_colors", True)
-        export_options.set_editor_property("export_materials", False)
-        export_options.set_editor_property("export_animation_sequences", export_animations)
-    except Exception:
-        pass
+    configure_gltf_export_options(export_options, export_animations)
 
     # 5. Export Meshes
     exported_count = 0
@@ -789,24 +860,14 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
             unreal.log_warning(f"Failed to export textures for meshes: {str(tex_err)}")
 
         if separate_textures:
-            # Post-export safety relocator: move any PNG textures generated by the glTF exporter
-            # inside the GLTF/ folder to the sibling textures/ folder.
+            # Post-export safety net: with baking disabled the glTF folder should
+            # contain no PNGs at all, but relocate any that appear anyway.
             try:
                 clean_export_dir = os.path.normpath(export_dir)
-                parent_dir = os.path.dirname(clean_export_dir)
-                textures_dir = os.path.join(parent_dir, "textures")
-                os.makedirs(textures_dir, exist_ok=True)
-                
-                if os.path.exists(clean_export_dir):
-                    for filename in os.listdir(clean_export_dir):
-                        if filename.lower().endswith(".png"):
-                            src_path = os.path.join(clean_export_dir, filename)
-                            dest_path = os.path.join(textures_dir, filename)
-                            try:
-                                shutil.move(src_path, dest_path)
-                                unreal.log(f"Relocated baked texture: {filename} -> {textures_dir}")
-                            except Exception as move_err:
-                                unreal.log_warning(f"Failed to relocate baked texture {filename}: {str(move_err)}")
+                relocate_baked_textures(
+                    clean_export_dir,
+                    os.path.join(os.path.dirname(clean_export_dir), "textures"),
+                )
             except Exception as scan_err:
                 unreal.log_warning(f"Failed to scan and relocate baked textures: {str(scan_err)}")
 

@@ -934,15 +934,54 @@ def _do_register_menu():
     except Exception as e:
         unreal.log_warning(f"Unreal to Godot Exporter: Could not register menu entry: {str(e)}")
 
-def register_menu_entry():
-    """Checks if Slate is ready, otherwise defers registration to post-init callback."""
-    menus = unreal.ToolMenus.get()
-    window_menu = menus.find_menu("LevelEditor.MainMenu.Window")
-    if window_menu:
+_deferred_menu_handle = None
+
+
+def _try_register_menu_on_tick(_delta_seconds):
+    """Slate post-tick pump: registers the menu as soon as the Window menu exists."""
+    global _deferred_menu_handle
+    try:
+        if not unreal.ToolMenus.get().find_menu("LevelEditor.MainMenu.Window"):
+            return  # not ready yet; try again next tick
         _do_register_menu()
-    else:
-        unreal.log("Unreal to Godot Exporter: Slate menus not loaded yet. Deferring registration.")
-        unreal.register_slate_post_init_callback(_do_register_menu)
+    except Exception as e:
+        unreal.log_warning(f"Unreal to Godot Exporter: deferred menu registration failed: {str(e)}")
+    # Registered or permanently failed -- either way, stop pumping.
+    if _deferred_menu_handle is not None:
+        try:
+            unreal.unregister_slate_post_tick_callback(_deferred_menu_handle)
+        except Exception:
+            pass
+        _deferred_menu_handle = None
+
+
+def register_menu_entry():
+    """Registers the Window menu entry, deferring until Slate has built the menu.
+
+    Uses register_slate_post_tick_callback: it is the only slate callback the
+    Python API actually exposes. An earlier version called
+    register_slate_post_init_callback, which does not exist -- so whenever the
+    menu was not ready at import time, the AttributeError propagated out of
+    init_unreal.py and the entire plugin failed to load.
+
+    Commandlets (-run=pythonscript) have no Slate at all; there is no menu to
+    register there, so a missing callback API is not an error.
+    """
+    global _deferred_menu_handle
+    try:
+        if unreal.ToolMenus.get().find_menu("LevelEditor.MainMenu.Window"):
+            _do_register_menu()
+            return
+    except Exception as e:
+        unreal.log_warning(f"Unreal to Godot Exporter: could not query menus: {str(e)}")
+        return
+
+    if not hasattr(unreal, "register_slate_post_tick_callback"):
+        unreal.log("Unreal to Godot Exporter: no Slate available (commandlet?); skipping menu.")
+        return
+
+    unreal.log("Unreal to Godot Exporter: Slate menus not loaded yet. Deferring registration.")
+    _deferred_menu_handle = unreal.register_slate_post_tick_callback(_try_register_menu_on_tick)
 
 # Self-initialize on script import
 register_menu_entry()

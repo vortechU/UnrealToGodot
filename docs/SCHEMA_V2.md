@@ -89,6 +89,30 @@ Godot import: `node.set_meta("unreal_class", class)`, `set_meta("unreal_tags", t
 and one `set_meta(k, v)` per entry in `properties`. Property values are restricted to
 bool / int / float / string; anything else is stringified or dropped.
 
+### Component placement: `godot_world_transform` is authoritative
+
+**Importers MUST place a mesh component using its `godot_world_transform`, and MUST
+NOT compute `actor.godot_transform * component.godot_relative_transform`.**
+
+`*_relative_transform` comes from Unreal's `get_relative_transform()`, which is measured
+against the component's **immediate parent component** — not against the actor:
+
+- For an actor's **root** component (every plain `StaticMeshActor`) there is no parent
+  component, so the relative transform *is already the world transform*. Composing it
+  with the actor transform applies the placement **twice**: an actor at `(20, 3, -50)`
+  lands at `(40, 6, -100)`.
+- For a component nested two or more levels deep in a Blueprint, the relative transform
+  is measured against an intermediate component, so composing with only the actor
+  transform **silently drops** the intermediate offsets.
+
+`*_relative_transform` is retained for debugging and for reconstructing hierarchy, but
+it is not a placement input. Consumers that must parent under an actor node (multi-mesh
+Blueprints) should reparent via `actor_transform.affine_inverse() * world`, never by
+composing relatives.
+
+Implementations: `component_world_transform()` in `import_unreal_layout.gd`, and
+`_component_world_mat()` in `tscn_writer.py`.
+
 ## lights
 
 ```json

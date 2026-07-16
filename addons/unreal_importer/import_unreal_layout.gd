@@ -123,32 +123,20 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 			var comp_data = components[0]
 			var mesh_name: String = comp_data.get("mesh_name", "")
 			var mesh_key: String = comp_data.get("mesh_key", mesh_name)
-			
-			# Resolve the component's relative transform
-			var comp_transform: Transform3D
-			if USE_GDSCRIPT_TRANSFORM_CONVERSION:
-				var u_trans = comp_data["unreal_relative_transform"]
-				comp_transform = convert_unreal_to_godot_transform(
-					u_trans["translation"], 
-					u_trans["rotation_quat"], 
-					u_trans["scale"]
-				)
-			else:
-				var g_trans = comp_data["godot_relative_transform"]
-				comp_transform = get_transform_from_dict(g_trans)
-			
+
+			# The component's absolute placement, straight from the exporter.
+			var comp_transform := component_world_transform(comp_data, actor_transform)
+
 			var gltf_path := find_model_for(models_folder, mesh_key, mesh_name)
 			if gltf_path == "":
 				missing_meshes[mesh_key] = true
-				create_placeholder(active_scene_root, actor_name, actor_transform, mesh_key)
+				create_placeholder(active_scene_root, actor_name, comp_transform, mesh_key)
 				continue
 
 			# Collision shapes are defined in mesh-local space, so the physics body
-			# must sit at the mesh's full world transform (actor * component). The
-			# mesh then sits at IDENTITY under it, keeping collision and mesh aligned
-			# even when the component has a non-identity relative offset.
-			var body_transform := actor_transform * comp_transform
-			var physics_body = setup_physics_body(active_scene_root, actor_name, body_transform, mesh_key, meshes_lib)
+			# sits at the component's world transform and the mesh sits at IDENTITY
+			# under it, keeping collision and mesh aligned.
+			var physics_body = setup_physics_body(active_scene_root, actor_name, comp_transform, mesh_key, meshes_lib)
 			var instanced_mesh = instance_gltf(gltf_path)
 			
 			if instanced_mesh:
@@ -166,12 +154,12 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					_set_owner_recursive(instanced_mesh, active_scene_root)
 					instanced_mesh.transform = Transform3D.IDENTITY
 				else:
-					# Direct visual-only mesh instance: combine actor + component transforms
+					# Direct visual-only mesh instance at the component's world transform.
 					instanced_mesh.name = actor_name
 					active_scene_root.add_child(instanced_mesh)
 					instanced_mesh.owner = active_scene_root
 					_set_owner_recursive(instanced_mesh, active_scene_root)
-					instanced_mesh.global_transform = actor_transform * comp_transform
+					instanced_mesh.transform = comp_transform
 				imported_count += 1
 				if gameplay_helper:
 					gameplay_helper.apply_actor_metadata(physics_body if physics_body else instanced_mesh, actor_data, import_options)
@@ -187,23 +175,16 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 			actor_node.global_transform = actor_transform
 			
 			var any_component_succeeded := false
+			# Components hang off actor_node, so their world placement has to be
+			# expressed relative to the actor rather than to the world.
+			var actor_inverse := actor_transform.affine_inverse()
 			for comp_data in components:
 				var comp_name: String = comp_data.get("name", "Component")
 				var mesh_name: String = comp_data.get("mesh_name", "")
 				var mesh_key: String = comp_data.get("mesh_key", mesh_name)
-				
-				var comp_transform: Transform3D
-				if USE_GDSCRIPT_TRANSFORM_CONVERSION:
-					var u_trans = comp_data["unreal_relative_transform"]
-					comp_transform = convert_unreal_to_godot_transform(
-						u_trans["translation"], 
-						u_trans["rotation_quat"], 
-						u_trans["scale"]
-					)
-				else:
-					var g_trans = comp_data["godot_relative_transform"]
-					comp_transform = get_transform_from_dict(g_trans)
-					
+
+				var comp_transform := actor_inverse * component_world_transform(comp_data, actor_transform)
+
 				var gltf_path := find_model_for(models_folder, mesh_key, mesh_name)
 				if gltf_path == "":
 					missing_meshes[mesh_key] = true
@@ -278,6 +259,32 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 		print("Placeholders (Marker3Ds) were created at their respective transforms.")
 	print("======================================================\n")
 	return true
+
+func component_world_transform(comp_data: Dictionary, actor_transform: Transform3D) -> Transform3D:
+	"""Resolves a mesh component's absolute placement in Godot space.
+
+	Do NOT compose actor * relative here. Unreal reports get_relative_transform()
+	against a component's IMMEDIATE parent component, and an actor's ROOT component
+	has no parent component -- its relative transform is already the world transform.
+	Composing therefore double-applies the placement for every plain StaticMeshActor,
+	and for a component nested two levels deep inside a Blueprint it silently drops
+	the intermediate transform. The exporter writes each component's absolute world
+	transform, so use that and never accumulate.
+	"""
+	if USE_GDSCRIPT_TRANSFORM_CONVERSION:
+		if comp_data.has("unreal_world_transform"):
+			var u_trans = comp_data["unreal_world_transform"]
+			return convert_unreal_to_godot_transform(
+				u_trans["translation"],
+				u_trans["rotation_quat"],
+				u_trans["scale"]
+			)
+	elif comp_data.has("godot_world_transform"):
+		return get_transform_from_dict(comp_data["godot_world_transform"])
+	# Layout predates the world transform: fall back to the actor's own placement,
+	# which is correct for the single-root-component actors those layouts contain.
+	return actor_transform
+
 
 func find_gltf_path(folder: String, mesh_name: String) -> String:
 	"""Searches for a .gltf/.glb file with matching mesh name (case-insensitive)."""

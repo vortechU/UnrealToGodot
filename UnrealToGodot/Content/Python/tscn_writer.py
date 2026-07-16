@@ -171,6 +171,45 @@ def _mat_compose(parent, child):
 _IDENTITY_MAT = ([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], [0.0, 0.0, 0.0])
 
 
+def _mat_affine_inverse(mat):
+    """Godot Transform3D.affine_inverse(): inverts a basis that may carry scale/shear.
+
+    Falls back to identity on a singular basis (an actor scaled to zero on some
+    axis), which keeps the export running instead of raising mid-write.
+    """
+    rows, origin = mat
+    a, b, c = rows[0]
+    d, e, f = rows[1]
+    g, h, i = rows[2]
+    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    if abs(det) < 1e-12:
+        _warn("actor basis is singular (zero scale?); using identity inverse")
+        return _IDENTITY_MAT
+    inv_det = 1.0 / det
+    inv = [
+        [(e * i - f * h) * inv_det, (c * h - b * i) * inv_det, (b * f - c * e) * inv_det],
+        [(f * g - d * i) * inv_det, (a * i - c * g) * inv_det, (c * d - a * f) * inv_det],
+        [(d * h - e * g) * inv_det, (b * g - a * h) * inv_det, (a * e - b * d) * inv_det],
+    ]
+    inv_origin = [-sum(inv[r][k] * origin[k] for k in range(3)) for r in range(3)]
+    return (inv, inv_origin)
+
+
+def _component_world_mat(comp, actor_mat):
+    """A component's absolute placement, taken from the exporter rather than composed.
+
+    Unreal's get_relative_transform() is measured against a component's IMMEDIATE
+    parent component, and an actor's ROOT component has none -- its relative
+    transform is already the world transform. Composing actor * relative therefore
+    doubles the placement of every plain StaticMeshActor and drops intermediate
+    transforms for deeply nested Blueprint components. Mirrors
+    component_world_transform() in import_unreal_layout.gd.
+    """
+    if isinstance(comp, dict) and isinstance(comp.get("godot_world_transform"), dict):
+        return _transform_dict_to_mat(comp["godot_world_transform"])
+    return actor_mat
+
+
 def _mat_to_transform3d(mat):
     """(rows3x3, origin3) -> 'Transform3D(m00,m01,m02, m10,m11,m12, m20,m21,m22, ox,oy,oz)'."""
     rows, origin = mat
@@ -560,12 +599,11 @@ class _TscnWriter(object):
     def _build_single_component_actor(self, root_path, actor_name, actor_mat, comp,
                                       meshes_lib, actor_meta, emit_meta):
         mesh_key = self._component_mesh_key(comp)
-        comp_mat = _transform_dict_to_mat(comp.get("godot_relative_transform"))
+        world = _component_world_mat(comp, actor_mat)
         res_path = self._mesh_res_path(mesh_key)
 
         if res_path is None:
-            # Missing mesh -> Marker3D placeholder at actor*comp world transform
-            world = _mat_compose(actor_mat, comp_mat)
+            # Missing mesh -> Marker3D placeholder at the component's world transform
             props = ["transform = " + _mat_to_transform3d(world)]
             meta = ['metadata/missing_mesh = "%s"' % _escape_string(mesh_key)] + actor_meta
             self._add_node("MISSING_" + _sanitize_node_name(mesh_key), "Marker3D",
@@ -577,18 +615,18 @@ class _TscnWriter(object):
         collision = (meshes_lib.get(mesh_key) or {}).get("collision")
 
         if collision:
-            # StaticBody3D(actor) -> [ CollisionShape3D children ; mesh instance at comp relative ]
-            body_props = ["transform = " + _mat_to_transform3d(actor_mat)]
+            # Collision shapes are mesh-local, so the body carries the component's
+            # world transform and the mesh instance sits at identity under it.
+            body_props = ["transform = " + _mat_to_transform3d(world)]
             body_path = self._add_node(actor_name, "StaticBody3D", root_path,
                                        props=body_props, metadata=actor_meta)
             self._emit_collision(body_path, collision)
-            inst_props = ["transform = " + _mat_to_transform3d(comp_mat)]
+            inst_props = ["transform = " + _mat_to_transform3d(_IDENTITY_MAT)]
             inst_meta = self._component_metadata_lines(comp) if emit_meta else []
             self._add_node(_mesh_node_name(comp, mesh_key), None, body_path,
                            instance_id=ext_id, props=inst_props, metadata=inst_meta)
         else:
-            # Direct visual-only instance at actor*comp world transform
-            world = _mat_compose(actor_mat, comp_mat)
+            # Direct visual-only instance at the component's world transform
             props = ["transform = " + _mat_to_transform3d(world)]
             meta = list(actor_meta)
             if emit_meta:
@@ -601,10 +639,13 @@ class _TscnWriter(object):
         parent_props = ["transform = " + _mat_to_transform3d(actor_mat)]
         actor_path = self._add_node(actor_name, "Node3D", root_path,
                                     props=parent_props, metadata=actor_meta)
+        # Components are emitted under actor_path, so their world placement has to
+        # be re-expressed relative to the actor.
+        actor_inverse = _mat_affine_inverse(actor_mat)
         for comp in components:
             mesh_key = self._component_mesh_key(comp)
             comp_name = comp.get("name") or "Component"
-            comp_mat = _transform_dict_to_mat(comp.get("godot_relative_transform"))
+            comp_mat = _mat_compose(actor_inverse, _component_world_mat(comp, actor_mat))
             res_path = self._mesh_res_path(mesh_key)
             comp_meta = self._component_metadata_lines(comp) if emit_meta else []
 
