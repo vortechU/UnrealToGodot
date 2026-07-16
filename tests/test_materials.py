@@ -158,6 +158,64 @@ check("gltf with no materials returns 0", EX.inject_texture_references(p3, param
 check("missing file returns 0 rather than raising",
       EX.inject_texture_references(os.path.join(tmp, "nope.gltf"), params) == 0)
 
+# ------------------------------------------------- retargeting on transfer
+# A .gltf exported with textures beside it says "./TX_Foo.png". The transfer
+# into a Godot project splits models/ from textures/, so that uri then
+# resolves against res://models/ and Godot reports "Can't open file from
+# path" -- the exact failure this reproduces.
+def _uris(path):
+    with open(path, encoding="utf-8") as f:
+        return [i.get("uri") for i in json.load(f).get("images", [])]
+
+
+def _write_gltf(path, uris):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({
+            "asset": {"version": "2.0"},
+            "materials": [{"name": "M"}],
+            "images": [{"uri": u} for u in uris],
+            "textures": [{"source": i} for i in range(len(uris))],
+        }, f)
+
+
+side_by_side = os.path.join(tmp, "sbs.gltf")
+_write_gltf(side_by_side, ["./TX_Foo_ALB.png", "./TX_Foo_NRM.png"])
+n = EX.retarget_gltf_textures(side_by_side, "../textures")
+check("retarget rewrites every sibling uri", n == 2)
+check("retargeted uris point at ../textures/",
+      _uris(side_by_side) == ["../textures/TX_Foo_ALB.png", "../textures/TX_Foo_NRM.png"])
+
+bare = os.path.join(tmp, "bare.gltf")
+_write_gltf(bare, ["TX_Bare.png"])
+EX.retarget_gltf_textures(bare, "../textures")
+check("bare filename uri is retargeted too", _uris(bare) == ["../textures/TX_Bare.png"])
+
+already = os.path.join(tmp, "already.gltf")
+_write_gltf(already, ["../textures/TX_Foo_ALB.png"])
+check("already-correct uri is left alone (0 changes)",
+      EX.retarget_gltf_textures(already, "../textures") == 0)
+check("already-correct uri unchanged on disk",
+      _uris(already) == ["../textures/TX_Foo_ALB.png"])
+
+embedded = os.path.join(tmp, "embedded.gltf")
+_write_gltf(embedded, ["data:image/png;base64,iVBORw0KGgo="])
+check("embedded data: uri is not touched",
+      EX.retarget_gltf_textures(embedded, "../textures") == 0)
+
+deep = os.path.join(tmp, "deep.gltf")
+_write_gltf(deep, ["../some/other/place/TX_Foo_ALB.png"])
+EX.retarget_gltf_textures(deep, "../textures")
+check("a wrong nested path is rewritten to the basename",
+      _uris(deep) == ["../textures/TX_Foo_ALB.png"])
+
+check("retarget on a missing file returns 0 rather than raising",
+      EX.retarget_gltf_textures(os.path.join(tmp, "nope.gltf")) == 0)
+
+no_images = os.path.join(tmp, "noimg.gltf")
+with open(no_images, "w", encoding="utf-8") as f:
+    json.dump({"asset": {"version": "2.0"}}, f)
+check("gltf with no images returns 0", EX.retarget_gltf_textures(no_images) == 0)
+
 print("\n" + "=" * 60)
 if FAIL:
     print("FAILURES (%d): %s" % (len(FAIL), FAIL))

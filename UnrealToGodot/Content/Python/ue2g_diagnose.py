@@ -203,10 +203,14 @@ def audit_layout(rep, path, strict=True):
     if bad_scalars:
         for pname, count in bad_scalars.most_common():
             mesh_key, val = bad_examples[pname]
-            rep.error("%d material slot(s) have '%s' outside Godot's 0..1 range "
-                      "(e.g. %s on %s). Godot multiplies this with the texture, "
-                      "so the surface will be flattened or blown out."
-                      % (count, pname, round(val, 3), mesh_key))
+            # A warning, not an error: the importer clamps these on read, so
+            # the import survives. It is still worth surfacing, because the
+            # clamp is a guess at what an Unreal shader graph meant.
+            rep.warn("%d material slot(s) have '%s' outside Godot's 0..1 range "
+                     "(e.g. %s on %s). Unreal treats these as shader-graph "
+                     "inputs; Godot multiplies them into the texture. The "
+                     "importer clamps them, so check those surfaces look right."
+                     % (count, pname, round(val, 3), mesh_key))
     else:
         rep.ok("all material scalars are within Godot's 0..1 range")
 
@@ -375,6 +379,35 @@ def audit_godot_project(rep, project_dir):
         gltfs = [f for f in os.listdir(models_dir) if f.lower().endswith(".gltf")]
         rep.fact("glTFs in project", len(gltfs))
 
+        # The check that matters: a .gltf's uri is resolved against its OWN
+        # folder, and the transfer splits models/ from textures/. An export
+        # whose uris describe the export folder's layout instead of the
+        # project's breaks here and nowhere else.
+        broken = []
+        for name in gltfs:
+            try:
+                with open(os.path.join(models_dir, name), encoding="utf-8") as f:
+                    doc = json.load(f)
+            except Exception:
+                continue
+            for img in doc.get("images", []):
+                uri = img.get("uri")
+                if not uri or uri.startswith("data:"):
+                    continue
+                if not os.path.isfile(os.path.normpath(os.path.join(models_dir, uri))):
+                    broken.append((name, uri))
+        if broken:
+            name, uri = broken[0]
+            rep.error("%d image URI(s) in the project's models/ do not resolve "
+                      "(e.g. '%s' in %s -- Godot looks for it at res://models/%s "
+                      "and reports \"Can't open file from path\"). The .gltf "
+                      "references textures beside itself, but the transfer puts "
+                      "them in res://textures/. Re-export: the transfer now "
+                      "rewrites these to ../textures/."
+                      % (len(broken), uri, name, os.path.basename(uri)))
+        elif gltfs:
+            rep.ok("every glTF in the project resolves its textures")
+
     cache = os.path.join(project_dir, ".godot")
     if os.path.isdir(cache):
         rep.line("  note    a .godot/ cache exists. If models were re-exported, "
@@ -382,24 +415,67 @@ def audit_godot_project(rep, project_dir):
                  "a .gltf's textures changed.")
 
 
-def resolve_paths(export_dir):
-    """Works out where models/textures/layout are, given an export root.
+def _has_gltf(path):
+    return any(f.lower().endswith(".gltf") for f in _listdir(path))
 
-    Tolerates being handed the models folder itself, since that is what the
-    exporter's own 'export directory' setting points at.
+
+def find_models_dir(root):
+    """Locates the exported .gltf files under an export root.
+
+    The exporter's default is GLTF/, but the export directory is user-set and
+    can be anything, so look rather than assume: an earlier version of this
+    check hardcoded models/ -- a name that only ever existed in the test
+    harness -- and reported a perfectly good export as empty.
     """
-    export_dir = os.path.abspath(export_dir)
-    models = os.path.join(export_dir, "models")
-    if not os.path.isdir(models):
-        # Handed the models folder directly? Then the root is its parent, and
-        # textures sit beside it -- the layout the exporter actually writes.
-        if any(f.lower().endswith(".gltf") for f in _listdir(export_dir)):
-            models = export_dir
-            export_dir = os.path.dirname(export_dir)
-    return (export_dir,
-            models,
-            os.path.join(export_dir, "textures"),
-            os.path.join(export_dir, "level_layout.json"))
+    if _has_gltf(root):
+        return root
+    for name in ("GLTF", "models", "Models", "gltf"):
+        candidate = os.path.join(root, name)
+        if _has_gltf(candidate):
+            return candidate
+    for name in sorted(_listdir(root)):
+        candidate = os.path.join(root, name)
+        if os.path.isdir(candidate) and _has_gltf(candidate):
+            return candidate
+    return os.path.join(root, "GLTF")
+
+
+def find_layout_json(root):
+    """Locates the layout JSON. The exporter names it <LevelName>_layout.json,
+    and only falls back to level_layout.json when the level is unnamed."""
+    for name in ("level_layout.json",):
+        candidate = os.path.join(root, name)
+        if os.path.isfile(candidate):
+            return candidate
+    matches = sorted(f for f in _listdir(root) if f.lower().endswith("_layout.json"))
+    if matches:
+        # Newest wins: an export folder accumulates one per level exported.
+        matches.sort(key=lambda f: os.path.getmtime(os.path.join(root, f)), reverse=True)
+        return os.path.join(root, matches[0])
+    return os.path.join(root, "level_layout.json")
+
+
+def resolve_paths(export_dir):
+    """Works out where models/textures/layout live, given an export root.
+
+    Tolerates being handed the models folder itself, since that is exactly what
+    the exporter's 'export directory' setting points at (it defaults to
+    Saved/Exports/GLTF), while the layout and textures sit one level up.
+    """
+    root = os.path.abspath(export_dir)
+    models = find_models_dir(root)
+    # Handed the models folder directly? Then the real root is its parent --
+    # that is where textures/ and the layout json live.
+    if os.path.normcase(models) == os.path.normcase(root):
+        parent = os.path.dirname(root)
+        if os.path.isdir(os.path.join(parent, "textures")) or _layout_in(parent):
+            root = parent
+    return root, models, os.path.join(root, "textures"), find_layout_json(root)
+
+
+def _layout_in(path):
+    return any(f.lower().endswith("_layout.json") or f.lower() == "level_layout.json"
+               for f in _listdir(path))
 
 
 def _listdir(path):

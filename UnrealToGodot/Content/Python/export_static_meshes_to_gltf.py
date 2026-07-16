@@ -208,6 +208,56 @@ def inject_textures_for_exported_mesh(mesh, export_dir, mesh_name, separate_text
             unreal.log_warning(f"Texture injection failed for {filename}: {str(e)}")
 
 
+def retarget_gltf_textures(gltf_path, textures_rel="../textures"):
+    """Rewrites a .gltf's image uris to point at textures_rel/<filename>.
+
+    A .gltf's uris describe the folder it was exported into, but the copy that
+    matters is the one transferred into the Godot project -- and that always
+    splits models/ and textures/, whatever layout the export folder used. With
+    "separate textures" off, the exporter writes textures beside the models and
+    injects "./TX_Foo.png"; the transfer then puts the .gltf in models/ and the
+    texture in textures/, so Godot resolves "./TX_Foo.png" against res://models/
+    and reports "Can't open file from path".
+
+    Only the copy in the Godot project is retargeted, so the export folder keeps
+    whatever layout it was asked for and still previews correctly.
+
+    Returns the number of uris changed.
+    """
+    try:
+        with open(gltf_path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except Exception as e:
+        unreal.log_warning(f"Could not read {os.path.basename(gltf_path)} to retarget textures: {str(e)}")
+        return 0
+
+    images = doc.get("images")
+    if not images:
+        return 0
+
+    prefix = textures_rel.rstrip("/")
+    changed = 0
+    for image in images:
+        uri = image.get("uri")
+        # Embedded (data:) images carry their own bytes and have no path to fix.
+        if not uri or uri.startswith("data:"):
+            continue
+        base = os.path.basename(uri.replace("\\", "/"))
+        new_uri = base if prefix in ("", ".") else "%s/%s" % (prefix, base)
+        if new_uri != uri:
+            image["uri"] = new_uri
+            changed += 1
+
+    if changed:
+        try:
+            with open(gltf_path, "w", encoding="utf-8") as f:
+                json.dump(doc, f, indent=4)
+        except Exception as e:
+            unreal.log_warning(f"Could not rewrite {os.path.basename(gltf_path)}: {str(e)}")
+            return 0
+    return changed
+
+
 def relocate_baked_textures(export_dir, textures_dir):
     """Moves stray PNGs emitted beside the .gltf files into textures_dir.
 
@@ -540,6 +590,11 @@ def copy_exports_to_godot(export_dir, meshes_exported, separate_textures, godot_
                         if os.path.abspath(src_path) != os.path.abspath(dest_path):
                             shutil.copy2(src_path, dest_path)
                             unreal.log(f"Transferred mesh file: {filename} -> {godot_models_dir}")
+                            # Textures always land in <project>/textures, so the
+                            # copy has to reference them there regardless of how
+                            # the export folder itself was arranged.
+                            if ext.lower() == ".gltf":
+                                retarget_gltf_textures(dest_path, "../textures")
                     except Exception as copy_err:
                         unreal.log_warning(f"Failed to copy {filename} to Godot: {str(copy_err)}")
                         

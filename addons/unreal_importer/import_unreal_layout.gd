@@ -49,6 +49,7 @@ var import_options: Dictionary = {}
 # so the report file is the thing that can actually be handed to someone else.
 var report = null
 var _missing_textures: Dictionary = {}
+var _clamped_scalars: Dictionary = {}
 
 func _run() -> void:
 	# Standalone EditorScript execution entry point
@@ -65,6 +66,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 	report = ImportReport.new()
 	report.header(json_path, models_folder, textures_folder)
 	_missing_textures.clear()
+	_clamped_scalars.clear()
 	import_options = DEFAULT_IMPORT_OPTIONS.duplicate()
 	for key in options:
 		import_options[key] = options[key]
@@ -671,8 +673,15 @@ func create_godot_material(params: Dictionary, existing_mat: Material = null) ->
 	mat.albedo_color = Color(color_arr[0], color_arr[1], color_arr[2], color_arr[3])
 	
 	# 2. Map PBR multipliers
-	mat.roughness = params.get("roughness", 0.5)
-	mat.metallic = params.get("metallic", 0.0)
+	# Unreal's scalar parameters are inputs to a shader graph and are not bound
+	# to 0..1 -- real materials ship values like 4.57 and -0.27. Godot's
+	# roughness/metallic are multiplied straight into the corresponding texture
+	# channel, so an out-of-range value does not "look a bit off": 4.57 drives
+	# every texel above 0.22 to fully rough, flattening the surface completely.
+	# Clamping to the range Godot actually defines lets the packed map show
+	# through, which is what the map is there for.
+	mat.roughness = _clamp_unit(params.get("roughness", 0.5), 0.5, "roughness")
+	mat.metallic = _clamp_unit(params.get("metallic", 0.0), 0.0, "metallic")
 	
 	# 3. Map Tiling scale
 	var tiling_arr: Array = params.get("tiling", [1.0, 1.0])
@@ -725,6 +734,31 @@ func create_godot_material(params: Dictionary, existing_mat: Material = null) ->
 
 	_apply_packed_texture(mat, params)
 	return mat
+
+
+func _clamp_unit(value, fallback: float, label: String) -> float:
+	"""Brings an Unreal scalar into the 0..1 range Godot defines for it.
+
+	Reported once per distinct out-of-range value rather than per material: one
+	bad parameter is shared by dozens of slots, and repeating it drowns the
+	report it appears in.
+	"""
+	if not (value is float or value is int):
+		return fallback
+	var v := float(value)
+	if v >= 0.0 and v <= 1.0:
+		return v
+	var clamped: float = clampf(v, 0.0, 1.0)
+	var key := "%s=%.3f" % [label, v]
+	if not _clamped_scalars.has(key):
+		_clamped_scalars[key] = true
+		push_warning("Unreal Importer: %s %.3f is outside Godot's 0..1 range; clamped to %.2f. %s"
+			% [label, v, clamped,
+			   "Unreal treats this as a shader-graph input; Godot multiplies it into the texture."])
+		if report:
+			report.warn("%s of %.3f clamped to %.2f (Unreal scalar outside Godot's 0..1 range)"
+				% [label, v, clamped])
+	return clamped
 
 
 func _note_missing_texture(texture_name: String) -> void:
