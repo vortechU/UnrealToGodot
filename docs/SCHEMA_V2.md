@@ -73,6 +73,51 @@ Each entry:
 Components reference the library through `"mesh_key"` (falling back to `"mesh_name"`
 for v1 files).
 
+### material `parameters`
+
+```json
+{
+    "albedo_color": [r, g, b, a],      // a tint MULTIPLIER, and legitimately >1:
+                                       // packs often author dark albedo and scale it up
+    "roughness": 1.0,                  // multiplier against the roughness channel
+    "metallic": 1.0,                   // multiplier against the metallic channel
+    "albedo_texture": "TX_Foo_ALB" | null,
+    "normal_texture": "TX_Foo_NRM" | null,
+    "roughness_texture": null,         // only when the material uses SEPARATE maps
+    "metallic_texture": null,
+    "packed_texture": "TX_Foo_RMA" | null,   // one texture holding 3 channels
+    "packed_channels": { "roughness": 0, "metallic": 1, "ao": 2 } | null,
+    "tiling": [u, v]
+}
+```
+
+**Packed PBR maps.** Unreal packs roughness/metallic/AO into one texture's RGB
+channels, and the channel order is a naming convention, not a standard:
+
+| Parameter name | R | G | B |
+| --- | --- | --- | --- |
+| `RMA`, `RMAO` | roughness | metallic | ao |
+| `ORM`, `ARM` | ao | roughness | metallic |
+| `MRA`, `MRAO` | metallic | roughness | ao |
+
+The exporter resolves the layout from the parameter name and emits explicit
+channel indices in `packed_channels`, matching Godot's
+`BaseMaterial3D.TextureChannel` (`0=RED, 1=GREEN, 2=BLUE, 3=ALPHA`). Importers
+assign the same texture to `roughness_texture`/`metallic_texture`/`ao_texture` and
+set each `*_texture_channel` from those indices — **never assume one layout**, or
+metallic and AO silently swap.
+
+Matching is on whole tokens, so a parameter named `Normal` is not read as an `ORM`
+map. When a packed map supplies a channel and the material exposes no explicit
+multiplier, the exporter promotes that scalar to `1.0`: Godot computes
+`roughness = scalar * texture[channel]`, so the `metallic` default of `0.0` would
+otherwise cancel the map out entirely.
+
+**glTF image URIs** are resolved relative to the `.gltf` file's own directory, so
+they must spell out the real path (`"../textures/TX_Foo.png"`). A bare filename
+only ever resolves as a sibling of the `.gltf`. Verified: Godot loads a
+`../textures/` URI out of a sibling folder correctly.
+
 ## actors (v2 additions per actor)
 
 ```json

@@ -21,6 +21,7 @@ extends EditorPlugin
 const Importer = preload("res://addons/unreal_importer/import_unreal_layout.gd")
 
 var failures: Array[String] = []
+var results: Array[String] = []
 
 func _enter_tree() -> void:
 	call_deferred("_run_tests")
@@ -28,8 +29,10 @@ func _enter_tree() -> void:
 func check(name: String, cond: bool, detail: String = "") -> void:
 	if cond:
 		print("  PASS  ", name)
+		results.append("PASS  " + name)
 	else:
 		print("  FAIL  ", name, "  ", detail)
+		results.append("FAIL  " + name + "  " + detail)
 		failures.append(name)
 
 func near(a: Vector3, b: Vector3, eps: float = 0.001) -> bool:
@@ -95,13 +98,100 @@ func _run_tests() -> void:
 		var p4: Vector3 = (deck as Node3D).global_transform.origin
 		check("Deck resolves to world (15, 0, 0)", near(p4, Vector3(15, 0, 0)), str(p4))
 
+	_test_materials(root)
+
 	print("\\n============================================")
+	_write_results()
 	if failures.size() > 0:
 		print("FAILURES (", failures.size(), "): ", failures)
 		get_tree().quit(1)
 	else:
 		print("ALL GODOT IMPORT CHECKS PASSED")
 		get_tree().quit(0)
+
+
+func _write_results() -> void:
+	"""Writes results where run_tests.py can read them.
+
+	Godot's GUI-subsystem executable on Windows has no stdout to inherit when the
+	parent redirects to a file, so the runner cannot scrape the console. It reads
+	this file instead, and treats a missing file as a failure -- otherwise a
+	plugin that never ran would look identical to one that passed."""
+	var f := FileAccess.open("res://test_result.txt", FileAccess.WRITE)
+	if f == null:
+		printerr("could not write test_result.txt")
+		return
+	for line in results:
+		f.store_line(line)
+	f.store_line("TOTAL %d" % results.size())
+	f.store_line("VERDICT %s" % ("FAIL" if failures.size() > 0 else "PASS"))
+	f.close()
+
+func _test_materials(root: Node) -> void:
+	print("\\n--- materials ---")
+	var textured := find_node(root, "Textured_1")
+	check("Textured_1 exists", textured != null)
+	if textured == null:
+		return
+
+	var mi: MeshInstance3D = null
+	for c in textured.get_children():
+		if c is MeshInstance3D:
+			mi = c
+		else:
+			for g in c.get_children():
+				if g is MeshInstance3D:
+					mi = g
+	if mi == null and textured is MeshInstance3D:
+		mi = textured
+	check("found a MeshInstance3D under Textured_1", mi != null)
+	if mi == null:
+		return
+
+	# A: does Godot resolve "../textures/TX_Test_ALB.png" out of a SIBLING folder?
+	# This is what inject_texture_references() writes into every exported .gltf.
+	var gltf_mat = mi.mesh.surface_get_material(0) if mi.mesh and mi.mesh.get_surface_count() > 0 else null
+	var gltf_albedo = null
+	if gltf_mat and gltf_mat is BaseMaterial3D:
+		gltf_albedo = (gltf_mat as BaseMaterial3D).albedo_texture
+	check("glTF resolved a ../textures/ sibling uri into a real texture",
+		gltf_albedo != null,
+		"gltf material=%s" % [gltf_mat])
+
+	# B: the importer's own material, built from the layout JSON.
+	var m = mi.get_surface_override_material(0)
+	check("importer applied a surface override material", m != null)
+	if m == null or not (m is BaseMaterial3D):
+		return
+	var bm := m as BaseMaterial3D
+
+	check("albedo texture bound from the sibling textures/ folder",
+		bm.albedo_texture != null)
+	check("normal map bound and enabled",
+		bm.normal_texture != null and bm.normal_enabled)
+
+	# C: the packed RMA map -- the actual bug. One texture, three channels.
+	check("roughness driven by the packed map", bm.roughness_texture != null)
+	check("roughness reads the RED channel",
+		bm.roughness_texture_channel == BaseMaterial3D.TEXTURE_CHANNEL_RED,
+		str(bm.roughness_texture_channel))
+	check("metallic driven by the packed map", bm.metallic_texture != null)
+	check("metallic reads the GREEN channel (not RED -- that would be roughness)",
+		bm.metallic_texture_channel == BaseMaterial3D.TEXTURE_CHANNEL_GREEN,
+		str(bm.metallic_texture_channel))
+	check("ambient occlusion enabled", bm.ao_enabled)
+	check("AO reads the BLUE channel",
+		bm.ao_texture_channel == BaseMaterial3D.TEXTURE_CHANNEL_BLUE,
+		str(bm.ao_texture_channel))
+	check("roughness/metallic/AO share one texture resource",
+		bm.roughness_texture == bm.metallic_texture and bm.metallic_texture == bm.ao_texture)
+
+	# Scalars must stay at 1.0 or they would cancel the packed map out.
+	check("roughness scalar passes the map through (1.0)",
+		is_equal_approx(bm.roughness, 1.0), str(bm.roughness))
+	check("metallic scalar passes the map through (1.0, not the 0.0 default)",
+		is_equal_approx(bm.metallic, 1.0), str(bm.metallic))
+
 
 func _dump(n: Node, depth: int) -> void:
 	var pos := ""

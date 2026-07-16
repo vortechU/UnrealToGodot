@@ -70,6 +70,144 @@ def configure_gltf_export_options(export_options, export_animations):
     )
 
 
+def inject_texture_references(gltf_path, params_by_material, textures_rel="../textures"):
+    """Points a .gltf's materials at the separately exported source textures.
+
+    With baking disabled the exporter emits materials by name but no images, so a
+    .gltf previewed on its own renders untextured. Rather than bake (which would
+    duplicate every texture per material x mesh pair, lossily), we add image
+    entries pointing at the shared textures/ folder.
+
+    glTF resolves a relative image uri against the .gltf's OWN directory, so the
+    uri must spell out the real relative path ("../textures/T_Foo.png"). A bare
+    filename only ever resolves as a sibling -- which is exactly how the earlier
+    baked-then-relocated PNGs ended up orphaned.
+
+    Only base color and normal are wired. The packed roughness/metallic/AO map
+    cannot go in as-is: glTF's metallicRoughness expects G=roughness/B=metallic,
+    and Unreal's RMA is R=roughness/G=metallic, so a direct reference would render
+    with the channels swapped. The layout importer handles that map properly via
+    Godot's per-channel selectors; this is preview dressing only.
+
+    Returns the number of materials it touched.
+    """
+    try:
+        with open(gltf_path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except Exception as e:
+        unreal.log_warning(f"Could not read {os.path.basename(gltf_path)} for texture injection: {str(e)}")
+        return 0
+
+    materials = doc.get("materials")
+    if not materials:
+        return 0
+
+    images = doc.setdefault("images", [])
+    textures = doc.setdefault("textures", [])
+
+    # Seed from what is already in the document so re-running over an existing
+    # .gltf reuses its entries instead of appending duplicates.
+    uri_to_texture = {}
+    for idx, tex in enumerate(textures):
+        source = tex.get("source")
+        if isinstance(source, int) and 0 <= source < len(images):
+            existing_uri = images[source].get("uri")
+            if existing_uri and existing_uri not in uri_to_texture:
+                uri_to_texture[existing_uri] = idx
+
+    def texture_index(tex_name):
+        """Adds (or reuses) an image+texture pair for tex_name, returning its index."""
+        uri = "%s/%s.png" % (textures_rel, tex_name)
+        if uri in uri_to_texture:
+            return uri_to_texture[uri]
+        images.append({"uri": uri, "mimeType": "image/png", "name": tex_name})
+        textures.append({"source": len(images) - 1})
+        uri_to_texture[uri] = len(textures) - 1
+        return len(textures) - 1
+
+    touched = 0
+    for mat in materials:
+        params = params_by_material.get(mat.get("name"))
+        if not params:
+            continue
+        changed = False
+
+        albedo = params.get("albedo_texture")
+        if albedo:
+            pbr = mat.setdefault("pbrMetallicRoughness", {})
+            pbr["baseColorTexture"] = {"index": texture_index(albedo)}
+            changed = True
+
+        normal = params.get("normal_texture")
+        if normal:
+            mat["normalTexture"] = {"index": texture_index(normal)}
+            changed = True
+
+        if changed:
+            touched += 1
+
+    if touched == 0:
+        return 0
+
+    try:
+        with open(gltf_path, "w", encoding="utf-8") as f:
+            json.dump(doc, f, indent=4)
+    except Exception as e:
+        unreal.log_warning(f"Could not write texture references into {os.path.basename(gltf_path)}: {str(e)}")
+        return 0
+    return touched
+
+
+def material_params_for_mesh(mesh):
+    """Maps material name -> extracted parameters for every slot on a mesh."""
+    try:
+        from export_level_to_json import extract_material_parameters
+    except Exception:
+        return {}
+    out = {}
+    slots = []
+    try:
+        if hasattr(unreal, "StaticMesh") and isinstance(mesh, unreal.StaticMesh):
+            slots = mesh.get_editor_property("static_materials") or []
+        elif hasattr(unreal, "SkeletalMesh") and isinstance(mesh, unreal.SkeletalMesh):
+            slots = mesh.get_editor_property("materials") or []
+    except Exception:
+        return {}
+    for slot in slots:
+        try:
+            mi = slot.material_interface
+            if mi is None:
+                continue
+            params = extract_material_parameters(mi)
+            if params:
+                out[mi.get_name()] = params
+        except Exception:
+            continue
+    return out
+
+
+def inject_textures_for_exported_mesh(mesh, export_dir, mesh_name, separate_textures):
+    """Injects source-texture references into every .gltf just exported for a mesh."""
+    params_by_material = material_params_for_mesh(mesh)
+    if not params_by_material:
+        return
+    # Where textures/ sits relative to the .gltf files themselves.
+    textures_rel = ".." + "/textures" if separate_textures else "."
+    for filename in os.listdir(export_dir):
+        if not filename.lower().endswith(".gltf"):
+            continue
+        stem = filename[:-5]
+        if stem != mesh_name and not stem.startswith(mesh_name + "_LOD"):
+            continue
+        try:
+            n = inject_texture_references(os.path.join(export_dir, filename),
+                                          params_by_material, textures_rel)
+            if n:
+                unreal.log(f"Wired source textures into {filename} ({n} material(s))")
+        except Exception as e:
+            unreal.log_warning(f"Texture injection failed for {filename}: {str(e)}")
+
+
 def relocate_baked_textures(export_dir, textures_dir):
     """Moves stray PNGs emitted beside the .gltf files into textures_dir.
 
@@ -639,6 +777,7 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
             
             if mesh_has_exported:
                 exported_meshes.append(mesh)
+                inject_textures_for_exported_mesh(mesh, export_dir, mesh_name, separate_textures)
 
     # Automatically export referenced textures
     if exported_count > 0:
@@ -851,6 +990,7 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
             
             if mesh_has_exported:
                 exported_meshes.append(mesh)
+                inject_textures_for_exported_mesh(mesh, export_dir, mesh_name, separate_textures)
 
     # Automatically export referenced textures
     if exported_count > 0:

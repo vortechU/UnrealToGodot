@@ -663,15 +663,51 @@ func create_godot_material(params: Dictionary, existing_mat: Material = null) ->
 			var tex = load_texture(tex_path)
 			if tex:
 				mat.roughness_texture = tex
-				
+
 	if metallic_tex != "":
 		var tex_path = find_texture_path(active_textures_folder, metallic_tex)
 		if tex_path != "":
 			var tex = load_texture(tex_path)
 			if tex:
 				mat.metallic_texture = tex
-				
+
+	_apply_packed_texture(mat, params)
 	return mat
+
+
+func _apply_packed_texture(mat: BaseMaterial3D, params: Dictionary) -> void:
+	"""Wires a packed PBR map (RMA/ORM/ARM/...) into roughness, metallic and AO.
+
+	Unreal packs these three into one texture's RGB channels. Godot reads each
+	from a channel selector, so no image processing is needed -- the same texture
+	is assigned three times with a different channel each. The layout varies by
+	convention (RMA is R=rough/G=metal/B=ao, ORM is R=ao/G=rough/B=metal), so the
+	exporter sends explicit channel indices rather than us assuming one."""
+	var packed_tex := _safe_str(params.get("packed_texture"))
+	if packed_tex == "":
+		return
+	var tex_path := find_texture_path(active_textures_folder, packed_tex)
+	if tex_path == "":
+		printerr("Unreal Importer: packed PBR map not found on disk: ", packed_tex,
+			" (roughness/metallic/AO will be flat)")
+		return
+	var tex := load_texture(tex_path)
+	if tex == null:
+		return
+	var channels = params.get("packed_channels", {})
+	if not (channels is Dictionary):
+		return
+
+	if channels.has("roughness"):
+		mat.roughness_texture = tex
+		mat.roughness_texture_channel = int(channels["roughness"])
+	if channels.has("metallic"):
+		mat.metallic_texture = tex
+		mat.metallic_texture_channel = int(channels["metallic"])
+	if channels.has("ao"):
+		mat.ao_enabled = true
+		mat.ao_texture = tex
+		mat.ao_texture_channel = int(channels["ao"])
 
 func load_texture(tex_path: String) -> Texture2D:
 	"""Loads a texture from res:// or from the external filesystem."""

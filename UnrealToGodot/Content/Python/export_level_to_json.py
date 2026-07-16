@@ -13,6 +13,7 @@ Usage:
 
 import os
 import json
+import re
 import unreal
 
 import ue2g_common
@@ -140,6 +141,37 @@ def extract_mesh_collision(static_mesh):
     )
     return collision_data if has_collision else None
 
+# Packed PBR maps stuff roughness/metallic/AO into one texture's RGB channels.
+# Which channel holds what is encoded in the parameter name by convention, so the
+# name IS the layout -- guessing a single layout for all of them would silently
+# swap metallic and AO. Channel indices match Godot's BaseMaterial3D.TextureChannel
+# (0=RED, 1=GREEN, 2=BLUE, 3=ALPHA).
+_PACKED_LAYOUTS = {
+    "rma":  {"roughness": 0, "metallic": 1, "ao": 2},
+    "rmao": {"roughness": 0, "metallic": 1, "ao": 2},
+    "orm":  {"ao": 0, "roughness": 1, "metallic": 2},   # the glTF convention
+    "arm":  {"ao": 0, "roughness": 1, "metallic": 2},
+    "mra":  {"metallic": 0, "roughness": 1, "ao": 2},
+    "mrao": {"metallic": 0, "roughness": 1, "ao": 2},
+}
+
+
+def classify_packed_texture(param_name):
+    """Returns the channel layout for a packed PBR map parameter, else None.
+
+    Matches whole tokens only: a material with a parameter literally named
+    "Normal" must not be read as an ORM map because "orm" appears inside it.
+    """
+    if not param_name:
+        return None
+    tokens = re.split(r"[^a-z0-9]+", str(param_name).lower())
+    for token in tokens:
+        layout = _PACKED_LAYOUTS.get(token)
+        if layout:
+            return dict(layout)
+    return None
+
+
 def extract_material_parameters(material, collected_textures=None):
     """
     Safely queries a Material Interface for PBR parameter values (scalars, vectors, textures).
@@ -156,9 +188,11 @@ def extract_material_parameters(material, collected_textures=None):
         "normal_texture": None,
         "roughness_texture": None,
         "metallic_texture": None,
+        "packed_texture": None,
+        "packed_channels": None,
         "tiling": [1.0, 1.0]
     }
-    
+
     visited = set()
     # Tracks scalar/vector params that have been explicitly set, so the first
     # (child-most) material that provides one wins — even if its value happens
@@ -195,7 +229,12 @@ def extract_material_parameters(material, collected_textures=None):
                                 else:
                                     name = str(expr.get_name()).lower()
                                     
-                                if "albedo" in name or "basecolor" in name or "diffuse" in name or "color" in name or "maintex" in name:
+                                packed = classify_packed_texture(name)
+                                if packed:
+                                    if parameters["packed_texture"] is None:
+                                        parameters["packed_texture"] = tex_name
+                                        parameters["packed_channels"] = packed
+                                elif "albedo" in name or "basecolor" in name or "diffuse" in name or "color" in name or "maintex" in name:
                                     if parameters["albedo_texture"] is None:
                                         parameters["albedo_texture"] = tex_name
                                 elif "normal" in name or "bump" in name:
@@ -267,7 +306,15 @@ def extract_material_parameters(material, collected_textures=None):
                     if collected_textures is not None and isinstance(tex, unreal.Texture):
                         collected_textures.add(tex)
                     
-                    if "albedo" in name or "basecolor" in name or "diffuse" in name or "color" in name or "maintex" in name:
+                    # Packed maps first: a parameter named "RMA" matches none of the
+                    # role substrings below, so without this the whole
+                    # roughness/metallic/AO set is silently dropped.
+                    packed = classify_packed_texture(name)
+                    if packed:
+                        if parameters["packed_texture"] is None:
+                            parameters["packed_texture"] = tex_name
+                            parameters["packed_channels"] = packed
+                    elif "albedo" in name or "basecolor" in name or "diffuse" in name or "color" in name or "maintex" in name:
                         if parameters["albedo_texture"] is None:
                             parameters["albedo_texture"] = tex_name
                     elif "normal" in name or "bump" in name:
@@ -281,7 +328,7 @@ def extract_material_parameters(material, collected_textures=None):
                             parameters["metallic_texture"] = tex_name
         except Exception:
             pass
-            
+
         # Walk up to parent
         try:
             parent = mat.get_editor_property("parent")
@@ -291,6 +338,19 @@ def extract_material_parameters(material, collected_textures=None):
             pass
 
     _extract_recursive(material)
+
+    # Godot computes roughness/metallic as scalar * texture[channel]. Unreal drives
+    # them straight from the packed map unless the material exposes an explicit
+    # multiplier, so a scalar left at its default would zero the texture out --
+    # metallic defaults to 0.0, which would cancel the map entirely. Promote the
+    # unset scalars to 1.0 so the packed map passes through unchanged.
+    if parameters["packed_texture"]:
+        channels = parameters["packed_channels"] or {}
+        if "roughness" in channels and "roughness" not in assigned:
+            parameters["roughness"] = 1.0
+        if "metallic" in channels and "metallic" not in assigned:
+            parameters["metallic"] = 1.0
+
     return parameters
 
 def extract_mesh_materials(mesh, collected_textures=None):

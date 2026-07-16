@@ -17,12 +17,43 @@ TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 HARNESS_DIR = os.path.join(TESTS_DIR, "godot_harness")
 PROJECT_DIR = os.path.join(HARNESS_DIR, "_project")
 
-PY_TESTS = ["test_math.py", "test_layout.py", "test_tscn_writer.py"]
+PY_TESTS = ["test_math.py", "test_layout.py", "test_tscn_writer.py", "test_materials.py"]
 
 
 def run(cmd, **kw):
     print("\n$ " + " ".join(str(c) for c in cmd))
     return subprocess.run(cmd, **kw).returncode
+
+
+def report_godot_results(exit_code):
+    """Reads the harness's result file and prints it. Returns True only on a pass.
+
+    Godot's GUI-subsystem exe on Windows drops stdout when the parent redirects it
+    to a file, so its console output cannot be trusted as the pass signal -- and a
+    plugin that never ran also exits 0. The result file is the only evidence that
+    the assertions actually executed, so a missing file is a failure.
+    """
+    result_path = os.path.join(PROJECT_DIR, "test_result.txt")
+    if not os.path.exists(result_path):
+        print("ERROR: godot harness produced no test_result.txt "
+              "(exit=%s) -- the test plugin did not run." % exit_code)
+        return False
+    with open(result_path, encoding="utf-8") as f:
+        lines = [ln.rstrip("\n") for ln in f if ln.strip()]
+    verdict = ""
+    total = 0
+    for ln in lines:
+        if ln.startswith("VERDICT "):
+            verdict = ln.split(" ", 1)[1].strip()
+        elif ln.startswith("TOTAL "):
+            total = int(ln.split(" ", 1)[1])
+        else:
+            print("  " + ln)
+    if total == 0:
+        print("ERROR: godot harness ran no checks at all.")
+        return False
+    print("  -> %d checks, verdict=%s (exit=%s)" % (total, verdict, exit_code))
+    return verdict == "PASS" and exit_code == 0
 
 
 def main():
@@ -51,7 +82,8 @@ def main():
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         # -e (editor mode) is required: import_unreal_layout.gd extends
         # EditorScript, which Godot refuses to instantiate outside the editor.
-        if run([args.godot, "--headless", "-e", "--path", PROJECT_DIR]) != 0:
+        code = run([args.godot, "--headless", "-e", "--path", PROJECT_DIR])
+        if not report_godot_results(code):
             failed.append("godot_headless_import")
     else:
         print("\n(skipping Godot leg; pass --godot <path-to-godot.exe> to enable)")

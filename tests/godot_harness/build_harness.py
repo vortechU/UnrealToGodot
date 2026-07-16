@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import struct
+import zlib
 
 HARNESS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_project")
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -16,37 +17,85 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if os.path.exists(HARNESS):
     shutil.rmtree(HARNESS)
 os.makedirs(os.path.join(HARNESS, "models"))
+os.makedirs(os.path.join(HARNESS, "textures"))
 
-# --- minimal valid glTF: one triangle, buffer embedded as a data URI ----------
+
+def write_png(path, rgb):
+    """Writes a 2x2 solid-colour PNG. Hand-rolled so tests need no image library."""
+    width = height = 2
+    raw = b"".join(b"\x00" + bytes(rgb) * width for _ in range(height))
+
+    def chunk(tag, data):
+        body = tag + data
+        return (struct.pack(">I", len(data)) + body
+                + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw))
+           + chunk(b"IEND", b""))
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+# Source textures live in a SIBLING folder, exactly as the exporter lays them out.
+write_png(os.path.join(HARNESS, "textures", "TX_Test_ALB.png"), (200, 40, 40))
+write_png(os.path.join(HARNESS, "textures", "TX_Test_NRM.png"), (128, 128, 255))
+write_png(os.path.join(HARNESS, "textures", "TX_Test_RMA.png"), (60, 200, 90))
+
+# --- minimal valid glTF: one triangle with UVs, buffer as a data URI ----------
 positions = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]
+uvs = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]
 pos_bytes = b"".join(struct.pack("<3f", *p) for p in positions)
+uv_bytes = b"".join(struct.pack("<2f", *t) for t in uvs)
 idx_bytes = struct.pack("<3H", 0, 1, 2) + b"\x00\x00"  # padded to 4-byte alignment
-blob = pos_bytes + idx_bytes
+blob = pos_bytes + uv_bytes + idx_bytes
 
-gltf = {
-    "asset": {"version": "2.0", "generator": "harness"},
-    "scene": 0,
-    "scenes": [{"nodes": [0]}],
-    "nodes": [{"mesh": 0, "name": "TriNode"}],
-    "meshes": [{"name": "Tri", "primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],
-    "buffers": [{
-        "byteLength": len(blob),
-        "uri": "data:application/octet-stream;base64," + base64.b64encode(blob).decode("ascii"),
-    }],
-    "bufferViews": [
-        {"buffer": 0, "byteOffset": 0, "byteLength": len(pos_bytes), "target": 34962},
-        {"buffer": 0, "byteOffset": len(pos_bytes), "byteLength": 6, "target": 34963},
-    ],
-    "accessors": [
-        {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
-         "min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 0.0]},
-        {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"},
-    ],
-}
+
+def make_gltf(with_texture):
+    doc = {
+        "asset": {"version": "2.0", "generator": "harness"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0, "name": "TriNode"}],
+        "meshes": [{"name": "Tri", "primitives": [
+            {"attributes": {"POSITION": 0, "TEXCOORD_0": 1}, "indices": 2}]}],
+        "buffers": [{
+            "byteLength": len(blob),
+            "uri": "data:application/octet-stream;base64," + base64.b64encode(blob).decode("ascii"),
+        }],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": 0, "byteLength": len(pos_bytes), "target": 34962},
+            {"buffer": 0, "byteOffset": len(pos_bytes), "byteLength": len(uv_bytes), "target": 34962},
+            {"buffer": 0, "byteOffset": len(pos_bytes) + len(uv_bytes), "byteLength": 6,
+             "target": 34963},
+        ],
+        "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+             "min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 0.0]},
+            {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC2",
+             "min": [0.0, 0.0], "max": [1.0, 1.0]},
+            {"bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR"},
+        ],
+    }
+    if with_texture:
+        # The whole point: a SIBLING textures/ folder reached by a relative uri.
+        # This is what inject_texture_references() writes.
+        doc["images"] = [{"uri": "../textures/TX_Test_ALB.png", "mimeType": "image/png"}]
+        doc["textures"] = [{"source": 0}]
+        doc["materials"] = [{"name": "MI_Test",
+                             "pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}]
+        doc["meshes"][0]["primitives"][0]["material"] = 0
+    return doc
+
 
 for name in ["SM_Rock", "SM_Crate"]:
     with open(os.path.join(HARNESS, "models", name + ".gltf"), "w", encoding="utf-8") as f:
-        json.dump(gltf, f)
+        json.dump(make_gltf(with_texture=False), f)
+
+# SM_Textured proves Godot resolves "../textures/..." out of a sibling folder.
+with open(os.path.join(HARNESS, "models", "SM_Textured.gltf"), "w", encoding="utf-8") as f:
+    json.dump(make_gltf(with_texture=True), f)
 
 # --- project + addon ---------------------------------------------------------
 with open(os.path.join(HARNESS, "project.godot"), "w", encoding="utf-8") as f:
@@ -71,6 +120,28 @@ layout = {
         # Crate has no collision -> exercises the plain-instance path.
         "SM_Crate": {"path": "/Game/SM_Crate", "export_name": "SM_Crate",
                      "collision": None, "materials": []},
+        # Carries a packed RMA map, as the Old_Buoys pack does. Channel indices
+        # match Godot's BaseMaterial3D.TextureChannel (0=RED, 1=GREEN, 2=BLUE).
+        "SM_Textured": {
+            "path": "/Game/SM_Textured", "export_name": "SM_Textured", "collision": None,
+            "materials": [{
+                "slot_index": 0,
+                "material_name": "MI_Test",
+                "material_path": "/Game/MI_Test",
+                "parameters": {
+                    "albedo_color": [2.0, 2.0, 2.0, 1.0],
+                    "roughness": 1.0,
+                    "metallic": 1.0,
+                    "albedo_texture": "TX_Test_ALB",
+                    "normal_texture": "TX_Test_NRM",
+                    "roughness_texture": None,
+                    "metallic_texture": None,
+                    "packed_texture": "TX_Test_RMA",
+                    "packed_channels": {"roughness": 0, "metallic": 1, "ao": 2},
+                    "tiling": [1.0, 1.0],
+                },
+            }],
+        },
     },
     "actors": [
         {
@@ -109,6 +180,15 @@ layout = {
                  "godot_relative_transform": t(1, 0, 0),
                  "godot_world_transform": t(16, 0, 0), "material_overrides": []},
             ],
+        },
+        {
+            # Drives the material path: packed RMA map + sibling-folder textures.
+            "name": "Textured_1", "class": "StaticMeshActor",
+            "godot_transform": t(0, 5, 0),
+            "components": [{"name": "SM0", "mesh_key": "SM_Textured", "mesh_name": "SM_Textured",
+                            "godot_relative_transform": t(0, 5, 0),
+                            "godot_world_transform": t(0, 5, 0),
+                            "material_overrides": []}],
         },
     ],
     "lights": [], "post_process": [], "decals": [], "foliage": [], "landscapes": [],
