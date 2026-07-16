@@ -37,12 +37,18 @@ const DEFAULT_IMPORT_OPTIONS := {
 # Set to false to use the pre-calculated "godot_transform" from the JSON (Option A - Recommended).
 var USE_GDSCRIPT_TRANSFORM_CONVERSION: bool = false
 
+const ImportReport = preload("res://addons/unreal_importer/import_report.gd")
+
 # Material sharing cache
 var material_cache: Dictionary = {}
 var active_scene_root: Node
 var active_textures_folder: String
 var active_models_folder: String
 var import_options: Dictionary = {}
+# Collects a written record of the import. The console scrolls and truncates,
+# so the report file is the thing that can actually be handed to someone else.
+var report = null
+var _missing_textures: Dictionary = {}
 
 func _run() -> void:
 	# Standalone EditorScript execution entry point
@@ -56,6 +62,9 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 	active_scene_root = scene_root
 	active_textures_folder = textures_folder
 	active_models_folder = models_folder
+	report = ImportReport.new()
+	report.header(json_path, models_folder, textures_folder)
+	_missing_textures.clear()
 	import_options = DEFAULT_IMPORT_OPTIONS.duplicate()
 	for key in options:
 		import_options[key] = options[key]
@@ -67,23 +76,33 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 	# Open and read the JSON file
 	if not FileAccess.file_exists(json_path):
 		printerr("Import Error: JSON file not found at path: ", json_path)
+		_fail_report("level_layout.json not found at " + json_path
+			+ " -- check the path, and that the layout export (a separate "
+			+ "action from the mesh export) actually ran.")
 		return false
-		
+
 	var file := FileAccess.open(json_path, FileAccess.READ)
 	if file == null:
 		printerr("Import Error: Could not open JSON file (may be locked or inaccessible): ", json_path)
+		_fail_report("level_layout.json exists but could not be opened (%s). It "
+			% error_string(FileAccess.get_open_error())
+			+ "may be locked by another program.")
 		return false
 	var json_string := file.get_as_text()
 	file.close()
-	
+
 	# Parse JSON data
 	var data = JSON.parse_string(json_string)
 	if data == null:
 		printerr("Import Error: Failed to parse JSON file.")
+		_fail_report("level_layout.json is not valid JSON. The export may have "
+			+ "been interrupted, leaving a truncated file.")
 		return false
-		
+
 	if not data.has("actors") or not (data["actors"] is Array):
 		printerr("Import Error: Invalid JSON structure. Missing 'actors' array.")
+		_fail_report("level_layout.json has no 'actors' array -- it is not a "
+			+ "layout file, or was written by an incompatible exporter version.")
 		return false
 
 	var actors: Array = data["actors"]
@@ -258,7 +277,30 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 			print(" - ", mesh, " (Looked in: ", models_folder, ")")
 		print("Placeholders (Marker3Ds) were created at their respective transforms.")
 	print("======================================================\n")
+
+	if report:
+		report.section("Layout")
+		report.fact("actors in json", actors.size())
+		report.fact("mesh entries in json", meshes_lib.size())
+		report.fact("actors imported", imported_count)
+		for line in feature_summary:
+			report.line("  " + line)
+		for w in feature_warnings:
+			report.warn(str(w))
+		report.audit_scene(scene_root)
+		report.note_missing_meshes(missing_meshes, models_folder)
+		report.write()
 	return true
+
+func _fail_report(reason: String) -> void:
+	"""An import that dies early is exactly the case where there is nothing to
+	show but a red console line, so still leave a report behind."""
+	if report == null:
+		return
+	report.section("Result")
+	report.error(reason)
+	report.write()
+
 
 func component_world_transform(comp_data: Dictionary, actor_transform: Transform3D) -> Transform3D:
 	"""Resolves a mesh component's absolute placement in Godot space.
@@ -642,13 +684,17 @@ func create_godot_material(params: Dictionary, existing_mat: Material = null) ->
 	var roughness_tex: String = _safe_str(params.get("roughness_texture"))
 	var metallic_tex: String = _safe_str(params.get("metallic_texture"))
 	
+	# A texture the exporter named but that is not on disk used to fail in
+	# silence, leaving a flat material and no clue why. Every miss is recorded.
 	if albedo_tex != "":
 		var tex_path = find_texture_path(active_textures_folder, albedo_tex)
 		if tex_path != "":
 			var tex = load_texture(tex_path)
 			if tex:
 				mat.albedo_texture = tex
-				
+		else:
+			_note_missing_texture(albedo_tex)
+
 	if normal_tex != "":
 		var tex_path = find_texture_path(active_textures_folder, normal_tex)
 		if tex_path != "":
@@ -656,13 +702,17 @@ func create_godot_material(params: Dictionary, existing_mat: Material = null) ->
 			if tex:
 				mat.normal_enabled = true
 				mat.normal_texture = tex
-				
+		else:
+			_note_missing_texture(normal_tex)
+
 	if roughness_tex != "":
 		var tex_path = find_texture_path(active_textures_folder, roughness_tex)
 		if tex_path != "":
 			var tex = load_texture(tex_path)
 			if tex:
 				mat.roughness_texture = tex
+		else:
+			_note_missing_texture(roughness_tex)
 
 	if metallic_tex != "":
 		var tex_path = find_texture_path(active_textures_folder, metallic_tex)
@@ -670,9 +720,24 @@ func create_godot_material(params: Dictionary, existing_mat: Material = null) ->
 			var tex = load_texture(tex_path)
 			if tex:
 				mat.metallic_texture = tex
+		else:
+			_note_missing_texture(metallic_tex)
 
 	_apply_packed_texture(mat, params)
 	return mat
+
+
+func _note_missing_texture(texture_name: String) -> void:
+	"""Records a texture the layout referenced but that is not in the textures
+	folder. Deduplicated: one missing 4K albedo is typically referenced by
+	dozens of slots, and 40 identical lines bury everything else."""
+	if _missing_textures.has(texture_name):
+		return
+	_missing_textures[texture_name] = true
+	printerr("Unreal Importer: texture not found on disk: ", texture_name,
+		" (looked in: ", active_textures_folder, ")")
+	if report:
+		report.note_missing_texture(texture_name)
 
 
 func _apply_packed_texture(mat: BaseMaterial3D, params: Dictionary) -> void:
@@ -688,8 +753,7 @@ func _apply_packed_texture(mat: BaseMaterial3D, params: Dictionary) -> void:
 		return
 	var tex_path := find_texture_path(active_textures_folder, packed_tex)
 	if tex_path == "":
-		printerr("Unreal Importer: packed PBR map not found on disk: ", packed_tex,
-			" (roughness/metallic/AO will be flat)")
+		_note_missing_texture(packed_tex)
 		return
 	var tex := load_texture(tex_path)
 	if tex == null:

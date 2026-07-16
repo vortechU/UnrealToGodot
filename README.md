@@ -123,6 +123,34 @@ If you enabled **Generate Godot .tscn scene directly** on the Unreal side, just 
 
 ## Troubleshooting
 
+### Start here: get a report
+
+Both halves of the toolchain describe themselves in writing, so you don't have
+to work out which console line mattered.
+
+**After an export** — audit the export folder. Needs nothing but Python (no
+Unreal, no Godot), and checks the things that actually go wrong: stale glTFs
+left from an older export, texture URIs pointing at files that don't exist,
+material scalars outside Godot's valid range, and texture sets big enough to
+crash Godot's importer.
+
+```bash
+python tools/ue2g_diagnose.py <export_folder>
+# optionally cross-check the Godot side too:
+python tools/ue2g_diagnose.py <export_folder> --godot-project <godot_project>
+```
+
+It prints a verdict and writes `<export_folder>/ue2g_report.txt`.
+
+**After an import** — the importer writes `res://ue2g_import_report.txt`
+automatically, listing how many material slots got each map bound, which
+textures were missing, and what failed. If an import goes wrong, that file
+explains it on its own.
+
+### Common problems
+
+- **Errors like `Can't open file from path 'res://models/<Material>_<Mesh>_BaseColor.png'`**: those filenames are produced only by material *baking*, which the exporter disables. Their presence means the `.gltf` files are left over from an older export. Clear the `models/` folder, re-run the mesh export (a **separate action** from the layout export — running one does not re-run the other), and delete the Godot project's `.godot/` cache, which otherwise keeps serving the old import.
+- **Godot crashes, hangs, or half-imports a large level**: a full map can export several GB of 4K textures, and Godot's WebP packer runs out of memory and segfaults partway through, leaving a half-populated `.godot` cache that looks like a toolchain bug. Set **Max Texture Resolution** (e.g. 2048) in the exporter. `tools/ue2g_diagnose.py` warns before you hit this.
 - **GUI window doesn't appear or locks up**: Ensure Tkinter is installed in your python environment. On Windows, standard Unreal installations include Tkinter automatically.
 - **Missing Meshes Warning**: If a mesh name doesn't match the glTF filename, the importer will place a `Marker3D` placeholder in the scene tree labeled `_MISSING_<MeshName>`. Verify your glTF export folder. Note: when an asset pack contains two different meshes with the same name, exports get a deterministic `_<hash>` suffix — re-export both meshes and layout together so the names line up.
 - **Textures aren't loading**: Textures referenced by materials and decals are auto-exported to a `textures/` folder next to your export. File matching is case-insensitive; supported extensions are `.png`, `.tga`, `.jpg`, `.jpeg`, `.dds`, `.exr` and `.webp`.
