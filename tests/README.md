@@ -13,6 +13,50 @@ python tests/run_tests.py
 python tests/run_tests.py --godot "V:/Apps/Godot_v4.6.3/Godot_v4.6.3.exe"
 ```
 
+## The real-data loop
+
+The tests above use synthetic fixtures, so they pass on data that never
+exercises a real material graph. To check the toolchain against an actual map,
+export once from Unreal and then re-run the Godot half as often as you like:
+
+```bash
+# SLOW (minutes) -- run once per Unreal-side change
+UnrealEditor-Cmd.exe <project>.uproject -run=pythonscript \
+  -script="tests/real_export.py" -unattended -nopause -nosplash \
+  -MapPath="/Game/.../Maps/Demonstration" -OutDir="C:/scratch/real_export_out"
+
+# FAST (~1s import) -- run after every Godot-side change
+python tests/run_real_check.py C:/scratch/real_export_out \
+  --godot "V:/Apps/Godot_v4.6.3/Godot_v4.6.3.exe"
+```
+
+`run_real_check.py` builds a throwaway project from the export, imports it, and
+prints how many material slots got each map bound, how many packed maps resolved
+to the right channels, and how many meshes went missing.
+
+Two traps this harness had to work around, both of which silently report
+"everything is fine" when hit:
+
+* **The inspector must wait for the editor's asset scan.** A plugin's
+  `_enter_tree()` runs while imports are still queued on a background thread, so
+  `load()` on a not-yet-imported `.gltf` returns `null` and every mesh vanishes.
+  The report then blames the importer for a race. `_wait_for_import()` polls
+  `EditorInterface.get_resource_filesystem().is_scanning()` first.
+* **A real texture set will crash `--import`.** A full map exports gigabytes of
+  4K RGBA PNGs; Godot's WebP packer exhausts memory and segfaults
+  (`webp_common.cpp:110`, then `alloc_static: "mem" is null`), leaving a
+  half-populated `.godot` cache that the next run happily trusts. The harness
+  sets `importer_defaults/texture` with `process/size_limit` — it is testing
+  that textures are *wired up*, not how they look.
+
+## Landscape export needs a GPU
+
+`export_level_to_json` with landscape enabled calls
+`LandscapeExportHeightmapToRenderTarget`, which asserts on a null RenderTarget
+(`Canvas.cpp:880`) under the `pythonscript` commandlet. Pass
+`options={"landscape": False}` when exporting headlessly. This is a limit of the
+headless test method, not of the exporter.
+
 ## What each test covers
 
 | File | Covers |
