@@ -17,10 +17,53 @@ import unreal
 # Import underlying exporters
 import export_static_meshes_to_gltf
 import export_level_to_json
+import ue2g_diagnose
 
 # Global communication queues
 _command_queue = queue.Queue()
 _state_queue = queue.Queue()
+
+
+def _run_diagnostic(export_dir, godot_project=None, strict=False):
+    """Audits an export and leaves a report beside it.
+
+    Runs after every export so a problem is described in writing at the moment
+    it is created, rather than reconstructed later from a screenshot of the
+    Godot console. strict=False because each export action only produces half
+    of a complete export -- the missing half is a warning here, not an error.
+
+    Never raises: a diagnostic that breaks the export it reports on is worse
+    than no diagnostic at all.
+    """
+    try:
+        _text, rep = ue2g_diagnose.diagnose(export_dir, godot_project=godot_project,
+                                            strict=strict)
+    except Exception as e:
+        unreal.log_warning("Unreal to Godot Exporter: diagnostic failed: %s" % str(e))
+        return None
+
+    for err in rep.errors:
+        unreal.log_error("EXPORT CHECK: " + err)
+    for warn in rep.warnings:
+        unreal.log_warning("EXPORT CHECK: " + warn)
+    if rep.written_to:
+        unreal.log("Unreal to Godot Exporter: wrote %s" % rep.written_to)
+    if not rep.errors and not rep.warnings:
+        unreal.log("Unreal to Godot Exporter: export check found no problems.")
+    return rep
+
+
+def _diagnostic_status(rep):
+    """A one-line verdict for the GUI status bar, or None if nothing to say."""
+    if rep is None:
+        return None
+    if rep.errors:
+        return ("Export check: %d problem(s) found -- see ue2g_report.txt"
+                % len(rep.errors), "error")
+    if rep.warnings:
+        return ("Export check: %d warning(s) -- see ue2g_report.txt"
+                % len(rep.warnings), "warning")
+    return None
 
 # Global handles
 _tick_handle = None
@@ -830,8 +873,12 @@ def check_editor_queues(delta_time):
                     exported, failed = export_static_meshes_to_gltf.export_all_level_meshes(
                         export_dir=export_dir, export_animations=export_anims, export_lods=export_lods, separate_textures=separate_tex, show_dialogs=False, godot_project_dir=godot_project, max_texture_resolution=max_res
                     )
+                    rep = _run_diagnostic(export_dir, godot_project)
+                    verdict = _diagnostic_status(rep)
                     if failed > 0:
                         _state_queue.put({"status": (f"Batch export completed: {exported} exported, {failed} failed.", "warning")})
+                    elif verdict:
+                        _state_queue.put({"status": verdict})
                     else:
                         _state_queue.put({"status": (f"Successfully batch exported {exported} level meshes to glTF!", "success")})
                 except Exception as e:
@@ -848,7 +895,12 @@ def check_editor_queues(delta_time):
                         save_path=save_path, show_dialogs=False, godot_project_dir=godot_project, max_texture_resolution=max_res, options=feature_options
                     )
                     if success:
-                        _state_queue.put({"status": ("Successfully exported level layout JSON!", "success")})
+                        # The layout lands next to models/, so audit the whole
+                        # export: this is the point where both halves exist and
+                        # can be cross-checked against each other.
+                        rep = _run_diagnostic(os.path.dirname(save_path), godot_project)
+                        verdict = _diagnostic_status(rep)
+                        _state_queue.put({"status": verdict or ("Successfully exported level layout JSON!", "success")})
                     else:
                         _state_queue.put({"status": ("Failed to export level layout. Check output log.", "error")})
                 except Exception as e:

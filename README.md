@@ -123,16 +123,29 @@ If you enabled **Generate Godot .tscn scene directly** on the Unreal side, just 
 
 ## Troubleshooting
 
-### Start here: get a report
+### Start here: read the reports
 
-Both halves of the toolchain describe themselves in writing, so you don't have
-to work out which console line mattered.
+Both halves of the toolchain describe themselves in writing, automatically.
+There is nothing to run and nothing to remember.
 
-**After an export** — audit the export folder. Needs nothing but Python (no
-Unreal, no Godot), and checks the things that actually go wrong: stale glTFs
-left from an older export, texture URIs pointing at files that don't exist,
-material scalars outside Godot's valid range, and texture sets big enough to
-crash Godot's importer.
+**After an export**, the exporter audits its own output and writes
+`ue2g_report.txt` next to it. Any problem is also surfaced in the GUI status
+bar and the Unreal output log, prefixed `EXPORT CHECK:`. It catches the things
+that actually go wrong: stale glTFs left from an older export, texture URIs
+pointing at files that don't exist, meshes the layout references but that were
+never exported, material scalars outside Godot's valid range, and texture sets
+big enough to crash Godot's importer.
+
+**After an import**, the importer writes `res://ue2g_import_report.txt`,
+listing how many material slots got each map bound, which textures were
+missing, and what failed — including when the import dies early.
+
+Those two files are self-contained: they describe a run without anyone having
+to remember what they saw.
+
+To re-check an export folder later, run the same audit from a **terminal**
+(PowerShell, cmd, bash — *not* Unreal's Python console, which would treat the
+command as a script filename):
 
 ```bash
 python tools/ue2g_diagnose.py <export_folder>
@@ -140,12 +153,8 @@ python tools/ue2g_diagnose.py <export_folder>
 python tools/ue2g_diagnose.py <export_folder> --godot-project <godot_project>
 ```
 
-It prints a verdict and writes `<export_folder>/ue2g_report.txt`.
-
-**After an import** — the importer writes `res://ue2g_import_report.txt`
-automatically, listing how many material slots got each map bound, which
-textures were missing, and what failed. If an import goes wrong, that file
-explains it on its own.
+It needs only Python — no Unreal, no Godot — so it also runs on a machine that
+has nothing but the exported files.
 
 ### Common problems
 
