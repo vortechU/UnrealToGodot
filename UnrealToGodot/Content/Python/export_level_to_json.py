@@ -463,7 +463,18 @@ def prompt_for_save_file(default_path):
         unreal.log_warning(f"Could not open file save dialog via tkinter: {str(e)}")
     return None
 
-def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=None, max_texture_resolution=0, options=None):
+def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=None,
+                         max_texture_resolution=0, options=None,
+                         skip_existing_textures=False):
+    """Exports the level layout, and the textures its materials reference.
+
+    skip_existing_textures leaves any texture already written to the textures
+    folder alone. Set it when the mesh export has just run and written the same
+    4K PNGs: re-encoding gigabytes of identical images is the slowest thing this
+    toolchain does. Textures the mesh export cannot see -- decals, landscape
+    layers -- are still exported, because only the ones actually present are
+    skipped, not all of them.
+    """
     opts = dict(DEFAULT_EXPORT_OPTIONS)
     if options:
         opts.update(options)
@@ -774,12 +785,21 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                 os.makedirs(textures_dir, exist_ok=True)
                 
                 tasks = []
+                skipped_existing = 0
                 for tex in collected_textures:
                     if not tex or not isinstance(tex, unreal.Texture):
                         continue
                     tex_name = tex.get_name()
                     filename = os.path.join(textures_dir, f"{tex_name}.png")
-                    
+
+                    # Already on disk (typically written moments ago by the mesh
+                    # export). Re-encoding a 4K PNG to produce identical bytes is
+                    # the single most expensive thing here.
+                    if skip_existing_textures and os.path.exists(filename):
+                        skipped_existing += 1
+                        exported_textures_count += 1
+                        continue
+
                     if max_texture_resolution > 0:
                         try:
                             original_sizes[tex] = tex.get_editor_property("max_texture_size")
@@ -799,6 +819,8 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                         
                     tasks.append(task)
                     
+                if skipped_existing:
+                    unreal.log(f"Reusing {skipped_existing} texture(s) already exported to: {textures_dir}")
                 if tasks:
                     unreal.log(f"Exporting {len(tasks)} level textures to: {textures_dir}")
                     unreal.Exporter.run_asset_export_tasks(tasks)

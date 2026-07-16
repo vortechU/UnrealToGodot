@@ -91,15 +91,29 @@ This repository contains two main components:
 
 1. Open your level in Unreal Engine.
 2. Open the **Unreal to Godot Exporter** window from the **Window** menu.
-3. **Export Static Meshes**:
-   - Choose a target folder to save the glTF models (e.g., `<GodotProject>/models/`).
-   - Click **Batch Export All Level Meshes** (exports all unique meshes used in the active level) or select specific meshes in the Content Browser and click **Export Selected Meshes**.
+3. Set both paths: the glTF target folder (defaults to `Saved/Exports/GLTF`) and the layout JSON path.
 4. **Choose Level Export Features** (all optional, all persisted between sessions):
    - **Lights & Post-Process**, **Decals**, **Landscape / Terrain**, **Foliage & Instances**, **Navigation Volumes**, **Tags & Metadata** — untick anything you don't want in the export.
-   - **Generate Godot .tscn scene directly**: writes a ready-to-open scene file into your Godot project (requires the Godot Project Path in the *Godot Engine Integration* section). Export your meshes first so the scene can reference them.
-5. **Export Level Layout**:
-   - Select a target JSON file path (e.g., `<GodotProject>/level_layout.json`).
-   - Click **Export Level Layout**. Heightmaps/splatmaps go to a sibling `terrain/` folder, textures to `textures/`.
+   - **Generate Godot .tscn scene directly**: writes a ready-to-open scene file into your Godot project (requires the Godot Project Path in the *Godot Engine Integration* section).
+5. Click **Export Everything (Meshes + Layout)**.
+
+That last button is the one to use. The layout names meshes the mesh export has
+to have written, so exporting the two halves separately is how they drift out of
+sync — and a mismatch shows up much later in Godot as a missing texture or a
+`MISSING_` placeholder, far from the click that caused it. Exporting together
+also encodes each texture once instead of twice, which on a real level is the
+difference between three minutes and a fraction of a second.
+
+The individual actions are still there when you want them — **Batch Export All
+Level Meshes**, **Export Selected Meshes** (for a Content Browser selection),
+and **Export Level Layout only**. If you use them, run both halves before
+importing.
+
+Heightmaps/splatmaps go to a sibling `terrain/` folder, textures to `textures/`.
+
+> **Max Texture Resolution** is worth setting (e.g. `2048`). A real level's
+> source textures can be several GB of 4K PNGs, which is enough to make Godot's
+> importer run out of memory and crash partway through.
 
 ### Step 2: Importing into Godot
 

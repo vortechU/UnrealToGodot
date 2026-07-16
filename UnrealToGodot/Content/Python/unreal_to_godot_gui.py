@@ -328,19 +328,36 @@ class UnrealToGodotApp:
         )
         browse_layout_btn.pack(side=tk.LEFT, padx=(6, 0))
         
+        # The default action: meshes and layout have to describe the same level,
+        # and exporting them separately is how they drift apart. Textures are
+        # only encoded once across the two halves.
+        self.export_everything_btn = tk.Button(
+            layout_inner,
+            text="Export Everything (Meshes + Layout)",
+            bg="#15803d",
+            fg="#ffffff",
+            activebackground="#16a34a",
+            activeforeground="#ffffff",
+            bd=0,
+            pady=7,
+            font=("Segoe UI", 10, "bold"),
+            command=self.run_full_export
+        )
+        self.export_everything_btn.pack(fill=tk.X, pady=(10, 0))
+
         self.export_layout_btn = tk.Button(
-            layout_inner, 
-            text="Export Level Layout", 
-            bg="#b45309", 
-            fg="#ffffff", 
-            activebackground="#d97706", 
-            activeforeground="#ffffff", 
-            bd=0, 
-            pady=5, 
-            font=("Segoe UI", 10, "bold"), 
+            layout_inner,
+            text="Export Level Layout only",
+            bg="#b45309",
+            fg="#ffffff",
+            activebackground="#d97706",
+            activeforeground="#ffffff",
+            bd=0,
+            pady=5,
+            font=("Segoe UI", 10, "bold"),
             command=self.run_layout_export
         )
-        self.export_layout_btn.pack(fill=tk.X, pady=(10, 0))
+        self.export_layout_btn.pack(fill=tk.X, pady=(6, 0))
 
         # --- Section 2b: Level Export Features (per-feature toggles) ---
         features_frame = tk.LabelFrame(
@@ -759,6 +776,39 @@ class UnrealToGodotApp:
         # Queue the export all meshes command to run on main thread
         _command_queue.put(("export_all_meshes", [export_dir, export_anims, export_lods, separate_tex, godot_project, max_res]))
 
+    def run_full_export(self):
+        """Exports meshes and layout together.
+
+        The two halves have to agree with each other -- the layout names meshes
+        the mesh export must have written -- so the default path does both, and
+        the textures are only encoded once.
+        """
+        export_dir = self.mesh_path_entry.get()
+        save_path = self.layout_path_entry.get()
+        if not export_dir:
+            self.show_status("Error: Please select a valid mesh target directory first.", "error")
+            return
+        if not save_path:
+            self.show_status("Error: Please select a valid target JSON save path first.", "error")
+            return
+
+        godot_project = self.get_godot_project_dir_if_valid()
+        if godot_project == -1:
+            return
+
+        export_anims = self.export_anims_var.get()
+        export_lods = self.export_lods_var.get()
+        separate_tex = self.separate_textures_var.get()
+        max_res = self.get_max_texture_resolution()
+        feature_options = self.get_export_feature_options()
+
+        self.save_settings()
+        self.show_status("Full export (meshes + layout) sent to Unreal...")
+        _command_queue.put(("export_everything", [
+            export_dir, save_path, export_anims, export_lods, separate_tex,
+            godot_project, max_res, feature_options,
+        ]))
+
     def run_layout_export(self):
         save_path = self.layout_path_entry.get()
         if not save_path:
@@ -884,6 +934,52 @@ def check_editor_queues(delta_time):
                 except Exception as e:
                     _state_queue.put({"status": (f"Batch Export Error: {str(e)}", "error")})
                     
+            elif cmd == "export_everything":
+                # Meshes and layout in one action. Keeping them as two separate
+                # buttons meant a half-updated export was always one forgotten
+                # click away, and the resulting mismatch surfaces much later as
+                # a missing texture or a MISSING_ placeholder in Godot.
+                export_dir = args[0]
+                save_path = args[1]
+                export_anims = args[2]
+                export_lods = args[3]
+                separate_tex = args[4]
+                godot_project = args[5]
+                max_res = args[6]
+                feature_options = args[7]
+                unreal.log("Unreal to Godot Exporter: Starting full export (meshes + layout)...")
+                exported = failed = 0
+                layout_ok = False
+                try:
+                    exported, failed = export_static_meshes_to_gltf.export_all_level_meshes(
+                        export_dir=export_dir, export_animations=export_anims, export_lods=export_lods, separate_textures=separate_tex, show_dialogs=False, godot_project_dir=godot_project, max_texture_resolution=max_res
+                    )
+                except Exception as e:
+                    _state_queue.put({"status": (f"Full Export Error (meshes): {str(e)}", "error")})
+                    continue
+
+                try:
+                    # The mesh export just wrote these same textures, so reuse
+                    # them rather than re-encoding gigabytes of identical PNGs.
+                    layout_ok = export_level_to_json.export_level_to_json(
+                        save_path=save_path, show_dialogs=False, godot_project_dir=godot_project, max_texture_resolution=max_res, options=feature_options,
+                        skip_existing_textures=True,
+                    )
+                except Exception as e:
+                    _state_queue.put({"status": (f"Full Export Error (layout): {str(e)}", "error")})
+                    continue
+
+                rep = _run_diagnostic(os.path.dirname(save_path), godot_project, strict=True)
+                verdict = _diagnostic_status(rep)
+                if failed > 0:
+                    _state_queue.put({"status": (f"Full export: {exported} meshes exported, {failed} failed.", "warning")})
+                elif not layout_ok:
+                    _state_queue.put({"status": ("Meshes exported, but the layout export failed. Check output log.", "error")})
+                elif verdict:
+                    _state_queue.put({"status": verdict})
+                else:
+                    _state_queue.put({"status": (f"Full export complete: {exported} meshes + layout.", "success")})
+
             elif cmd == "export_layout":
                 save_path = args[0]
                 godot_project = args[1] if len(args) > 1 else None
