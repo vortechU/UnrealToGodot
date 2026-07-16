@@ -98,7 +98,9 @@ bool / int / float / string; anything else is stringified or dropped.
     "godot_transform": { ... },
     "color": [r, g, b],
     "intensity": 5000.0,
-    "intensity_units": "lumens" | "candela" | "ev" | "unitless" | "unknown",
+    "intensity_units": "lux" | "lumens" | "candela" | "ev" | "unitless" | "unknown",
+                                         // "lux" is always used for directional lights,
+                                         // which have no IntensityUnits property in UE
     "godot_energy": 1.7,                 // pre-converted suggested Godot light_energy
     "temperature_kelvin": 6500.0 | null,
     "use_temperature": false,
@@ -164,7 +166,8 @@ WorldEnvironment but still listed.
 "has_sky_atmosphere": true
 ```
 
-Godot: fog → `Environment.fog_enabled` (+density heuristic `fog_density * 5.0`, documented);
+Godot: fog → `Environment.fog_enabled` (+density heuristic `fog_density * 0.5`, so UE's
+default 0.02 lands on Godot's default 0.01);
 sky_light/atmosphere → `Environment.background = Sky` with `ProceduralSkyMaterial` and
 ambient light energy.
 

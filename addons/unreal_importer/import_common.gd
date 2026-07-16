@@ -116,16 +116,30 @@ static func find_model_path(folder: String, base_name: String) -> String:
 
 
 static func load_image_file(path: String) -> Image:
-	"""Loads an Image from res:// or an absolute filesystem path."""
+	"""Loads an Image from res:// or an absolute filesystem path.
+
+	Used for heightmaps, where precision matters: Godot's texture importer may
+	VRAM-compress or reformat an .exr, which would quantise the height data and
+	produce terraced terrain. So for res:// paths we read the raw file off disk
+	first (globalize_path is reliable here — this is an editor-only tool) and
+	only fall back to the imported resource if that fails."""
 	if path == "":
 		return null
 	if path.begins_with("res://"):
+		var raw_path := ProjectSettings.globalize_path(path)
+		if raw_path != "":
+			var direct := Image.load_from_file(raw_path)
+			if direct != null:
+				return direct
 		var tex := load(path)
 		if tex is Texture2D:
-			return (tex as Texture2D).get_image()
+			var img := (tex as Texture2D).get_image()
+			if img != null and img.is_compressed():
+				img.decompress()
+			return img
 		return null
-	var img := Image.load_from_file(path)
-	return img
+	var loaded := Image.load_from_file(path)
+	return loaded
 
 
 static func load_texture_file(tex_path: String) -> Texture2D:

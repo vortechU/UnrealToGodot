@@ -408,8 +408,12 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
     if options:
         opts.update(options)
 
-    # Optional feature modules (each missing module simply disables its feature)
-    foliage_mod = _try_import("export_foliage") if opts.get("foliage") else None
+    # Optional feature modules (each missing module simply disables its feature).
+    # export_foliage is loaded even when foliage export is OFF: it owns the list of
+    # instanced component classes that must be EXCLUDED from per-component actor
+    # export. Without it, every ISM/HISM/painted-foliage component would be emitted
+    # as a single mesh placement at its component origin instead of being omitted.
+    foliage_mod = _try_import("export_foliage")
     environment_mod = _try_import("export_environment") if (opts.get("lights") or opts.get("decals")) else None
     landscape_mod = _try_import("export_landscape") if opts.get("landscape") else None
     gameplay_mod = _try_import("export_gameplay") if (opts.get("navigation") or opts.get("metadata")) else None
@@ -660,7 +664,7 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
             unreal.log_warning(f"Landscape export failed: {str(e)}")
 
     foliage_data = []
-    if foliage_mod:
+    if foliage_mod and opts.get("foliage"):
         try:
             foliage_data = foliage_mod.collect_foliage(all_actors, register_mesh) or []
         except Exception as e:
