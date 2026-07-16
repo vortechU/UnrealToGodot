@@ -347,12 +347,17 @@ def audit_textures(rep, tex_dir):
         rep.fact("largest", "%s (%dx%d)" % (biggest[0], biggest[1][0], biggest[1][1]))
 
     if total > TOTAL_TEXTURE_BYTES_WARN or len(oversized) > 20:
+        # Deliberately does not suggest the exporter's own "Max Texture
+        # Resolution": that sets max_texture_size, which drives the cooked
+        # texture, while the PNG exporter writes the source art. Verified on
+        # UE 5.7 -- the exported PNG is 4096x4096 either way. The cap that
+        # works is Godot's.
         rep.warn("This texture set is large enough to crash Godot's importer: "
                  "its WebP packer runs out of memory and segfaults partway "
                  "through, leaving a half-imported project that looks like a "
-                 "toolchain bug. Set 'Max Texture Resolution' in the exporter "
-                 "(e.g. 2048), or cap it in Godot via Import defaults "
-                 "(process/size_limit).")
+                 "toolchain bug. Set 'Texture size limit' in the Godot "
+                 "importer dock (e.g. 1024) -- it caps textures already in the "
+                 "project as well as new ones.")
     else:
         rep.ok("texture set is within a size Godot imports reliably")
 

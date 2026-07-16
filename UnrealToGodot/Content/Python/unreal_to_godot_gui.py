@@ -222,9 +222,19 @@ class UnrealToGodotApp:
         self.separate_textures_cb.pack(anchor=tk.W, pady=(4, 0))
         
         # Max Texture Resolution Row
+        #
+        # This does not currently change the exported files, and says so rather
+        # than quietly ignoring the choice. It works by setting each texture's
+        # max_texture_size, which drives the COOKED texture -- but
+        # TextureExporterPNG writes the SOURCE art, so the PNG comes out at its
+        # original resolution regardless. Verified on UE 5.7: exporting a 4096
+        # texture with max_texture_size=1024 still produces 4096x4096, 24 MB.
+        # Picking 1K here and getting 3.1 GB of 4K PNGs is exactly the kind of
+        # silent no-op that costs an evening, so the label carries the caveat
+        # until the export path can honour it.
         res_row = tk.Frame(mesh_inner, bg="#1e1e1e")
         res_row.pack(fill=tk.X, pady=(6, 0))
-        
+
         res_lbl = tk.Label(
             res_row,
             text="Max Texture Resolution:",
@@ -233,7 +243,7 @@ class UnrealToGodotApp:
             font=("Segoe UI", 9)
         )
         res_lbl.pack(side=tk.LEFT)
-        
+
         self.max_res_combo = ttk.Combobox(
             res_row,
             values=["Unlimited / Original", "512", "1024 (1K)", "2048 (2K)", "4096 (4K)"],
@@ -243,6 +253,17 @@ class UnrealToGodotApp:
         )
         self.max_res_combo.set("Unlimited / Original")
         self.max_res_combo.pack(side=tk.RIGHT)
+
+        res_note = tk.Label(
+            mesh_inner,
+            text="Note: Unreal exports source art, so this does not resize the exported PNGs.\n"
+                 "Use 'Texture size limit' in the Godot importer dock to keep the import light.",
+            fg="#a1a1aa",
+            bg="#1e1e1e",
+            justify=tk.LEFT,
+            font=("Segoe UI", 8)
+        )
+        res_note.pack(anchor=tk.W, pady=(2, 0))
         
         self.export_mesh_btn = tk.Button(
             mesh_inner, 

@@ -20,10 +20,18 @@ var navigation_check: CheckBox
 var navigation_bake_check: CheckBox
 var metadata_check: CheckBox
 var energy_scale_spin: SpinBox
+var texture_limit_option: OptionButton
 
 # Refactored importer script class reference
 const ImporterClass = preload("res://addons/unreal_importer/import_unreal_layout.gd")
 const Common = preload("res://addons/unreal_importer/import_common.gd")
+const TextureLimit = preload("res://addons/unreal_importer/texture_import_limit.gd")
+
+const TEXTURE_LIMIT_LABELS := ["No limit (as exported)", "512", "1024", "2048", "4096"]
+const TEXTURE_LIMIT_VALUES := [0, 512, 1024, 2048, 4096]
+# 1024 by default: a full-resolution import of a real level is slow, heavy, and
+# can run Godot out of memory. Someone who wants the source art can say so.
+const TEXTURE_LIMIT_DEFAULT_INDEX := 2
 
 func _enter_tree() -> void:
 	# Root Container
@@ -178,6 +186,27 @@ func _enter_tree() -> void:
 	vbox.add_child(sep2)
 	
 	# --- Action Button ---
+	# Unreal exports its source art, so a real level arrives as gigabytes of 4K
+	# PNGs. Unreal's own "Max Texture Resolution" cannot prevent that -- it
+	# drives the cooked texture while the PNG exporter writes the source -- so
+	# the cap has to be applied here.
+	var tex_limit_row := HBoxContainer.new()
+	var tex_limit_lbl := Label.new()
+	tex_limit_lbl.text = "Texture size limit"
+	tex_limit_lbl.tooltip_text = "Caps the resolution Godot imports textures at. Unreal exports full-resolution source art (often 4K), which is slow, heavy on VRAM, and large enough to crash Godot's importer. Applies to textures already imported as well as new ones."
+	tex_limit_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	tex_limit_row.add_child(tex_limit_lbl)
+
+	texture_limit_option = OptionButton.new()
+	for item in TEXTURE_LIMIT_LABELS:
+		texture_limit_option.add_item(item)
+	texture_limit_option.selected = TEXTURE_LIMIT_DEFAULT_INDEX
+	texture_limit_option.tooltip_text = tex_limit_lbl.tooltip_text
+	texture_limit_option.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	texture_limit_option.item_selected.connect(_on_texture_limit_changed)
+	tex_limit_row.add_child(texture_limit_option)
+	vbox.add_child(tex_limit_row)
+
 	import_btn = Button.new()
 	import_btn.text = "Import Unreal Level Layout"
 	import_btn.custom_minimum_size = Vector2(0, 36)
@@ -300,6 +329,27 @@ func _on_browse_textures() -> void:
 	)
 	dialog.popup_centered_ratio(0.6)
 
+func _selected_texture_limit() -> int:
+	if texture_limit_option == null:
+		return 0
+	return TEXTURE_LIMIT_VALUES[clampi(texture_limit_option.selected, 0, TEXTURE_LIMIT_VALUES.size() - 1)]
+
+
+func _on_texture_limit_changed(_index: int) -> void:
+	## Set the project default as soon as it is chosen, not at import time.
+	## Textures are imported by the editor the moment they appear in the
+	## project -- typically when the exporter's auto-transfer drops them in,
+	## long before anyone presses Import. Waiting until then would be too late
+	## to prevent the expensive full-resolution import we are trying to avoid.
+	var limit := _selected_texture_limit()
+	TextureLimit.set_default_limit(limit)
+	if limit > 0:
+		status_label.text = "Status: New textures will import at max %dpx." % limit
+	else:
+		status_label.text = "Status: New textures will import at full resolution."
+	status_label.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6))
+
+
 func _on_import_pressed() -> void:
 	# 1. Get the current active scene root
 	var scene_root: Node = EditorInterface.get_edited_scene_root()
@@ -314,7 +364,23 @@ func _on_import_pressed() -> void:
 	
 	# Deferred frame execution to let status label redraw
 	await get_tree().process_frame
-	
+
+	# Cap textures that are already in the project. Changing the importer
+	# default only affects future imports, so anything transferred in before
+	# the limit was chosen is still sitting there at full 4K.
+	var tex_limit := _selected_texture_limit()
+	if tex_limit > 0:
+		var capped: Dictionary = TextureLimit.apply_to_folder(textures_edit.text, tex_limit)
+		if int(capped.get("changed", 0)) > 0:
+			status_label.text = "Status: capping %d texture(s) to %dpx..." % [capped["changed"], tex_limit]
+			await get_tree().process_frame
+			# Let the queued reimports finish before materials load the textures.
+			var fs := EditorInterface.get_resource_filesystem()
+			while fs and fs.is_scanning():
+				await get_tree().process_frame
+			print("Unreal Importer: capped %d/%d texture(s) to %dpx"
+				% [capped["changed"], capped["total"], tex_limit])
+
 	# Instantiate our importer class. Note that since we invoke do_import() directly
 	# and pass the scene root, we bypass the need for EditorScript's get_scene() context.
 	var importer = ImporterClass.new()
