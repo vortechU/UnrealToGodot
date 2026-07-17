@@ -47,7 +47,7 @@ try:
     exported, failed = EX.export_all_level_meshes(
         export_dir=os.path.join(OUT_DIR, "models"),
         export_animations=False, export_lods=False, separate_textures=True,
-        show_dialogs=False, godot_project_dir=None, max_texture_resolution=0,
+        show_dialogs=False, godot_project_dir=None,
     )
     unreal.log("mesh export: exported=%s failed=%s" % (exported, failed))
 except Exception as e:
@@ -57,8 +57,7 @@ unreal.log("--- layout export (export_level_to_json) ---")
 try:
     ok = EL.export_level_to_json(
         save_path=os.path.join(OUT_DIR, "level_layout.json"),
-        show_dialogs=False, godot_project_dir=None, max_texture_resolution=0,
-        options=None,
+        show_dialogs=False, godot_project_dir=None, options=None,
     )
     unreal.log("layout export: %s" % ok)
 except Exception as e:

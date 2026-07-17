@@ -48,6 +48,14 @@ Two traps this harness had to work around, both of which silently report
   half-populated `.godot` cache that the next run happily trusts. The harness
   sets `importer_defaults/texture` with `process/size_limit` — it is testing
   that textures are *wired up*, not how they look.
+* **`--import` runs your editor plugins too.** It is not a quiet asset pass: it
+  boots the editor and enables `[editor_plugins]`, so a test plugin's
+  `_enter_tree()` fires there *and* in the following `-e` run. `test_texture_shrink.py`
+  hit this — the `--import` pass did the work and quit, then `-e` ran the same
+  plugin against already-processed files, found nothing to do, and overwrote the
+  result with a zero. A working feature looked broken. Either skip the separate
+  `--import` (the `-e` pass imports anyway) or make the plugin idempotent, and
+  assert the fixture is in the state you think it is before acting on it.
 
 ## Landscape export needs a GPU
 
@@ -57,6 +65,12 @@ Two traps this harness had to work around, both of which silently report
 `options={"landscape": False}` when exporting headlessly. This is a limit of the
 headless test method, not of the exporter.
 
+The cause is `FApp::CanEverRender()` being false in a commandlet, and
+`-AllowCommandletRendering` flips it — that is what lets
+`probe_texture_export_routes.py` drive real render targets headlessly. It is
+plausible that the same flag lifts this landscape limitation, but that has not
+been tried; the flag is only known to work for the texture probe.
+
 ## What each test covers
 
 | File | Covers |
@@ -65,7 +79,9 @@ headless test method, not of the exporter.
 | `test_layout.py` | Component placement in `tscn_writer.py`, including an explicit reproduction of the double-transform bug and `affine_inverse` round-trips. |
 | `test_tscn_writer.py` | End-to-end `.tscn` generation: resource/node structure, `load_steps` accounting, dangling-reference checks, and node placement. |
 | `godot_harness/` | Builds a throwaway Godot project (minimal glTF, fixture `level_layout.json`) and runs `import_unreal_layout.gd` for real, asserting where nodes land. |
+| `test_texture_shrink.py` | Drives `texture_import_limit.shrink_source_files` in headless Godot against real 4K exports, then checks the pixels with PIL: capped dimensions, and no channel collapsed to a constant. The normal map's blue channel is the case that matters — see `docs/texture-sizing.md`. |
 | `probe_unreal_api.py` | Run *inside* Unreal to confirm `GLTFExportOptions` property names exist on your engine version. |
+| `probe_texture_export_routes.py` | Run *inside* Unreal (needs `-AllowCommandletRendering`) to re-check why no Unreal route resizes textures. Pair with `compare_texture_exports.py`, which does the pixel verdict on the host. |
 
 ## Driving the engines headlessly
 

@@ -85,6 +85,12 @@ def main():
         code = run([args.godot, "--headless", "-e", "--path", PROJECT_DIR])
         if not report_godot_results(code):
             failed.append("godot_headless_import")
+
+        # Skips itself when there are no real exports to work on, so it costs
+        # nothing on a machine that has never run the Unreal probe.
+        if run([sys.executable, os.path.join(TESTS_DIR, "test_texture_shrink.py"),
+                "--godot", args.godot]) != 0:
+            failed.append("test_texture_shrink.py")
     else:
         print("\n(skipping Godot leg; pass --godot <path-to-godot.exe> to enable)")
 

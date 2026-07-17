@@ -21,6 +21,7 @@ var navigation_bake_check: CheckBox
 var metadata_check: CheckBox
 var energy_scale_spin: SpinBox
 var texture_limit_option: OptionButton
+var shrink_files_check: CheckBox
 
 # Refactored importer script class reference
 const ImporterClass = preload("res://addons/unreal_importer/import_unreal_layout.gd")
@@ -207,6 +208,15 @@ func _enter_tree() -> void:
 	tex_limit_row.add_child(texture_limit_option)
 	vbox.add_child(tex_limit_row)
 
+	# The limit above only changes what Godot loads; the exported PNGs stay 4K on
+	# disk. This is what reclaims the space, and it is destructive, so it says so
+	# plainly rather than quietly rewriting an export someone still needed.
+	shrink_files_check = CheckBox.new()
+	shrink_files_check.text = "Also shrink texture files on disk"
+	shrink_files_check.button_pressed = true
+	shrink_files_check.tooltip_text = "Rewrites exported PNGs larger than the limit at the capped size, which is usually the difference between a multi-gigabyte textures folder and a few hundred megabytes.\n\nDestructive: the full-resolution art only exists back in Unreal, so raising the limit later means exporting again. Only .png files the exporter writes are touched."
+	vbox.add_child(shrink_files_check)
+
 	import_btn = Button.new()
 	import_btn.text = "Import Unreal Level Layout"
 	import_btn.custom_minimum_size = Vector2(0, 36)
@@ -365,10 +375,28 @@ func _on_import_pressed() -> void:
 	# Deferred frame execution to let status label redraw
 	await get_tree().process_frame
 
+	var tex_limit := _selected_texture_limit()
+
+	# Shrink the exported PNGs first, so the reimport below reads the small ones
+	# rather than importing 4K art and then throwing most of it away.
+	if tex_limit > 0 and shrink_files_check and shrink_files_check.button_pressed:
+		status_label.text = "Status: shrinking texture files to %dpx..." % tex_limit
+		await get_tree().process_frame
+		var shrunk: Dictionary = TextureLimit.shrink_source_files(textures_edit.text, tex_limit)
+		if int(shrunk.get("shrunk", 0)) > 0:
+			var saved_mb := float(int(shrunk["bytes_before"]) - int(shrunk["bytes_after"])) / 1048576.0
+			print("Unreal Importer: shrank %d/%d texture file(s) to %dpx, freeing %.1f MB on disk"
+				% [shrunk["shrunk"], shrunk["total"], tex_limit, saved_mb])
+		if int(shrunk.get("failed", 0)) > 0:
+			push_warning("Unreal Importer: %d texture file(s) could not be shrunk; see warnings above"
+				% shrunk["failed"])
+		var shrink_fs := EditorInterface.get_resource_filesystem()
+		while shrink_fs and shrink_fs.is_scanning():
+			await get_tree().process_frame
+
 	# Cap textures that are already in the project. Changing the importer
 	# default only affects future imports, so anything transferred in before
 	# the limit was chosen is still sitting there at full 4K.
-	var tex_limit := _selected_texture_limit()
 	if tex_limit > 0:
 		var capped: Dictionary = TextureLimit.apply_to_folder(textures_edit.text, tex_limit)
 		if int(capped.get("changed", 0)) > 0:

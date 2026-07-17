@@ -111,15 +111,18 @@ importing.
 
 Heightmaps/splatmaps go to a sibling `terrain/` folder, textures to `textures/`.
 
-> **Keeping textures light**: a real level's source textures can be several GB
-> of 4K PNGs — enough to make Godot's importer run out of memory and crash
-> partway through. Set **Texture size limit** (e.g. `1024`) in the Godot
-> importer dock; it caps textures already in the project as well as new ones.
+> **Keeping textures light**: Unreal exports source art, so a real level arrives
+> as several GB of 4K PNGs — enough to make Godot's importer run out of memory
+> and crash partway through. Texture sizing lives in the Godot importer dock,
+> because Unreal's Python API has no way to resize source art
+> ([why](docs/texture-sizing.md)):
 >
-> The exporter's own **Max Texture Resolution** does *not* resize the exported
-> files. It sets each texture's `max_texture_size`, which drives the cooked
-> texture, while the PNG exporter writes the *source* art — verified on UE 5.7,
-> a 4K texture exports at 4096×4096 either way. Cap it on the Godot side.
+> - **Texture size limit** (e.g. `1024`) caps what Godot imports, for textures
+>   already in the project as well as new ones.
+> - **Also shrink texture files on disk** rewrites the oversized PNGs at that
+>   size, which is what reclaims the space — 3.1 GB of 4K exports drops to a few
+>   hundred MB. It is destructive: the full-resolution art only exists back in
+>   Unreal, so raising the limit later means exporting again.
 
 ### Step 2: Importing into Godot
 

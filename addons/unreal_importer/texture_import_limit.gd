@@ -1,7 +1,7 @@
 @tool
 extends RefCounted
 
-## Caps the size Godot imports textures at.
+## Caps the size Godot imports textures at, and can shrink the files themselves.
 ##
 ## An Unreal export ships its source art: a real level is gigabytes of 4K PNGs.
 ## Godot imports those at full resolution, which is slow, costs a lot of VRAM,
@@ -9,15 +9,21 @@ extends RefCounted
 ## down partway through -- leaving a half-populated .godot cache that looks like
 ## a broken export rather than an out-of-memory crash.
 ##
-## Unreal's own "Max Texture Resolution" setting cannot help here: it drives the
-## cooked texture, while the PNG exporter writes the source art, so the exported
-## files are full-size no matter what it is set to. Capping on the Godot side is
-## what actually makes the imported project lightweight.
+## Texture sizing lives on this side of the pipeline because Unreal cannot do it.
+## Its Python API exposes no way to resize the source art an export writes:
+## max_texture_size and ResizeDuringBuild drive the *cooked* texture while
+## TextureExporterPNG writes the *source*, and every route to the cooked pixels
+## (render targets, ExportTexture2D) reads block-compressed data -- which returns
+## a constant 0 blue channel for BC5 normal maps, silently flattening them. See
+## docs/texture-sizing.md. Godot's Image.resize has none of those problems.
 ##
-## Two things have to happen, and doing only the first is the trap: setting the
-## importer default only affects textures imported from now on. Textures already
-## in the project keep whatever their .import file says, so those are rewritten
-## and reimported explicitly.
+## Three things have to happen, and doing only the first is the trap:
+##   1. The importer default only affects textures imported from now on.
+##   2. Textures already in the project keep whatever their .import file says,
+##      so those are rewritten and reimported explicitly.
+##   3. Both of the above only change what Godot *loads*. The exported PNG on
+##      disk stays 4K, so the project keeps carrying gigabytes it never uses --
+##      shrink_source_files() is what actually reclaims the disk space.
 
 const IMPORTER_DEFAULTS := "importer_defaults/texture"
 
@@ -95,6 +101,84 @@ static func _rewrite_import_file(import_path: String, size_limit: int) -> bool:
 	f.store_string("\n".join(out))
 	f.close()
 	return true
+
+
+static func target_size(width: int, height: int, size_limit: int) -> Vector2i:
+	## Longest edge capped to size_limit, aspect ratio kept. Never upscales.
+	var longest := maxi(width, height)
+	if size_limit <= 0 or longest <= size_limit:
+		return Vector2i(width, height)
+	var scale := float(size_limit) / float(longest)
+	return Vector2i(maxi(1, roundi(width * scale)), maxi(1, roundi(height * scale)))
+
+
+static func shrink_source_files(folder: String, size_limit: int) -> Dictionary:
+	## Rewrites oversized exported PNGs on disk at the capped size.
+	##
+	## This is destructive and cannot be undone from inside Godot -- the source
+	## art only exists back in Unreal. It is deliberately limited to .png, the
+	## only thing the exporter writes: anything else in the folder was put there
+	## by hand, and quietly rewriting someone's own art would be a nasty way to
+	## learn what this option does.
+	##
+	## Returns {"total", "shrunk", "skipped", "failed", "bytes_before",
+	## "bytes_after"}. Sizes are read from the file header via Image, so an
+	## already-capped folder costs a load per texture and no writes.
+	var result := {
+		"total": 0, "shrunk": 0, "skipped": 0, "failed": 0,
+		"bytes_before": 0, "bytes_after": 0,
+	}
+	if size_limit <= 0:
+		return result
+
+	var changed := PackedStringArray()
+	for tex_path in find_textures(folder):
+		result["total"] += 1
+		if not tex_path.to_lower().ends_with(".png"):
+			result["skipped"] += 1
+			continue
+
+		var image := Image.new()
+		if image.load(tex_path) != OK:
+			result["failed"] += 1
+			push_warning("Unreal Importer: could not read %s to shrink it" % tex_path)
+			continue
+
+		var target := target_size(image.get_width(), image.get_height(), size_limit)
+		if target == Vector2i(image.get_width(), image.get_height()):
+			continue
+
+		var before := _file_size(tex_path)
+		# Lanczos is the sharpest of Godot's filters for downscaling. It resamples
+		# raw channel values, so packed masks and normal maps come through intact
+		# -- no gamma reinterpretation, no channel dropped.
+		image.resize(target.x, target.y, Image.INTERPOLATE_LANCZOS)
+		if image.save_png(tex_path) != OK:
+			result["failed"] += 1
+			push_warning("Unreal Importer: could not write %s at %dx%d" % [tex_path, target.x, target.y])
+			continue
+
+		result["shrunk"] += 1
+		result["bytes_before"] += before
+		result["bytes_after"] += _file_size(tex_path)
+		changed.append(tex_path)
+
+	# The bytes behind every rewritten path just changed; without a reimport the
+	# editor keeps serving whatever the stale .godot cache holds.
+	if not changed.is_empty() and Engine.is_editor_hint():
+		var fs := EditorInterface.get_resource_filesystem()
+		if fs:
+			fs.reimport_files(changed)
+	return result
+
+
+static func _file_size(path: String) -> int:
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return 0
+	var size := f.get_length()
+	f.close()
+	return size
 
 
 static func apply_to_folder(folder: String, size_limit: int) -> Dictionary:

@@ -464,8 +464,7 @@ def prompt_for_save_file(default_path):
     return None
 
 def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=None,
-                         max_texture_resolution=0, options=None,
-                         skip_existing_textures=False):
+                         options=None, skip_existing_textures=False):
     """Exports the level layout, and the textures its materials reference.
 
     skip_existing_textures leaves any texture already written to the textures
@@ -778,7 +777,6 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
         # Export all collected textures automatically
         exported_textures_count = 0
         if collected_textures:
-            original_sizes = {}
             try:
                 parent_dir = os.path.dirname(save_path)
                 textures_dir = os.path.join(parent_dir, "textures")
@@ -800,13 +798,6 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                         exported_textures_count += 1
                         continue
 
-                    if max_texture_resolution > 0:
-                        try:
-                            original_sizes[tex] = tex.get_editor_property("max_texture_size")
-                            tex.set_editor_property("max_texture_size", max_texture_resolution)
-                        except Exception as e:
-                            unreal.log_warning(f"Could not limit resolution for {tex_name}: {str(e)}")
-                    
                     task = unreal.AssetExportTask()
                     task.object = tex
                     task.filename = filename
@@ -830,13 +821,6 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                             exported_textures_count += 1
             except Exception as tex_err:
                 unreal.log_warning(f"Failed to export level textures: {str(tex_err)}")
-            finally:
-                if max_texture_resolution > 0 and original_sizes:
-                    for tex, orig_size in original_sizes.items():
-                        try:
-                            tex.set_editor_property("max_texture_size", orig_size)
-                        except Exception as e:
-                            unreal.log_warning(f"Failed to restore texture size for {tex.get_name()}: {str(e)}")
 
         if godot_project_dir and os.path.isdir(godot_project_dir):
             try:

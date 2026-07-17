@@ -486,7 +486,17 @@ def get_mesh_lod_count(mesh):
             pass
     return 1
 
-def export_textures_for_meshes(meshes, export_dir, separate_textures=True, max_res_limit=0):
+def export_textures_for_meshes(meshes, export_dir, separate_textures=True):
+    """Writes every texture the given meshes reference, at its source size.
+
+    There is no resolution cap here on purpose. This used to set each texture's
+    max_texture_size, which was a no-op: that drives the cooked texture, while
+    TextureExporterPNG writes the source art. Unreal's Python API has no way to
+    resize source art, and the cooked pixels are unusable for this -- BC5 normal
+    maps read back with a constant 0 blue channel. The Godot importer dock caps
+    textures instead, and can shrink these files on disk. See
+    docs/texture-sizing.md.
+    """
     collected_textures = set()
     for mesh in meshes:
         if isinstance(mesh, unreal.StaticMesh):
@@ -512,46 +522,25 @@ def export_textures_for_meshes(meshes, export_dir, separate_textures=True, max_r
     os.makedirs(textures_dir, exist_ok=True)
     
     tasks = []
-    original_sizes = {}  # Store original max sizes to restore them later
-    
-    try:
-        for tex in collected_textures:
-            tex_name = tex.get_name()
-            filename = os.path.join(textures_dir, f"{tex_name}.png")
-            
-            # If a resolution limit is set (e.g., 1024 for 1K)
-            if max_res_limit > 0:
-                try:
-                    # Store the original max texture size setting
-                    original_sizes[tex] = tex.get_editor_property("max_texture_size")
-                    # Apply the limit temporarily
-                    tex.set_editor_property("max_texture_size", max_res_limit)
-                except Exception as e:
-                    unreal.log_warning(f"Could not limit resolution for {tex_name}: {str(e)}")
-            
-            task = unreal.AssetExportTask()
-            task.object = tex
-            task.filename = filename
-            task.automated = True
-            task.prompt = False
-            task.replace_identical = True
-            
-            if hasattr(unreal, "TextureExporterPNG"):
-                task.exporter = unreal.TextureExporterPNG()
-                
-            tasks.append(task)
-            
-        if tasks:
-            unreal.log(f"Exporting {len(tasks)} referenced textures to: {textures_dir}")
-            unreal.Exporter.run_asset_export_tasks(tasks)
-    finally:
-        # Restore the original texture sizes so we don't modify the user's source assets
-        if max_res_limit > 0 and original_sizes:
-            for tex, orig_size in original_sizes.items():
-                try:
-                    tex.set_editor_property("max_texture_size", orig_size)
-                except Exception as e:
-                    unreal.log_warning(f"Failed to restore texture size for {tex.get_name()}: {str(e)}")
+    for tex in collected_textures:
+        tex_name = tex.get_name()
+        filename = os.path.join(textures_dir, f"{tex_name}.png")
+
+        task = unreal.AssetExportTask()
+        task.object = tex
+        task.filename = filename
+        task.automated = True
+        task.prompt = False
+        task.replace_identical = True
+
+        if hasattr(unreal, "TextureExporterPNG"):
+            task.exporter = unreal.TextureExporterPNG()
+
+        tasks.append(task)
+
+    if tasks:
+        unreal.log(f"Exporting {len(tasks)} referenced textures to: {textures_dir}")
+        unreal.Exporter.run_asset_export_tasks(tasks)
 
 def copy_exports_to_godot(export_dir, meshes_exported, separate_textures, godot_project_dir, export_names=None):
     if not godot_project_dir or not os.path.isdir(godot_project_dir):
@@ -641,7 +630,7 @@ def copy_exports_to_godot(export_dir, meshes_exported, separate_textures, godot_
                     except Exception as copy_err:
                         unreal.log_warning(f"Failed to copy texture {filename} to Godot: {str(copy_err)}")
 
-def export_selected_static_meshes(export_dir=None, export_animations=False, export_lods=False, separate_textures=True, show_dialogs=True, godot_project_dir=None, max_texture_resolution=0):
+def export_selected_static_meshes(export_dir=None, export_animations=False, export_lods=False, separate_textures=True, show_dialogs=True, godot_project_dir=None):
     # 1. Check requirements
     if not hasattr(unreal, "GLTFExporter"):
         if show_dialogs:
@@ -837,7 +826,7 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
     # Automatically export referenced textures
     if exported_count > 0:
         try:
-            export_textures_for_meshes(meshes_to_export, export_dir, separate_textures, max_texture_resolution)
+            export_textures_for_meshes(meshes_to_export, export_dir, separate_textures)
         except Exception as tex_err:
             unreal.log_warning(f"Failed to export textures for meshes: {str(tex_err)}")
 
@@ -899,7 +888,7 @@ def prompt_for_folder(initial_dir):
         unreal.log_warning(f"Could not open directory browser dialog via tkinter: {str(e)}")
     return None
 
-def export_all_level_meshes(export_dir=None, export_animations=False, export_lods=False, separate_textures=True, show_dialogs=True, godot_project_dir=None, max_texture_resolution=0):
+def export_all_level_meshes(export_dir=None, export_animations=False, export_lods=False, separate_textures=True, show_dialogs=True, godot_project_dir=None):
     # 1. Check requirements
     if not hasattr(unreal, "GLTFExporter"):
         if show_dialogs:
@@ -1050,7 +1039,7 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
     # Automatically export referenced textures
     if exported_count > 0:
         try:
-            export_textures_for_meshes(meshes_to_export, export_dir, separate_textures, max_texture_resolution)
+            export_textures_for_meshes(meshes_to_export, export_dir, separate_textures)
         except Exception as tex_err:
             unreal.log_warning(f"Failed to export textures for meshes: {str(tex_err)}")
 

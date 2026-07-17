@@ -11,7 +11,7 @@ import queue
 import threading
 import json
 import tkinter as tk
-from tkinter import filedialog, ttk
+from tkinter import filedialog
 import unreal
 
 # Import underlying exporters
@@ -221,50 +221,29 @@ class UnrealToGodotApp:
         )
         self.separate_textures_cb.pack(anchor=tk.W, pady=(4, 0))
         
-        # Max Texture Resolution Row
+        # There is deliberately no "Max Texture Resolution" control here.
         #
-        # This does not currently change the exported files, and says so rather
-        # than quietly ignoring the choice. It works by setting each texture's
-        # max_texture_size, which drives the COOKED texture -- but
-        # TextureExporterPNG writes the SOURCE art, so the PNG comes out at its
-        # original resolution regardless. Verified on UE 5.7: exporting a 4096
-        # texture with max_texture_size=1024 still produces 4096x4096, 24 MB.
-        # Picking 1K here and getting 3.1 GB of 4K PNGs is exactly the kind of
-        # silent no-op that costs an evening, so the label carries the caveat
-        # until the export path can honour it.
-        res_row = tk.Frame(mesh_inner, bg="#1e1e1e")
-        res_row.pack(fill=tk.X, pady=(6, 0))
-
-        res_lbl = tk.Label(
-            res_row,
-            text="Max Texture Resolution:",
-            fg="#e5e5e5",
-            bg="#1e1e1e",
-            font=("Segoe UI", 9)
-        )
-        res_lbl.pack(side=tk.LEFT)
-
-        self.max_res_combo = ttk.Combobox(
-            res_row,
-            values=["Unlimited / Original", "512", "1024 (1K)", "2048 (2K)", "4096 (4K)"],
-            state="readonly",
-            width=22,
-            font=("Segoe UI", 9)
-        )
-        self.max_res_combo.set("Unlimited / Original")
-        self.max_res_combo.pack(side=tk.RIGHT)
-
+        # There was one, and it did nothing: it set each texture's
+        # max_texture_size, which drives the COOKED texture, while
+        # TextureExporterPNG writes the SOURCE art. Nothing else in Unreal's
+        # Python API resizes source art either, and every route to the cooked
+        # pixels reads block-compressed data -- which hands back a constant 0
+        # blue channel for BC5 normal maps. See docs/texture-sizing.md.
+        #
+        # Sizing lives in the Godot importer dock instead, where it works. The
+        # note stays because someone who came looking for the dropdown needs to
+        # know where it went.
         res_note = tk.Label(
             mesh_inner,
-            text="Note: Unreal exports source art, so this does not resize the exported PNGs.\n"
-                 "Use 'Texture size limit' in the Godot importer dock to keep the import light.",
+            text="Note: textures export at their source resolution (often 4K).\n"
+                 "Use 'Texture size limit' in the Godot importer dock to cap them.",
             fg="#a1a1aa",
             bg="#1e1e1e",
             justify=tk.LEFT,
             font=("Segoe UI", 8)
         )
-        res_note.pack(anchor=tk.W, pady=(2, 0))
-        
+        res_note.pack(anchor=tk.W, pady=(6, 0))
+
         self.export_mesh_btn = tk.Button(
             mesh_inner, 
             text="Export Selected Meshes", 
@@ -644,18 +623,6 @@ class UnrealToGodotApp:
             self.godot_path_entry.delete(0, tk.END)
             self.godot_path_entry.insert(0, norm_path)
 
-    def get_max_texture_resolution(self):
-        text = self.max_res_combo.get()
-        if "512" in text:
-            return 512
-        elif "1024" in text:
-            return 1024
-        elif "2048" in text:
-            return 2048
-        elif "4096" in text:
-            return 4096
-        return 0
-
     def get_export_feature_options(self):
         """Collects the per-feature export toggles (see docs/SCHEMA_V2.md)."""
         return {
@@ -694,18 +661,9 @@ class UnrealToGodotApp:
                     if "layout_path" in settings:
                         self.layout_path_entry.delete(0, tk.END)
                         self.layout_path_entry.insert(0, settings["layout_path"])
-                    if "max_texture_res" in settings:
-                        val = settings["max_texture_res"]
-                        if val == 512:
-                            self.max_res_combo.set("512")
-                        elif val == 1024:
-                            self.max_res_combo.set("1024 (1K)")
-                        elif val == 2048:
-                            self.max_res_combo.set("2048 (2K)")
-                        elif val == 4096:
-                            self.max_res_combo.set("4096 (4K)")
-                        else:
-                            self.max_res_combo.set("Unlimited / Original")
+                    # "max_texture_res" may still be in an older settings file.
+                    # It is read by nothing now -- the control it fed never
+                    # resized anything -- and is ignored rather than migrated.
                     if "features" in settings and isinstance(settings["features"], dict):
                         feats = settings["features"]
                         self.feat_lights_var.set(feats.get("lights", True))
@@ -733,7 +691,6 @@ class UnrealToGodotApp:
             "separate_textures": self.separate_textures_var.get(),
             "mesh_path": self.mesh_path_entry.get(),
             "layout_path": self.layout_path_entry.get(),
-            "max_texture_res": self.get_max_texture_resolution(),
             "features": self.get_export_feature_options()
         }
         try:
@@ -770,12 +727,11 @@ class UnrealToGodotApp:
         export_anims = self.export_anims_var.get()
         export_lods = self.export_lods_var.get()
         separate_tex = self.separate_textures_var.get()
-        max_res = self.get_max_texture_resolution()
-        
+
         self.save_settings()
         self.show_status("Export command sent to Unreal...")
         # Queue the export meshes command to run on main thread
-        _command_queue.put(("export_meshes", [export_dir, export_anims, export_lods, separate_tex, godot_project, max_res]))
+        _command_queue.put(("export_meshes", [export_dir, export_anims, export_lods, separate_tex, godot_project]))
 
     def run_all_meshes_export(self):
         export_dir = self.mesh_path_entry.get()
@@ -790,12 +746,11 @@ class UnrealToGodotApp:
         export_anims = self.export_anims_var.get()
         export_lods = self.export_lods_var.get()
         separate_tex = self.separate_textures_var.get()
-        max_res = self.get_max_texture_resolution()
-        
+
         self.save_settings()
         self.show_status("Batch export command sent to Unreal...")
         # Queue the export all meshes command to run on main thread
-        _command_queue.put(("export_all_meshes", [export_dir, export_anims, export_lods, separate_tex, godot_project, max_res]))
+        _command_queue.put(("export_all_meshes", [export_dir, export_anims, export_lods, separate_tex, godot_project]))
 
     def run_full_export(self):
         """Exports meshes and layout together.
@@ -820,14 +775,13 @@ class UnrealToGodotApp:
         export_anims = self.export_anims_var.get()
         export_lods = self.export_lods_var.get()
         separate_tex = self.separate_textures_var.get()
-        max_res = self.get_max_texture_resolution()
         feature_options = self.get_export_feature_options()
 
         self.save_settings()
         self.show_status("Full export (meshes + layout) sent to Unreal...")
         _command_queue.put(("export_everything", [
             export_dir, save_path, export_anims, export_lods, separate_tex,
-            godot_project, max_res, feature_options,
+            godot_project, feature_options,
         ]))
 
     def run_layout_export(self):
@@ -840,7 +794,6 @@ class UnrealToGodotApp:
         if godot_project == -1:
             return
             
-        max_res = self.get_max_texture_resolution()
         feature_options = self.get_export_feature_options()
 
         self.save_settings()
@@ -849,7 +802,7 @@ class UnrealToGodotApp:
         else:
             self.show_status("Export command sent to Unreal...")
         # Queue the export layout command to run on main thread
-        _command_queue.put(("export_layout", [save_path, godot_project, max_res, feature_options]))
+        _command_queue.put(("export_layout", [save_path, godot_project, feature_options]))
 
     def close(self):
         """Pushes close signal to main thread and shuts down GUI."""
@@ -919,11 +872,10 @@ def check_editor_queues(delta_time):
                 export_lods = args[2] if len(args) > 2 else False
                 separate_tex = args[3] if len(args) > 3 else True
                 godot_project = args[4] if len(args) > 4 else None
-                max_res = args[5] if len(args) > 5 else 0
                 unreal.log("Unreal to Godot Exporter: Starting mesh export on main thread...")
                 try:
                     exported, failed = export_static_meshes_to_gltf.export_selected_static_meshes(
-                        export_dir=export_dir, export_animations=export_anims, export_lods=export_lods, separate_textures=separate_tex, show_dialogs=False, godot_project_dir=godot_project, max_texture_resolution=max_res
+                        export_dir=export_dir, export_animations=export_anims, export_lods=export_lods, separate_textures=separate_tex, show_dialogs=False, godot_project_dir=godot_project
                     )
                     if failed > 0:
                         _state_queue.put({"status": (f"Export completed: {exported} exported, {failed} failed.", "warning")})
@@ -938,11 +890,10 @@ def check_editor_queues(delta_time):
                 export_lods = args[2] if len(args) > 2 else False
                 separate_tex = args[3] if len(args) > 3 else True
                 godot_project = args[4] if len(args) > 4 else None
-                max_res = args[5] if len(args) > 5 else 0
                 unreal.log("Unreal to Godot Exporter: Starting batch level mesh export on main thread...")
                 try:
                     exported, failed = export_static_meshes_to_gltf.export_all_level_meshes(
-                        export_dir=export_dir, export_animations=export_anims, export_lods=export_lods, separate_textures=separate_tex, show_dialogs=False, godot_project_dir=godot_project, max_texture_resolution=max_res
+                        export_dir=export_dir, export_animations=export_anims, export_lods=export_lods, separate_textures=separate_tex, show_dialogs=False, godot_project_dir=godot_project
                     )
                     rep = _run_diagnostic(export_dir, godot_project)
                     verdict = _diagnostic_status(rep)
@@ -966,14 +917,13 @@ def check_editor_queues(delta_time):
                 export_lods = args[3]
                 separate_tex = args[4]
                 godot_project = args[5]
-                max_res = args[6]
-                feature_options = args[7]
+                feature_options = args[6]
                 unreal.log("Unreal to Godot Exporter: Starting full export (meshes + layout)...")
                 exported = failed = 0
                 layout_ok = False
                 try:
                     exported, failed = export_static_meshes_to_gltf.export_all_level_meshes(
-                        export_dir=export_dir, export_animations=export_anims, export_lods=export_lods, separate_textures=separate_tex, show_dialogs=False, godot_project_dir=godot_project, max_texture_resolution=max_res
+                        export_dir=export_dir, export_animations=export_anims, export_lods=export_lods, separate_textures=separate_tex, show_dialogs=False, godot_project_dir=godot_project
                     )
                 except Exception as e:
                     _state_queue.put({"status": (f"Full Export Error (meshes): {str(e)}", "error")})
@@ -983,7 +933,7 @@ def check_editor_queues(delta_time):
                     # The mesh export just wrote these same textures, so reuse
                     # them rather than re-encoding gigabytes of identical PNGs.
                     layout_ok = export_level_to_json.export_level_to_json(
-                        save_path=save_path, show_dialogs=False, godot_project_dir=godot_project, max_texture_resolution=max_res, options=feature_options,
+                        save_path=save_path, show_dialogs=False, godot_project_dir=godot_project, options=feature_options,
                         skip_existing_textures=True,
                     )
                 except Exception as e:
@@ -1004,12 +954,11 @@ def check_editor_queues(delta_time):
             elif cmd == "export_layout":
                 save_path = args[0]
                 godot_project = args[1] if len(args) > 1 else None
-                max_res = args[2] if len(args) > 2 else 0
-                feature_options = args[3] if len(args) > 3 else None
+                feature_options = args[2] if len(args) > 2 else None
                 unreal.log("Unreal to Godot Exporter: Starting level layout export on main thread...")
                 try:
                     success = export_level_to_json.export_level_to_json(
-                        save_path=save_path, show_dialogs=False, godot_project_dir=godot_project, max_texture_resolution=max_res, options=feature_options
+                        save_path=save_path, show_dialogs=False, godot_project_dir=godot_project, options=feature_options
                     )
                     if success:
                         # The layout lands next to models/, so audit the whole
