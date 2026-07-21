@@ -130,23 +130,22 @@ func _enter_tree() -> void:
 	textures_box.add_child(textures_row)
 	vbox.add_child(textures_box)
 	
-	# --- Option Checkbox ---
+	# --- Feature Toggles (everything is optional and user-controllable) ---
+	# Folded away by default: these are ten-plus rows and, left open, they push
+	# the Import button off the bottom of the dock. Everything a routine import
+	# needs stays visible; the fine-grained toggles are one click under here.
+	var features := _make_section(vbox, "Import Features", false)
+
 	convert_transforms_check = CheckBox.new()
 	convert_transforms_check.text = "GDScript Coordinate Swap"
 	convert_transforms_check.tooltip_text = "Checked: Re-calculates swizzle (LH Z-up to RH Y-up) inside Godot.\nUnchecked: Uses pre-calculated values from JSON (Recommended)."
 	convert_transforms_check.button_pressed = false
-	vbox.add_child(convert_transforms_check)
+	features.add_child(convert_transforms_check)
 
-	# --- Feature Toggles (everything is optional and user-controllable) ---
-	var features_lbl := Label.new()
-	features_lbl.text = "Import Features:"
-	features_lbl.tooltip_text = "Choose which exported Unreal data gets rebuilt in this scene."
-	vbox.add_child(features_lbl)
-
-	lights_check = _make_check(vbox, "Lights", "Create DirectionalLight3D / OmniLight3D / SpotLight3D nodes from exported Unreal lights.")
-	environment_check = _make_check(vbox, "World Environment (post-fx, fog, sky)", "Create a WorldEnvironment from PostProcessVolume, height fog and sky data (bloom, SSAO, exposure, fog).")
-	decals_check = _make_check(vbox, "Decals", "Create Decal nodes from Unreal DeferredDecal actors, binding exported textures.")
-	terrain_check = _make_check(vbox, "Terrain (Landscapes)", "Rebuild Unreal Landscapes from exported heightmaps. Uses Terrain3D when installed, otherwise a plugin-free mesh fallback with collision.")
+	lights_check = _make_check(features,"Lights", "Create DirectionalLight3D / OmniLight3D / SpotLight3D nodes from exported Unreal lights.")
+	environment_check = _make_check(features,"World Environment (post-fx, fog, sky)", "Create a WorldEnvironment from PostProcessVolume, height fog and sky data (bloom, SSAO, exposure, fog).")
+	decals_check = _make_check(features,"Decals", "Create Decal nodes from Unreal DeferredDecal actors, binding exported textures.")
+	terrain_check = _make_check(features,"Terrain (Landscapes)", "Rebuild Unreal Landscapes from exported heightmaps. Uses Terrain3D when installed, otherwise a plugin-free mesh fallback with collision.")
 
 	var terrain_mode_row := HBoxContainer.new()
 	var terrain_mode_lbl := Label.new()
@@ -161,12 +160,12 @@ func _enter_tree() -> void:
 	terrain_mode_option.tooltip_text = "Which terrain system to build with. Every mode falls back to the plugin-free mesh terrain if the plugin is unavailable."
 	terrain_mode_option.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	terrain_mode_row.add_child(terrain_mode_option)
-	vbox.add_child(terrain_mode_row)
+	features.add_child(terrain_mode_row)
 
-	foliage_check = _make_check(vbox, "Foliage (MultiMesh)", "Rebuild painted foliage and instanced meshes as MultiMeshInstance3D nodes (thousands of instances stay performant).")
-	navigation_check = _make_check(vbox, "Navigation Regions", "Create NavigationRegion3D nodes from Unreal NavMeshBoundsVolumes with matching agent settings.")
-	navigation_bake_check = _make_check(vbox, "    Bake navigation on import", "Bake the navigation meshes immediately after import (synchronous; can take a moment on large levels).", false)
-	metadata_check = _make_check(vbox, "Tags & Metadata", "Copy Unreal actor tags, classes and Blueprint variables onto nodes as metadata (get_meta()).")
+	foliage_check = _make_check(features,"Foliage (MultiMesh)", "Rebuild painted foliage and instanced meshes as MultiMeshInstance3D nodes (thousands of instances stay performant).")
+	navigation_check = _make_check(features,"Navigation Regions", "Create NavigationRegion3D nodes from Unreal NavMeshBoundsVolumes with matching agent settings.")
+	navigation_bake_check = _make_check(features,"    Bake navigation on import", "Bake the navigation meshes immediately after import (synchronous; can take a moment on large levels).", false)
+	metadata_check = _make_check(features,"Tags & Metadata", "Copy Unreal actor tags, classes and Blueprint variables onto nodes as metadata (get_meta()).")
 
 	var energy_row := HBoxContainer.new()
 	var energy_lbl := Label.new()
@@ -181,7 +180,7 @@ func _enter_tree() -> void:
 	energy_scale_spin.tooltip_text = energy_lbl.tooltip_text
 	energy_scale_spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	energy_row.add_child(energy_scale_spin)
-	vbox.add_child(energy_row)
+	features.add_child(energy_row)
 
 	var sep2 := HSeparator.new()
 	vbox.add_child(sep2)
@@ -267,6 +266,33 @@ func _bind_foliage_recursive(node: Node) -> int:
 	for child in node.get_children():
 		count += _bind_foliage_recursive(child)
 	return count
+
+
+func _make_section(parent: Control, title: String, start_expanded: bool = false) -> VBoxContainer:
+	# A fold-out: a clickable header plus an indented content box it shows or
+	# hides. Lets optional controls collapse so the dock does not overflow.
+	var header := Button.new()
+	header.toggle_mode = true
+	header.button_pressed = start_expanded
+	header.flat = true
+	header.focus_mode = Control.FOCUS_NONE
+	header.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	parent.add_child(header)
+
+	var indent := MarginContainer.new()
+	indent.add_theme_constant_override("margin_left", 8)
+	parent.add_child(indent)
+
+	var content := VBoxContainer.new()
+	content.add_theme_constant_override("separation", 6)
+	indent.add_child(content)
+
+	var refresh := func(expanded: bool) -> void:
+		header.text = ("  ▼  " if expanded else "  ▶  ") + title
+		indent.visible = expanded
+	header.toggled.connect(refresh)
+	refresh.call(start_expanded)
+	return content
 
 
 func _make_check(parent: Control, text: String, tooltip: String, default_on: bool = true) -> CheckBox:
