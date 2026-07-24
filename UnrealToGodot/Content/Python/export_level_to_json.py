@@ -172,6 +172,72 @@ def classify_packed_texture(param_name):
     return None
 
 
+# Single-role texture keywords, in priority order. Albedo before normal before
+# metallic matters: "T_Walls_Metal_Diff" must classify as albedo, not metallic.
+# "diff" rather than "diffuse" is deliberate -- marketplace packs name the
+# parameter literally "Diff" (the ContainersHouse pack does), and "diffuse"
+# contains "diff" anyway. "colour" covers UK-spelled packs that "color" misses.
+_ROLE_SUBSTRINGS = (
+    ("albedo_texture", ("albedo", "basecolor", "diff", "colour", "color", "maintex")),
+    ("normal_texture", ("normal", "bump")),
+    ("roughness_texture", ("rough",)),
+    ("metallic_texture", ("metal",)),
+)
+
+# Trailing-token conventions ("T_Crate_D", "T_Crate_N_01"). Only the LAST token
+# may match these -- "d" or "n" anywhere else would match nearly every name.
+_ROLE_LAST_TOKENS = (
+    # No bare "c": packs name generic slots "Tex C", which is not a color map.
+    ("albedo_texture", ("d", "alb", "bc", "col")),
+    ("normal_texture", ("n", "nrm", "norm", "nor")),
+    ("roughness_texture", ("r",)),
+    ("metallic_texture", ("m",)),
+)
+
+
+def classify_texture_role(name):
+    """Maps a parameter or texture name to its parameters[] slot key, else None."""
+    if not name:
+        return None
+    lowered = str(name).lower()
+    for key, needles in _ROLE_SUBSTRINGS:
+        for needle in needles:
+            if needle in lowered:
+                return key
+    # Trailing-token pass; a numeric suffix ("T_Crate_D_01") is skipped first.
+    tokens = [t for t in re.split(r"[^a-z0-9]+", lowered) if t]
+    while tokens and tokens[-1].isdigit():
+        tokens.pop()
+    if tokens:
+        for key, suffixes in _ROLE_LAST_TOKENS:
+            if tokens[-1] in suffixes:
+                return key
+    return None
+
+
+def resolve_texture_role(param_name, tex_name):
+    """Classifies one sampled texture as a packed map or a single PBR role.
+
+    The parameter name wins whenever it says anything at all; the texture
+    asset's own name is the fallback -- a pack whose parameters are named
+    "Tex A"/"Tex B" still ships textures named T_Foo_Diff/T_Foo_Normal/T_Foo_ORM,
+    and dropping the whole set over an unhelpful parameter name renders every
+    mesh white.
+
+    Returns (slot_key or "packed" or None, packed_channels or None).
+    """
+    for candidate in (param_name, tex_name):
+        if not candidate:
+            continue
+        packed = classify_packed_texture(candidate)
+        if packed:
+            return "packed", packed
+        role = classify_texture_role(candidate)
+        if role:
+            return role, None
+    return None, None
+
+
 def extract_material_parameters(material, collected_textures=None):
     """
     Safely queries a Material Interface for PBR parameter values (scalars, vectors, textures).
@@ -210,44 +276,25 @@ def extract_material_parameters(material, collected_textures=None):
             is_instance = isinstance(mat, unreal.MaterialInstanceConstant)
             
         if not is_instance:
-            # Base material: extract textures from its expressions graph
-            try:
-                expressions = mat.get_editor_property("expressions")
-                if expressions:
-                    for expr in expressions:
-                        if expr and hasattr(unreal, "MaterialExpressionTextureSample") and isinstance(expr, unreal.MaterialExpressionTextureSample):
-                            tex = expr.get_editor_property("texture")
-                            if tex and isinstance(tex, unreal.Texture):
-                                tex_name = tex.get_name()
-                                if collected_textures is not None:
-                                    collected_textures.add(tex)
-                                
-                                # Determine parameter/expression name
-                                name = ""
-                                if hasattr(unreal, "MaterialExpressionTextureSampleParameter2D") and isinstance(expr, unreal.MaterialExpressionTextureSampleParameter2D):
-                                    name = str(expr.get_editor_property("parameter_name")).lower()
-                                else:
-                                    name = str(expr.get_name()).lower()
-                                    
-                                packed = classify_packed_texture(name)
-                                if packed:
-                                    if parameters["packed_texture"] is None:
-                                        parameters["packed_texture"] = tex_name
-                                        parameters["packed_channels"] = packed
-                                elif "albedo" in name or "basecolor" in name or "diffuse" in name or "color" in name or "maintex" in name:
-                                    if parameters["albedo_texture"] is None:
-                                        parameters["albedo_texture"] = tex_name
-                                elif "normal" in name or "bump" in name:
-                                    if parameters["normal_texture"] is None:
-                                        parameters["normal_texture"] = tex_name
-                                elif "roughness" in name or "rough" in name:
-                                    if parameters["roughness_texture"] is None:
-                                        parameters["roughness_texture"] = tex_name
-                                elif "metallic" in name or "metal" in name:
-                                    if parameters["metallic_texture"] is None:
-                                        parameters["metallic_texture"] = tex_name
-            except Exception as e:
-                unreal.log_warning(f"Could not read expressions from base material {mat.get_name()}: {str(e)}")
+            # Base material: extract textures from its texture parameters. UE 5.7
+            # made Material.expressions unreadable from Python, so the old
+            # expression-graph read raised and silently harvested nothing here;
+            # the shared helper uses MaterialEditingLibrary instead (falling back
+            # to the expression walk on older engines). Parameter names classify
+            # by role exactly as the MaterialInstance branch below does.
+            for pname, tex in ue2g_common.iter_base_material_textures(mat):
+                tex_name = tex.get_name()
+                if collected_textures is not None:
+                    collected_textures.add(tex)
+
+                name = str(pname).lower()
+                role, packed = resolve_texture_role(name, tex_name)
+                if role == "packed":
+                    if parameters["packed_texture"] is None:
+                        parameters["packed_texture"] = tex_name
+                        parameters["packed_channels"] = packed
+                elif role is not None and parameters[role] is None:
+                    parameters[role] = tex_name
             return
 
         # Material Instance: Parse overridden parameters
@@ -283,7 +330,7 @@ def extract_material_parameters(material, collected_textures=None):
                     name = str(v.parameter_info.name).lower()
                     val = v.parameter_value
                     
-                    if "color" in name or "albedo" in name or "diffuse" in name:
+                    if "color" in name or "colour" in name or "albedo" in name or "diffuse" in name:
                         if "albedo_color" not in assigned:
                             parameters["albedo_color"] = [val.r, val.g, val.b, val.a]
                             assigned.add("albedo_color")
@@ -306,26 +353,16 @@ def extract_material_parameters(material, collected_textures=None):
                     if collected_textures is not None and isinstance(tex, unreal.Texture):
                         collected_textures.add(tex)
                     
-                    # Packed maps first: a parameter named "RMA" matches none of the
-                    # role substrings below, so without this the whole
-                    # roughness/metallic/AO set is silently dropped.
-                    packed = classify_packed_texture(name)
-                    if packed:
+                    # Packed maps take precedence inside the resolver: a
+                    # parameter named "RMA" matches no role substring, so
+                    # without that the roughness/metallic/AO set is dropped.
+                    role, packed = resolve_texture_role(name, tex_name)
+                    if role == "packed":
                         if parameters["packed_texture"] is None:
                             parameters["packed_texture"] = tex_name
                             parameters["packed_channels"] = packed
-                    elif "albedo" in name or "basecolor" in name or "diffuse" in name or "color" in name or "maintex" in name:
-                        if parameters["albedo_texture"] is None:
-                            parameters["albedo_texture"] = tex_name
-                    elif "normal" in name or "bump" in name:
-                        if parameters["normal_texture"] is None:
-                            parameters["normal_texture"] = tex_name
-                    elif "roughness" in name or "rough" in name:
-                        if parameters["roughness_texture"] is None:
-                            parameters["roughness_texture"] = tex_name
-                    elif "metallic" in name or "metal" in name:
-                        if parameters["metallic_texture"] is None:
-                            parameters["metallic_texture"] = tex_name
+                    elif role is not None and parameters[role] is None:
+                        parameters[role] = tex_name
         except Exception:
             pass
 

@@ -203,6 +203,92 @@ def safe_get_prop(obj, prop_name, default=None):
         return default
 
 
+def iter_base_material_textures(material):
+    """Yields (parameter_name, texture) for every texture a *base* Material references.
+
+    UE 5.7 made unreal.Material's 'expressions' property protected: reading it from
+    Python now raises ("Expressions ... is protected and cannot be read"), so the
+    old expression-graph walk silently harvested nothing from base materials -- any
+    texture referenced only by a base material (never overridden on a
+    MaterialInstance) dropped out of both the texture export and the layout JSON.
+
+    The supported replacement enumerates the material's texture *parameters* via
+    MaterialEditingLibrary (get_texture_parameter_names +
+    get_material_default_texture_parameter_value), which works on 5.7 and earlier
+    and hands back clean parameter names to classify by. Verified on UE 5.7.4
+    against /Game/ContainersHouseCH/Materials/M_Containers_Master.
+
+    Textures wired through non-parameter TextureSample nodes are still picked up by
+    the legacy expression walk on engines that allow it (pre-5.7); on 5.7 that read
+    raises and is skipped. Master materials in asset packs expose their maps as
+    parameters, which is the case that matters here.
+    """
+    if not material:
+        return
+    seen = set()
+
+    # Primary path: texture parameters via MaterialEditingLibrary (UE 5.7+).
+    mel = getattr(unreal, "MaterialEditingLibrary", None)
+    if mel is not None and hasattr(mel, "get_texture_parameter_names"):
+        try:
+            names = mel.get_texture_parameter_names(material) or []
+        except Exception as e:
+            unreal.log_warning(
+                "Could not read texture parameter names from base material %s: %s"
+                % (safe_get_name(material), str(e))
+            )
+            names = []
+        for pname in names:
+            try:
+                tex = mel.get_material_default_texture_parameter_value(material, pname)
+            except Exception:
+                tex = None
+            if tex and isinstance(tex, unreal.Texture) and tex not in seen:
+                seen.add(tex)
+                yield str(pname), tex
+
+    # Fallback: walk the expression graph directly. Raises on UE 5.7 (property is
+    # protected) -- caught and skipped, since the MEL pass above already covered
+    # the parameter textures on that version. On older engines this also catches
+    # textures wired through plain (non-parameter) TextureSample nodes.
+    try:
+        expressions = material.get_editor_property("expressions")
+    except Exception:
+        expressions = None
+    if expressions and hasattr(unreal, "MaterialExpressionTextureSample"):
+        for expr in expressions:
+            if not expr or not isinstance(expr, unreal.MaterialExpressionTextureSample):
+                continue
+            try:
+                tex = expr.get_editor_property("texture")
+            except Exception:
+                tex = None
+            if not tex or not isinstance(tex, unreal.Texture) or tex in seen:
+                continue
+            seen.add(tex)
+            name = ""
+            if (hasattr(unreal, "MaterialExpressionTextureSampleParameter2D")
+                    and isinstance(expr, unreal.MaterialExpressionTextureSampleParameter2D)):
+                try:
+                    name = str(expr.get_editor_property("parameter_name"))
+                except Exception:
+                    name = ""
+            if not name:
+                try:
+                    name = str(expr.get_name())
+                except Exception:
+                    name = ""
+            yield name, tex
+
+
+def safe_get_name(obj):
+    """Reads an object's asset name defensively; never raises."""
+    try:
+        return obj.get_name()
+    except Exception:
+        return "<unknown>"
+
+
 def short_path_hash(asset_path):
     """8-char stable hash of an asset path; used to disambiguate colliding mesh names."""
     return hashlib.md5(str(asset_path).encode("utf-8")).hexdigest()[:8]

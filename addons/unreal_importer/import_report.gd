@@ -131,9 +131,11 @@ func audit_scene(root: Node) -> void:
 	_ratio("packed map shared rough+metal", packed, slots)
 
 	if slots > 0 and albedo == 0:
-		error("not one material slot got an albedo texture. Either the textures "
-			+ "folder is wrong, or the .gltf files reference textures that are "
-			+ "not on disk.")
+		error("not one material slot got an albedo texture. If the layout JSON's "
+			+ "material parameters say \"albedo_texture\": null, the exporter "
+			+ "could not classify the material's base-color parameter -- update "
+			+ "the Unreal-side exporter and re-export. Otherwise the textures "
+			+ "folder is wrong, or the referenced files are not on disk.")
 	if out_of_range > 0:
 		error("%d slot(s) have roughness outside 0..1 (e.g. %s). Godot "
 			% [out_of_range, out_of_range_example]

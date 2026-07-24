@@ -334,16 +334,13 @@ def collect_textures_from_material(material, collected_textures):
             except Exception:
                 pass
         else:
-            try:
-                expressions = mat.get_editor_property("expressions")
-                if expressions:
-                    for expr in expressions:
-                        if expr and hasattr(unreal, "MaterialExpressionTextureSample") and isinstance(expr, unreal.MaterialExpressionTextureSample):
-                            tex = expr.get_editor_property("texture")
-                            if tex and isinstance(tex, unreal.Texture):
-                                collected_textures.add(tex)
-            except Exception as e:
-                unreal.log_warning(f"Could not read expressions from base material {mat.get_name()}: {str(e)}")
+            # Base material: harvest its texture parameters. UE 5.7 made
+            # Material.expressions unreadable from Python, so reading it directly
+            # here raised and silently collected nothing; the shared helper uses
+            # MaterialEditingLibrary instead (falling back to the expression walk
+            # on older engines). See ue2g_common.iter_base_material_textures.
+            for _name, tex in ue2g_common.iter_base_material_textures(mat):
+                collected_textures.add(tex)
                 
     _collect_recursive(material)
 

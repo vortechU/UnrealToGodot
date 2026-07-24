@@ -32,6 +32,22 @@ u.LinearColor = type("LinearColor", (), {})
 u.Color = type("Color", (), {})
 u.Texture = type("Texture", (), {})
 u.MaterialInstance = type("MaterialInstance", (), {})
+
+
+# Stubs UE 5.7's supported base-material texture API. The engine made
+# Material.expressions unreadable from Python, so iter_base_material_textures
+# now enumerates texture parameters through MaterialEditingLibrary instead.
+class _FakeMEL:
+    @staticmethod
+    def get_texture_parameter_names(material):
+        return list(material._texparams.keys())
+
+    @staticmethod
+    def get_material_default_texture_parameter_value(material, name):
+        return material._texparams.get(str(name))
+
+
+u.MaterialEditingLibrary = _FakeMEL
 u.StaticMesh = type("StaticMesh", (), {})
 u.SkeletalMesh = type("SkeletalMesh", (), {})
 u.log = lambda *a: None
@@ -82,6 +98,138 @@ check("'Format' is NOT a packed map", EL.classify_packed_texture("Format") is No
 check("'Deformation' is NOT a packed map", EL.classify_packed_texture("Deformation") is None)
 check("empty name is safe", EL.classify_packed_texture("") is None)
 check("None is safe", EL.classify_packed_texture(None) is None)
+
+print("\n=== 1b. Single-role classification and texture-name fallback ===")
+check("param 'Diff' is albedo (ContainersHouse pack names it exactly this)",
+      EL.classify_texture_role("Diff") == "albedo_texture",
+      EL.classify_texture_role("Diff"))
+check("param 'Base Colour' (UK spelling) is albedo",
+      EL.classify_texture_role("Base Colour") == "albedo_texture")
+check("'T_CH_Walls_Metal_Diff' is albedo, not metallic",
+      EL.classify_texture_role("T_CH_Walls_Metal_Diff") == "albedo_texture")
+check("'T_CH_Walls_Metal_Normal' is normal, not metallic",
+      EL.classify_texture_role("T_CH_Walls_Metal_Normal") == "normal_texture")
+check("trailing token 'T_Crate_D' is albedo",
+      EL.classify_texture_role("T_Crate_D") == "albedo_texture")
+check("trailing token survives numeric suffix ('T_Crate_N_01')",
+      EL.classify_texture_role("T_Crate_N_01") == "normal_texture")
+check("'Specular' is unclassified", EL.classify_texture_role("Specular") is None)
+check("'Darkness' is unclassified", EL.classify_texture_role("Darkness") is None)
+check("empty/None are safe",
+      EL.classify_texture_role("") is None and EL.classify_texture_role(None) is None)
+
+check("unhelpful param name falls back to the texture's own name",
+      EL.resolve_texture_role("Tex A", "T_CH_Bases_Diff") == ("albedo_texture", None),
+      EL.resolve_texture_role("Tex A", "T_CH_Bases_Diff"))
+check("a param name that says something wins over the texture name",
+      EL.resolve_texture_role("Normal", "T_Weird_ORM") == ("normal_texture", None))
+check("packed map found via texture-name fallback",
+      EL.resolve_texture_role("Tex B", "T_Rock_ORM")[0] == "packed")
+check("nothing classifiable returns (None, None)",
+      EL.resolve_texture_role("Tex C", "T_Mystery") == (None, None))
+check("generic 'Tex C' alone is NOT albedo (no bare-letter C rule)",
+      EL.classify_texture_role("Tex C") is None)
+
+print("\n=== 1c. extract_material_parameters on a CH-style instance ===")
+# Reproduces the real MI_CH_* materials: parameters named Diff/Normal/ORM.
+# "Diff" matched no albedo needle before this test's fix, so every mesh in the
+# ContainersHouse map imported white (0/126 albedo in the import report).
+
+
+class _TexParam:
+    def __init__(self, name, tex):
+        self.parameter_info = types.SimpleNamespace(name=name)
+        self.parameter_value = tex
+
+
+class _Tex(u.Texture):
+    def __init__(self, name):
+        self._n = name
+
+    def get_name(self):
+        return self._n
+
+
+class _MI(u.MaterialInstance):
+    def __init__(self, props):
+        self._p = props
+
+    def get_editor_property(self, key):
+        return self._p.get(key)
+
+    def get_name(self):
+        return "MI_CH_Bases"
+
+
+ch_mi = _MI({
+    "texture_parameter_values": [
+        _TexParam("Diff", _Tex("T_CH_Bases_Diff")),
+        _TexParam("Normal", _Tex("T_CH_Bases_Normal")),
+        _TexParam("ORM", _Tex("T_CH_Bases_ORM")),
+    ],
+    "scalar_parameter_values": [],
+    "vector_parameter_values": [],
+    "parent": None,
+})
+ch_params = EL.extract_material_parameters(ch_mi)
+check("CH albedo resolved", ch_params["albedo_texture"] == "T_CH_Bases_Diff", ch_params)
+check("CH normal resolved", ch_params["normal_texture"] == "T_CH_Bases_Normal")
+check("CH packed ORM resolved", ch_params["packed_texture"] == "T_CH_Bases_ORM")
+check("CH ORM channels are glTF order",
+      ch_params["packed_channels"] == {"ao": 0, "roughness": 1, "metallic": 2})
+
+print("\n=== 1d. Base material via MaterialEditingLibrary (UE 5.7 path) ===")
+# UE 5.7 made Material.expressions protected, so reading it raises and the old
+# base-material branch harvested nothing -- textures referenced only by a base
+# material silently vanished from both the export and the layout JSON. The fix
+# enumerates texture parameters through MaterialEditingLibrary instead.
+
+
+class _BaseMat:  # a plain Material: deliberately NOT a MaterialInstance
+    def __init__(self, texparams):
+        self._texparams = texparams
+
+    def get_editor_property(self, key):
+        if key == "expressions":
+            # Reproduce the 5.7 failure exactly.
+            raise Exception("Material: Property 'Expressions' for attribute "
+                            "'expressions' on 'Material' is protected and cannot be read")
+        return None
+
+    def get_name(self):
+        return "M_Containers_Master"
+
+
+base_mat = _BaseMat({
+    "Diff": _Tex("T_CH_Walls_Metal_Diff"),
+    "Normal": _Tex("T_CH_Walls_Metal_Normal"),
+    "ORM": _Tex("T_CH_Walls_Metal_ORM"),
+})
+
+# The raw helper both call sites share.
+harvested = list(EX.ue2g_common.iter_base_material_textures(base_mat))
+check("helper harvests all 3 base-material textures despite the 5.7 block",
+      len(harvested) == 3, harvested)
+check("helper preserves parameter names",
+      sorted(n for n, _ in harvested) == ["Diff", "Normal", "ORM"], harvested)
+
+base_params = EL.extract_material_parameters(base_mat)
+check("base-material albedo resolved (was lost on 5.7)",
+      base_params["albedo_texture"] == "T_CH_Walls_Metal_Diff", base_params)
+check("base-material normal resolved",
+      base_params["normal_texture"] == "T_CH_Walls_Metal_Normal")
+check("base-material packed ORM resolved",
+      base_params["packed_texture"] == "T_CH_Walls_Metal_ORM")
+check("base-material ORM channels are glTF order",
+      base_params["packed_channels"] == {"ao": 0, "roughness": 1, "metallic": 2})
+
+# The gltf exporter's collector must gather the same textures for export.
+collected = set()
+EX.collect_textures_from_material(base_mat, collected)
+check("collect_textures_from_material gathers all 3 base-material textures",
+      {t.get_name() for t in collected} ==
+      {"T_CH_Walls_Metal_Diff", "T_CH_Walls_Metal_Normal", "T_CH_Walls_Metal_ORM"},
+      {t.get_name() for t in collected})
 
 print("\n=== 2. glTF texture injection ===")
 tmp = tempfile.mkdtemp()
