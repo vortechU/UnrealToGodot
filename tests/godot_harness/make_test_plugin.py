@@ -98,6 +98,8 @@ func _run_tests() -> void:
 		var p4: Vector3 = (deck as Node3D).global_transform.origin
 		check("Deck resolves to world (15, 0, 0)", near(p4, Vector3(15, 0, 0)), str(p4))
 
+	_test_scaled_rotated_body(root)
+	_test_mislabeled_heightmap(root)
 	_test_materials(root)
 
 	print("\\n============================================")
@@ -126,6 +128,70 @@ func _write_results() -> void:
 	f.store_line("TOTAL %d" % results.size())
 	f.store_line("VERDICT %s" % ("FAIL" if failures.size() > 0 else "PASS"))
 	f.close()
+
+func _test_scaled_rotated_body(root: Node) -> void:
+	print("\\n--- rotated + non-uniformly scaled actor ---")
+	var tunnel := find_node(root, "Tunnel_1")
+	check("Tunnel_1 exists", tunnel != null)
+	if tunnel == null or not (tunnel is StaticBody3D):
+		check("Tunnel_1 is a StaticBody3D", tunnel is StaticBody3D,
+			tunnel.get_class() if tunnel else "missing")
+		return
+	var body := tunnel as StaticBody3D
+
+	# Jolt refuses non-uniform scale on bodies: the body node must be unscaled.
+	check("body basis carries no scale (Jolt-safe)",
+		body.global_transform.basis.get_scale().is_equal_approx(Vector3.ONE),
+		str(body.global_transform.basis.get_scale()))
+
+	var mesh_child: Node3D = null
+	var shape_child: CollisionShape3D = null
+	for c in body.get_children():
+		if c is CollisionShape3D:
+			shape_child = c
+		elif c is Node3D:
+			mesh_child = c
+
+	check("mesh child carries the scale instead",
+		mesh_child != null and mesh_child.transform.basis.get_scale().is_equal_approx(Vector3(0.875, 1.125, 1.0)),
+		str(mesh_child.transform.basis.get_scale()) if mesh_child else "no mesh child")
+
+	if mesh_child:
+		# FTransform applies scale BEFORE rotation: under a +90deg yaw the local X
+		# axis lands on world -Z and must keep ITS scale, 0.875. The old global-
+		# scale composition (S*R) left world -Z at 1.0 and squashed world X instead.
+		var wx: Vector3 = mesh_child.global_transform.basis.x
+		check("scale composes before rotation (local X -> world -Z at 0.875)",
+			near(wx, Vector3(0, 0, -0.875)), str(wx))
+
+	check("collision shape present", shape_child != null)
+	if shape_child:
+		check("box shape absorbed the scale: (0.875, 1.125, 1.0) m",
+			shape_child.shape is BoxShape3D
+				and (shape_child.shape as BoxShape3D).size.is_equal_approx(Vector3(0.875, 1.125, 1.0)),
+			str((shape_child.shape as BoxShape3D).size) if shape_child.shape is BoxShape3D else str(shape_child.shape))
+		check("shape node basis is orthonormal",
+			shape_child.transform.basis.get_scale().is_equal_approx(Vector3.ONE),
+			str(shape_child.transform.basis.get_scale()))
+
+
+func _test_mislabeled_heightmap(root: Node) -> void:
+	print("\\n--- landscape with PNG bytes under an .exr name ---")
+	var terrain := find_node(root, "FakeLandscape")
+	check("FakeLandscape terrain node exists (mislabeled .exr loaded by content)", terrain != null)
+	if terrain == null:
+		return
+	check("terrain mesh built", find_node(terrain, "TerrainMesh") != null)
+	check("terrain collision built", find_node(terrain, "TerrainCollision") != null)
+	var mesh_node := find_node(terrain, "TerrainMesh")
+	if mesh_node and mesh_node is MeshInstance3D:
+		var aabb := (mesh_node as MeshInstance3D).mesh.get_aabb()
+		# ue_bounds: 40x40 m footprint, 10 m height span, gradient heightmap.
+		check("terrain spans the ue_bounds footprint (40 m)",
+			absf(aabb.size.x - 40.0) < 1.0 and absf(aabb.size.z - 40.0) < 1.0, str(aabb))
+		check("terrain has vertical relief from the gradient",
+			aabb.size.y > 5.0, str(aabb.size.y))
+
 
 func _test_materials(root: Node) -> void:
 	print("\\n--- materials ---")
@@ -206,9 +272,12 @@ with open(os.path.join(PLUGIN_DIR, "test_runner.gd"), "w", encoding="utf-8") as 
     f.write(RUNNER)
 
 # Enable only the test runner (the importer addon is preloaded directly, not enabled).
+# Jolt is selected to match real projects: it is the engine that REJECTS scaled
+# bodies, so a regression there prints its errors in this harness run too.
 with open(os.path.join(HARNESS, "project.godot"), "w", encoding="utf-8") as f:
     f.write('config_version=5\n\n[application]\n\nconfig/name="ImporterHarness"\n'
             'config/features=PackedStringArray("4.6")\n\n'
-            '[editor_plugins]\n\nenabled=PackedStringArray("res://addons/test_runner/plugin.cfg")\n')
+            '[editor_plugins]\n\nenabled=PackedStringArray("res://addons/test_runner/plugin.cfg")\n\n'
+            '[physics]\n\n3d/physics_engine="Jolt Physics"\n')
 
 print("test plugin written to", PLUGIN_DIR)

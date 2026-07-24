@@ -57,19 +57,32 @@ Two traps this harness had to work around, both of which silently report
   `--import` (the `-e` pass imports anyway) or make the plugin idempotent, and
   assert the fixture is in the state you think it is before acting on it.
 
-## Landscape export needs a GPU
+## Landscape export: the GPU render paths lie, tracing does not
 
-`export_level_to_json` with landscape enabled calls
-`LandscapeExportHeightmapToRenderTarget`, which asserts on a null RenderTarget
-(`Canvas.cpp:880`) under the `pythonscript` commandlet. Pass
-`options={"landscape": False}` when exporting headlessly. This is a limit of the
-headless test method, not of the exporter.
+The GPU landscape exports are unreliable in EVERY context, not just headless:
+on a landscape without edit layers (typical for imported asset packs),
+`LandscapeExportHeightmapToRenderTarget` silently leaves the render target
+cleared — the full GUI editor produced a valid-looking, all-zero 16-bit PNG
+under an `.exr` name. `ALandscape.render_heightmap` (5.3+) at least returns an
+honest `False` there. `export_landscape.py` therefore tries `render_heightmap`,
+readback-validates the legacy call, and finally falls back to line-tracing the
+landscape's collision components (~30k traces/s, pure CPU, no GPU or edit
+layers needed) and writing an uncompressed float32 EXR from pure Python.
 
-The cause is `FApp::CanEverRender()` being false in a commandlet, and
-`-AllowCommandletRendering` flips it — that is what lets
-`probe_texture_export_routes.py` drive real render targets headlessly. It is
-plausible that the same flag lifts this landscape limitation, but that has not
-been tried; the flag is only known to work for the texture probe.
+Also learned the hard way (see `probe_landscape_*.py` / `probe_trace_heights.py`
+/ `real_landscape_export.py`):
+
+- The `pythonscript` commandlet cannot load a level at all (`load_level` -->
+  `False`, world stays `Untitled`). To probe anything needing a loaded map, boot
+  the full editor: pass the map as a positional argument plus
+  `-ExecutePythonScript=...` (fine on a machine with a GPU; the known Slate
+  crash is specific to `-NullRHI`).
+- Custom `-Foo=` args never reach `sys.argv` in either mode; pass env vars.
+- `ReadRenderTargetRawPixel` returns `LinearColor(1,0,0,1)` — red — as its own
+  FAILURE sentinel. A readback that is constant red is not pixel data.
+- On a streaming-proxy landscape the parent actor's `get_actor_bounds` is empty
+  headless and returned DOUBLE the true extent in the GUI; the union of the
+  proxies' bounds is ground truth.
 
 ## What each test covers
 

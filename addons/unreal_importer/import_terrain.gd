@@ -46,10 +46,19 @@ func apply(data: Dictionary, root: Node, scene_owner: Node, options: Dictionary)
 		if not (ls is Dictionary):
 			continue
 		var ls_name := Common.get_str(ls, "name", "Landscape")
-		var img := _load_heightmap(ls, json_dir)
+		var img := _load_heightmap(ls, json_dir, warnings)
 		if img == null:
 			warnings.append("Landscape '%s': heightmap could not be loaded (%s)." % [ls_name, Common.get_str(ls, "heightmap_file", "?")])
 			continue
+
+		# An all-constant heightmap is a broken export, not a real landscape:
+		# Unreal's render-target export can silently produce an empty image
+		# (e.g. no GPU in a commandlet). Import it anyway, but say so loudly —
+		# a flat terrain with no warning looks like an importer bug.
+		if _is_constant_heightmap(img):
+			warnings.append(("Landscape '%s': heightmap has NO height variation — the "
+				+ "Unreal-side export likely wrote an empty render target. The terrain "
+				+ "will import flat; re-export the level from Unreal.") % ls_name)
 
 		var built := false
 		if mode == "auto" or mode == "terrain3d":
@@ -67,16 +76,33 @@ func apply(data: Dictionary, root: Node, scene_owner: Node, options: Dictionary)
 	return {"created": created, "warnings": warnings}
 
 
-func _load_heightmap(ls: Dictionary, json_dir: String) -> Image:
+func _load_heightmap(ls: Dictionary, json_dir: String, warnings: PackedStringArray) -> Image:
 	var path := Common.resolve_json_relative(json_dir, Common.get_str(ls, "heightmap_file", ""))
 	if path == "":
 		return null
-	var img := Common.load_image_file(path)
+	# The loader sniffs file content (Unreal writes PNG bytes under .exr names);
+	# anything it noticed about the file belongs in the import report.
+	var notes := []
+	var img := Common.load_image_file(path, notes)
+	for n in notes:
+		warnings.append("Landscape '%s': %s" % [Common.get_str(ls, "name", "Landscape"), str(n)])
 	if img == null:
 		return null
 	if img.is_compressed():
 		img.decompress()
 	return img
+
+
+func _is_constant_heightmap(img: Image) -> bool:
+	"""True when every sampled pixel carries the same height — the signature of
+	an Unreal export that rendered nothing. Sampled coarsely: 4K x 4K per-pixel
+	GDScript scans are far too slow for a load-time sanity check."""
+	var probe := img
+	if img.get_width() > 64 or img.get_height() > 64:
+		probe = img.duplicate() as Image
+		probe.resize(mini(img.get_width(), 64), mini(img.get_height(), 64), Image.INTERPOLATE_NEAREST)
+	var mm := _scan_min_max(probe)
+	return mm.y - mm.x <= 0.0
 
 
 func _scan_min_max(img: Image) -> Vector2:

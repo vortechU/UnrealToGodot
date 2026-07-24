@@ -18,6 +18,7 @@ if os.path.exists(HARNESS):
     shutil.rmtree(HARNESS)
 os.makedirs(os.path.join(HARNESS, "models"))
 os.makedirs(os.path.join(HARNESS, "textures"))
+os.makedirs(os.path.join(HARNESS, "terrain"))
 
 
 def write_png(path, rgb):
@@ -42,6 +43,34 @@ def write_png(path, rgb):
 write_png(os.path.join(HARNESS, "textures", "TX_Test_ALB.png"), (200, 40, 40))
 write_png(os.path.join(HARNESS, "textures", "TX_Test_NRM.png"), (128, 128, 255))
 write_png(os.path.join(HARNESS, "textures", "TX_Test_RMA.png"), (60, 200, 90))
+
+
+def write_png16_gradient(path, size=8):
+    """Writes a 16-bit RGBA PNG with a row gradient in R -- byte-for-byte the
+    kind of file Unreal's ExportRenderTarget produces when asked for an EXR it
+    cannot write. Saved under an .exr name to reproduce that mislabeling."""
+    rows = []
+    for y in range(size):
+        v = y * 65535 // (size - 1)
+        px = struct.pack(">HHHH", v, v, v, 65535)
+        rows.append(b"\x00" + px * size)
+    raw = b"".join(rows)
+
+    def chunk(tag, data):
+        body = tag + data
+        return (struct.pack(">I", len(data)) + body
+                + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 16, 6, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw))
+           + chunk(b"IEND", b""))
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+# The heightmap the layout will reference: PNG bytes under an .exr name.
+write_png16_gradient(os.path.join(HARNESS, "terrain", "Fake_height.exr"))
 
 # --- minimal valid glTF: one triangle with UVs, buffer as a data URI ----------
 positions = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]
@@ -190,8 +219,40 @@ layout = {
                             "godot_world_transform": t(0, 5, 0),
                             "material_overrides": []}],
         },
+        {
+            # Rotated 90 deg about Y AND non-uniformly scaled, with box collision:
+            # scale must apply BEFORE rotation (FTransform semantics), the physics
+            # body must carry NO scale (Jolt rejects it), and the box shape must be
+            # scaled instead. Mirrors SM_tunnel_400_88 from the SciFi station map.
+            "name": "Tunnel_1", "class": "StaticMeshActor",
+            "godot_transform": {
+                "translation": [5.0, 0.0, 5.0],
+                "rotation_quat": [0.0, 0.7071067811865476, 0.0, 0.7071067811865476],
+                "scale": [0.875, 1.125, 1.0],
+            },
+            "components": [{"name": "SM0", "mesh_key": "SM_Rock", "mesh_name": "SM_Rock",
+                            "godot_world_transform": {
+                                "translation": [5.0, 0.0, 5.0],
+                                "rotation_quat": [0.0, 0.7071067811865476, 0.0, 0.7071067811865476],
+                                "scale": [0.875, 1.125, 1.0],
+                            },
+                            "material_overrides": []}],
+        },
     ],
-    "lights": [], "post_process": [], "decals": [], "foliage": [], "landscapes": [],
+    "lights": [], "post_process": [], "decals": [], "foliage": [],
+    # A landscape whose heightmap file is PNG bytes under an .exr name -- what
+    # Unreal's ExportRenderTarget actually leaves on disk (see write_png16_gradient).
+    "landscapes": [{
+        "name": "FakeLandscape",
+        "heightmap_file": "terrain/Fake_height.exr",
+        "heightmap_resolution": [8, 8],
+        "world_size_m": [40.0, 40.0],
+        "world_center_m": [0.0, 5.0, 0.0],
+        "height_range_m": [0.0, 10.0],
+        "height_encoding": "normalized",
+        "ue_bounds": {"center": [0.0, 0.0, 500.0], "extent": [2000.0, 2000.0, 500.0]},
+        "layers": [],
+    }],
     "height_fog": None, "sky_light": None, "has_sky_atmosphere": False, "navigation": None,
 }
 
