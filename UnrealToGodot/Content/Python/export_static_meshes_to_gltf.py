@@ -350,6 +350,9 @@ def collect_textures_from_material(material, collected_textures):
 matrix_to_quat = ue2g_common.matrix_to_quat
 unreal_to_godot_transform = ue2g_common.unreal_to_godot_transform
 local_shape_to_godot_transform = ue2g_common.local_shape_to_godot_transform
+# Collision shapes use the glTF axis convention (they hug the glTF mesh), not
+# the level-layout one -- see ue2g_common.gltf_local_shape_transform.
+gltf_local_shape_transform = ue2g_common.gltf_local_shape_transform
 
 
 def extract_skeletal_mesh_physics(skeletal_mesh):
@@ -393,21 +396,22 @@ def extract_skeletal_mesh_physics(skeletal_mesh):
             center = box.get_editor_property("center")
             rot = box.get_editor_property("rotation")
             u_quat = rot.quaternion()
-            godot_local = local_shape_to_godot_transform(center, u_quat)
-            
+            godot_local = gltf_local_shape_transform(center, u_quat)
+
+            # FKBoxElem X/Y/Z are the box's FULL side lengths in cm already.
             collision_data["boxes"].append({
                 "size": [
-                    box.get_editor_property("x") * 2.0,
-                    box.get_editor_property("y") * 2.0,
-                    box.get_editor_property("z") * 2.0
+                    box.get_editor_property("x"),
+                    box.get_editor_property("y"),
+                    box.get_editor_property("z")
                 ],
                 "godot_local_transform": godot_local
             })
-            
+
         # 2. Sphere Elements
         for sphere in agg_geom.get_editor_property("sphere_elems"):
             center = sphere.get_editor_property("center")
-            godot_local = local_shape_to_godot_transform(center, unreal.Quat(0.0, 0.0, 0.0, 1.0))
+            godot_local = gltf_local_shape_transform(center, unreal.Quat(0.0, 0.0, 0.0, 1.0))
             
             collision_data["spheres"].append({
                 "radius": sphere.get_editor_property("radius"),
@@ -419,8 +423,8 @@ def extract_skeletal_mesh_physics(skeletal_mesh):
             center = capsule.get_editor_property("center")
             rot = capsule.get_editor_property("rotation")
             u_quat = rot.quaternion()
-            godot_local = local_shape_to_godot_transform(center, u_quat)
-            
+            godot_local = gltf_local_shape_transform(center, u_quat)
+
             collision_data["capsules"].append({
                 "radius": capsule.get_editor_property("radius"),
                 "length": capsule.get_editor_property("length"),
@@ -433,8 +437,8 @@ def extract_skeletal_mesh_physics(skeletal_mesh):
                 center = convex.get_editor_property("center")
                 rot = convex.get_editor_property("rotation")
                 u_quat = rot.quaternion()
-                godot_local = local_shape_to_godot_transform(center, u_quat)
-                
+                godot_local = gltf_local_shape_transform(center, u_quat)
+
                 vertices = []
                 vertex_data = convex.get_editor_property("vertex_data")
                 if vertex_data:

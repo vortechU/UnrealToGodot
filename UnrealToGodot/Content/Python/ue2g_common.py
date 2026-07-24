@@ -3,8 +3,17 @@ Shared math and helper utilities for the Unreal to Godot exporter modules.
 
 Coordinate conversion (see TECHNICAL_BRIEF.md and docs/SCHEMA_V2.md):
   Unreal: left-handed, Z-up, centimeters.  Godot: right-handed, Y-up, meters.
-  Godot X = Unreal Y * 0.01, Godot Y = Unreal Z * 0.01, Godot Z = -Unreal X * 0.01
-  Rotation basis remapped via C * R_unreal * C^T.
+
+  TWO conventions live here, and mixing them up misplaces geometry:
+  * Level layout (actor/component placement) -- unreal_to_godot_transform:
+      Godot X = Unreal Y, Godot Y = Unreal Z, Godot Z = -Unreal X   (x 0.01)
+      Rotation basis remapped via C * R_unreal * C^T.
+  * Collision shapes -- gltf_local_shape_transform / gltf_collision_axis_swap:
+      Godot X = Unreal X, Godot Y = Unreal Z, Godot Z = Unreal Y     (x 0.01)
+    Collision rides UNDER the glTF mesh (StaticBody at the layout-converted
+    world transform, mesh at identity beneath it), so shapes must use the axis
+    convention Unreal's glTF exporter bakes into the mesh, NOT the layout one --
+    otherwise they land rotated 90 deg about vertical and displaced.
 
 All feature exporter modules must use these helpers instead of re-implementing
 the conversion, so every transform in the layout JSON stays consistent.
@@ -132,6 +141,68 @@ def local_shape_to_godot_transform(translation_vec, rotation_quat):
     """
     mock = SimpleTransform(translation_vec, rotation_quat)
     return unreal_to_godot_transform(mock)
+
+
+def gltf_local_shape_transform(translation_vec, rotation_quat):
+    """Converts a collision shape's mesh-local offset (unreal.Vector, cm) and
+    rotation (unreal.Quat) into a Godot local transform dict, using the axis
+    convention Unreal's glTF exporter bakes into the mesh geometry:
+
+        Godot X = Unreal X,  Godot Y = Unreal Z,  Godot Z = Unreal Y   (x 0.01)
+
+    This is DELIBERATELY different from unreal_to_godot_transform (the level-layout
+    convention, Godot = (Y, Z, -X)). Collision shapes ride under a StaticBody that
+    sits at the component's layout-converted world transform, with the glTF mesh
+    parented at identity beneath it. The mesh vertices therefore live in
+    glTF-local space, so a shape converted with the layout convention lands
+    rotated 90 deg about the vertical axis and displaced relative to the mesh it
+    is meant to hug (see gltf_collision_axis_swap for the geometry side). Using
+    the glTF convention here keeps collision and mesh locked together.
+
+    Rotation is remapped by conjugation with G (G = G^-1 = G^T, so Conj_G(R)
+    swaps rows 1<->2 and columns 1<->2 of R).
+    """
+    tx = translation_vec.x
+    ty = translation_vec.y
+    tz = translation_vec.z
+    godot_translation = [tx * CM_TO_M, tz * CM_TO_M, ty * CM_TO_M]
+
+    qx, qy, qz, qw = rotation_quat.x, rotation_quat.y, rotation_quat.z, rotation_quat.w
+    r00 = 1.0 - 2.0 * (qy**2 + qz**2)
+    r01 = 2.0 * (qx*qy - qw*qz)
+    r02 = 2.0 * (qx*qz + qw*qy)
+    r10 = 2.0 * (qx*qy + qw*qz)
+    r11 = 1.0 - 2.0 * (qx**2 + qz**2)
+    r12 = 2.0 * (qy*qz - qw*qx)
+    r20 = 2.0 * (qx*qz - qw*qy)
+    r21 = 2.0 * (qy*qz + qw*qx)
+    r22 = 1.0 - 2.0 * (qx**2 + qy**2)
+
+    # Conj_G(R): swap rows 1<->2 and columns 1<->2.
+    R_godot = [
+        [r00, r02, r01],
+        [r20, r22, r21],
+        [r10, r12, r11],
+    ]
+
+    g_quat = matrix_to_quat(R_godot)
+
+    return {
+        "translation": godot_translation,
+        "rotation_quat": list(g_quat),
+        "scale": [1.0, 1.0, 1.0],
+    }
+
+
+def gltf_collision_axis_swap(xyz):
+    """Reorders an Unreal-axis (x, y, z) triple into the glTF/Godot axis order
+    used by exported mesh geometry: (x, z, y). Callers apply their own cm->m
+    scale. Used for box extents and convex hull vertices so the collision
+    geometry matches gltf_local_shape_transform's frame."""
+    x = xyz[0] if len(xyz) > 0 else 0.0
+    y = xyz[1] if len(xyz) > 1 else 0.0
+    z = xyz[2] if len(xyz) > 2 else 0.0
+    return [x, z, y]
 
 
 def godot_transform_basis(u_transform):

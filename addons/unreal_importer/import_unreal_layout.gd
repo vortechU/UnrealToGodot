@@ -503,8 +503,9 @@ func setup_physics_body(parent: Node, node_name: String, transform: Transform3D,
 			shape_node.owner = active_scene_root
 			
 			var box_shape := BoxShape3D.new()
-			# Convert cm size to meters
-			box_shape.size = Vector3(size_arr[1], size_arr[2], size_arr[0]) * 0.01
+			# Full extents cm -> m, remapped into the glTF axis order (X, Z, Y) so
+			# the box lines up with the mesh it hugs (matches gltf_local_shape_transform).
+			box_shape.size = Vector3(size_arr[0], size_arr[2], size_arr[1]) * 0.01
 			shape_node.shape = box_shape
 			shape_node.transform = get_transform_from_dict(local_trans)
 			
@@ -560,8 +561,8 @@ func setup_physics_body(parent: Node, node_name: String, transform: Transform3D,
 			var convex_shape := ConvexPolygonShape3D.new()
 			var points = PackedVector3Array()
 			for v in verts_arr:
-				# Convert to Godot coordinate space: swap axes and scale to meters
-				points.append(Vector3(v[1], v[2], -v[0]) * 0.01)
+				# glTF axis order (X, Z, Y), cm -> m, matching the mesh geometry.
+				points.append(Vector3(v[0], v[2], v[1]) * 0.01)
 			convex_shape.points = points
 			
 			shape_node.shape = convex_shape

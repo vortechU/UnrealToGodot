@@ -248,6 +248,59 @@ check("order-independent",
 check("sanitize_name strips unsafe chars",
       C.sanitize_name("SM Rock/01:x") == "SM_Rock_01_x", C.sanitize_name("SM Rock/01:x"))
 
+print("\n=== 8. Collision uses the glTF axis convention (hugs the mesh) ===")
+# Collision shapes ride under the glTF mesh, so they must convert with the glTF
+# axis order (Godot = ux, uz, uy) -- NOT the level-layout order (uy, uz, -ux),
+# which lands them rotated 90 deg about vertical and displaced. Regression guard
+# for the container-collision misalignment.
+
+def gltf_point(p):
+    """How Unreal's glTF exporter maps a mesh-local UE point into Godot (x0.01)."""
+    return [p[0] * 0.01, p[2] * 0.01, p[1] * 0.01]
+
+# translation follows the glTF axis order
+gt = C.gltf_local_shape_transform(Vector(100.0, 200.0, 300.0), Quat(0, 0, 0, 1))
+check("gltf shape translation == (ux, uz, uy) * 0.01",
+      all(close(a, b) for a, b in zip(gt["translation"], [1.0, 3.0, 2.0])),
+      gt["translation"])
+check("gltf shape identity rotation stays identity",
+      all(close(a, b) for a, b in zip(gt["rotation_quat"], [0.0, 0.0, 0.0, 1.0])),
+      gt["rotation_quat"])
+check("gltf_collision_axis_swap([x,y,z]) == [x,z,y]",
+      C.gltf_collision_axis_swap([7.0, 8.0, 9.0]) == [7.0, 9.0, 8.0],
+      C.gltf_collision_axis_swap([7.0, 8.0, 9.0]))
+
+# The money check: every corner of a box collider, taken through the collision
+# export+import path, must land exactly where the glTF mesh convention puts the
+# same UE point -- for arbitrary centre, rotation and extents.
+worst = 0.0
+for _ in range(300):
+    cx, cy, cz = (rng.uniform(-500, 500) for _ in range(3))
+    hx, hy, hz = (rng.uniform(1, 300) for _ in range(3))
+    q = rand_quat(rng)
+    Rm = quat_to_mat(q)
+
+    # collision path: local transform (glTF conv) + rotation of the box shape
+    gt = C.gltf_local_shape_transform(Vector(cx, cy, cz), Quat(*q))
+    T = gt["translation"]
+    Rg = quat_to_mat(tuple(gt["rotation_quat"]))
+
+    centre = [cx, cy, cz]
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            for sz in (-1, 1):
+                s = [sx * hx, sy * hy, sz * hz]
+                # mesh side: UE corner = centre + R*s, then glTF-converted
+                ue_corner = [centre[i] + matvec(Rm, s)[i] for i in range(3)]
+                mesh = gltf_point(ue_corner)
+                # collision side: the same UE half-extent vector, axis-swapped
+                # into the box's Godot-local frame (x0.01), rotated + offset.
+                sl = [v * 0.01 for v in C.gltf_collision_axis_swap(s)]
+                col = [T[i] + matvec(Rg, sl)[i] for i in range(3)]
+                worst = max(worst, max(abs(mesh[i] - col[i]) for i in range(3)))
+check("box collider corners match the glTF mesh convention (300 random boxes)",
+      worst < 1e-6, "worst corner error = %.3e m" % worst)
+
 print("\n" + "=" * 60)
 if FAIL:
     print("FAILURES (%d): %s" % (len(FAIL), FAIL))

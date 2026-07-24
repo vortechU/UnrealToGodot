@@ -49,6 +49,9 @@ matrix_to_quat = ue2g_common.matrix_to_quat
 unreal_transform_to_dict = ue2g_common.unreal_transform_to_dict
 unreal_to_godot_transform = ue2g_common.unreal_to_godot_transform
 local_shape_to_godot_transform = ue2g_common.local_shape_to_godot_transform
+# Collision shapes ride under the glTF mesh, so they use the glTF axis
+# convention, NOT the level-layout one -- see gltf_local_shape_transform.
+gltf_local_shape_transform = ue2g_common.gltf_local_shape_transform
 
 
 def extract_mesh_collision(static_mesh):
@@ -76,22 +79,24 @@ def extract_mesh_collision(static_mesh):
         center = box.get_editor_property("center")
         rot = box.get_editor_property("rotation")
         u_quat = rot.quaternion()
-        godot_local = local_shape_to_godot_transform(center, u_quat)
-        
+        godot_local = gltf_local_shape_transform(center, u_quat)
+
+        # FKBoxElem X/Y/Z are already the box's FULL side lengths in cm (Godot's
+        # BoxShape3D.size is likewise full extents), so store them as-is.
         collision_data["boxes"].append({
             "size": [
-                box.get_editor_property("x") * 2.0, # Store full width in cm
-                box.get_editor_property("y") * 2.0, # Store full depth in cm
-                box.get_editor_property("z") * 2.0  # Store full height in cm
+                box.get_editor_property("x"), # Full width in cm  (Unreal X)
+                box.get_editor_property("y"), # Full depth in cm  (Unreal Y)
+                box.get_editor_property("z")  # Full height in cm (Unreal Z)
             ],
             "godot_local_transform": godot_local
         })
-        
+
     # 2. Sphere Elements
     for sphere in agg_geom.get_editor_property("sphere_elems"):
         center = sphere.get_editor_property("center")
         # Spheres don't have rotation
-        godot_local = local_shape_to_godot_transform(center, unreal.Quat(0.0, 0.0, 0.0, 1.0))
+        godot_local = gltf_local_shape_transform(center, unreal.Quat(0.0, 0.0, 0.0, 1.0))
         
         collision_data["spheres"].append({
             "radius": sphere.get_editor_property("radius"), # in cm
@@ -103,8 +108,8 @@ def extract_mesh_collision(static_mesh):
         center = capsule.get_editor_property("center")
         rot = capsule.get_editor_property("rotation")
         u_quat = rot.quaternion()
-        godot_local = local_shape_to_godot_transform(center, u_quat)
-        
+        godot_local = gltf_local_shape_transform(center, u_quat)
+
         collision_data["capsules"].append({
             "radius": capsule.get_editor_property("radius"), # in cm
             "length": capsule.get_editor_property("length"), # cylinder length in cm
@@ -117,8 +122,8 @@ def extract_mesh_collision(static_mesh):
             center = convex.get_editor_property("center")
             rot = convex.get_editor_property("rotation")
             u_quat = rot.quaternion()
-            godot_local = local_shape_to_godot_transform(center, u_quat)
-            
+            godot_local = gltf_local_shape_transform(center, u_quat)
+
             vertices = []
             vertex_data = convex.get_editor_property("vertex_data")
             if vertex_data:

@@ -504,10 +504,10 @@ class _TscnWriter(object):
             return
         for box in collision.get("boxes") or []:
             size = box.get("size") or [0.0, 0.0, 0.0]
-            # cm -> m with [y, z, x] axis remap (matches importer BoxShape3D.size)
-            gx = _num(size[1]) * 0.01 if len(size) > 1 else 0.0
+            # Full extents cm -> m with glTF [x, z, y] axis remap (matches importer BoxShape3D.size)
+            gx = _num(size[0]) * 0.01 if len(size) > 0 else 0.0
             gy = _num(size[2]) * 0.01 if len(size) > 2 else 0.0
-            gz = _num(size[0]) * 0.01 if len(size) > 0 else 0.0
+            gz = _num(size[1]) * 0.01 if len(size) > 1 else 0.0
             sid = self._register_sub("BoxShape3D", ["size = " + _vec3_literal([gx, gy, gz])])
             self._add_shape_node(parent_path, "BoxCollision",
                                  box.get("godot_local_transform"), sid)
@@ -530,10 +530,10 @@ class _TscnWriter(object):
                 continue
             floats = []
             for v in verts:
-                # per-vertex [y, z, -x] * 0.01 remap (matches importer ConvexPolygonShape3D)
-                vx = _num(v[1]) * 0.01 if len(v) > 1 else 0.0
+                # per-vertex glTF [x, z, y] * 0.01 remap (matches importer ConvexPolygonShape3D)
+                vx = _num(v[0]) * 0.01 if len(v) > 0 else 0.0
                 vy = _num(v[2]) * 0.01 if len(v) > 2 else 0.0
-                vz = -_num(v[0]) * 0.01 if len(v) > 0 else 0.0
+                vz = _num(v[1]) * 0.01 if len(v) > 1 else 0.0
                 floats.extend((vx, vy, vz))
             body = ["points = PackedVector3Array(%s)" % ", ".join(_f(x) for x in floats)]
             sid = self._register_sub("ConvexPolygonShape3D", body)
