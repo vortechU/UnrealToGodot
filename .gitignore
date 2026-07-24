@@ -13,6 +13,8 @@ env/
 .import/
 *.translation
 export_presets.cfg
+# Editor-generated resource UID sidecars; Godot regenerates them per project.
+*.uid
 
 # Unreal Engine (if the repository is placed in an Unreal project root)
 Binaries/
