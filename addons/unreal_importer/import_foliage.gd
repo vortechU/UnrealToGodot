@@ -81,7 +81,9 @@ func apply(data: Dictionary, root: Node, scene_owner: Node, options: Dictionary)
 				Vector3(floats[o + 6], floats[o + 7], floats[o + 8])
 			)
 			var origin := Vector3(floats[o + 9], floats[o + 10], floats[o + 11])
-			mm.set_instance_transform(i, Transform3D(basis, origin))
+			# Same glTF-vs-layout axis correction as the layout importer: the packed
+			# basis is in the placement convention, the mesh is in the glTF one.
+			mm.set_instance_transform(i, Common.gltf_mesh_placement(Transform3D(basis, origin)))
 
 		var mmi := MultiMeshInstance3D.new()
 		mmi.name = entry_name

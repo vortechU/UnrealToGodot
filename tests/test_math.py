@@ -6,8 +6,10 @@ Numerically verifies the core coordinate math in ue2g_common.py by stubbing the
   3. godot_transform_basis (packed 12-float foliage layout) agrees with
      unreal_to_godot_transform (quat+scale) -- catches row/column packing bugs
   4. matrix_to_quat round-trip
-  5. the decal fix-up quaternion actually aligns Godot -Y with UE -X
+  5. the decal fix-up quaternion actually aligns Godot -Y with UE -X, and
+     carries the scale with it so the decal box keeps its UE dimensions
   6. build_export_name_map collision handling
+  7. the schema's `scale` is a LOCAL scale: consumers must scale basis columns
 """
 import sys, os, math, types, random
 
@@ -300,6 +302,114 @@ for _ in range(300):
                 worst = max(worst, max(abs(mesh[i] - col[i]) for i in range(3)))
 check("box collider corners match the glTF mesh convention (300 random boxes)",
       worst < 1e-6, "worst corner error = %.3e m" % worst)
+
+print("\n=== 9. Placement axis fix re-seats the glTF mesh (scattered-building bug) ===")
+# The glTF mesh geometry is baked in the (X,Z,Y) order (gltf_point), but actors are
+# PLACED with the (Y,Z,-X) layout convention (unreal_to_godot_transform). Those two
+# right-handed maps differ by a +90 deg yaw about up. Placing a mesh at its layout
+# transform therefore yaws it about its OWN pivot -- invisible on centre-pivoted
+# props, but it flings off-centre modular pieces metres away. The importer folds a
+# fix (Common.gltf_mesh_placement / tscn_writer._MESH_AXIS_FIX) into every mesh
+# placement. This guards that fix constant and proves it actually re-aligns geometry.
+L_FIX = [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]]   # Ry(+90 deg)
+B_MAP = [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]]    # glTF axis map (x,z,y)
+check("fix constant == A * B (layout map composed with glTF map)",
+      mclose(matmul(CB, B_MAP), L_FIX))
+
+worst = 0.0
+for _ in range(300):
+    q = rand_quat(rng)
+    Ru = quat_to_mat(q)
+    tu = [rng.uniform(-3000, 3000) for _ in range(3)]   # actor world pos, cm
+    v = [rng.uniform(-400, 400) for _ in range(3)]       # mesh-local vertex, cm
+    tr = Transform(Vector(*tu), Quat(*q), Vector(1, 1, 1))
+    g = C.unreal_to_godot_transform(tr)
+    layout_basis = quat_to_mat(g["rotation_quat"])
+    fixed_basis = matmul(layout_basis, L_FIX)
+    mesh_local = gltf_point(v)                            # how the mesh vertex lives in Godot
+    fixed = [matvec(fixed_basis, mesh_local)[i] + g["translation"][i] for i in range(3)]
+    # ground truth: UE world point taken through the layout convention (x0.01)
+    ue_world = [sum(Ru[i][k] * v[k] for k in range(3)) + tu[i] for i in range(3)]
+    correct = [c * 0.01 for c in matvec(CB, ue_world)]
+    worst = max(worst, max(abs(fixed[i] - correct[i]) for i in range(3)))
+check("fixed placement matches layout-correct world position (300 cases)",
+      worst < 1e-6, "worst = %.3e m" % worst)
+
+print("\n=== 10. Schema scale is a LOCAL scale (column scaling, not row) ===")
+# Consumers rebuild a basis from (rotation_quat, scale). The only composition that
+# reproduces the true converted basis C * (R_ue * S_ue) * C^T is R * diag(scale)
+# -- i.e. scale each basis COLUMN (Godot's Basis.scaled_local / tscn_writer's
+# _transform_dict_to_mat). Godot's Basis.scaled() scales ROWS instead, applying
+# the scale in the PARENT frame; rotated actors with a non-uniform scale then come
+# out stretched along the wrong world axes. Guard for that mix-up.
+worst_col = worst_row = 0.0
+for _ in range(300):
+    q = rand_quat(rng)
+    sc = [rng.choice([-1, 1]) * rng.uniform(0.2, 4.0) for _ in range(3)]
+    tr = Transform(Vector(0, 0, 0), Quat(*q), Vector(*sc))
+    g = C.unreal_to_godot_transform(tr)
+    R = quat_to_mat(g["rotation_quat"])
+    s = g["scale"]
+    # truth: C * (R_ue * diag(scale_ue)) * C^T
+    Ru = quat_to_mat(q)
+    RS = [[Ru[i][j] * sc[j] for j in range(3)] for i in range(3)]
+    truth = matmul(matmul(CB, RS), transpose(CB))
+    by_col = [[R[i][j] * s[j] for j in range(3)] for i in range(3)]
+    by_row = [[R[i][j] * s[i] for j in range(3)] for i in range(3)]
+    worst_col = max(worst_col, max(abs(by_col[i][j] - truth[i][j]) for i in range(3) for j in range(3)))
+    worst_row = max(worst_row, max(abs(by_row[i][j] - truth[i][j]) for i in range(3) for j in range(3)))
+check("column scaling (R * S) reproduces C*(R_ue*S_ue)*C^T (300 cases)",
+      worst_col < 1e-6, "worst = %.3e" % worst_col)
+check("row scaling (S * R) does NOT -- the mix-up is observable",
+      worst_row > 0.1, "worst = %.3e" % worst_row)
+
+print("\n=== 11. Decal box: the fix-up rotation must carry the scale with it ===")
+# _decal_transform folds Rx(-90) into the rotation so Godot's -Y projection axis
+# lines up with UE's -X. That re-labels the node's local Y and Z, so the scale has
+# to be conjugated by the same rotation (its Y and Z swap). Forgetting that swaps
+# a decal's projection depth with its height. End-to-end check: reproduce the box
+# Godot renders (0.5 * size[j] * basis column j) and compare it to the UE decal box.
+import export_environment as EE
+
+
+class FakeDecalActor:
+    def __init__(self, tr):
+        self._tr = tr
+
+    def get_actor_transform(self):
+        return self._tr
+
+
+# UE default decal_size, half-extents cm: (X=projection depth, Y=width, Z=height)
+DS = (128.0, 256.0, 256.0)
+SIZE_M = [DS[1] * 2 * 0.01, DS[0] * 2 * 0.01, DS[2] * 2 * 0.01]   # what _build_decal_entry emits
+
+worst = 0.0
+for _ in range(300):
+    q = rand_quat(rng)
+    sc = [rng.choice([-1, 1]) * rng.uniform(0.1, 3.0) for _ in range(3)]
+    d = EE._decal_transform(FakeDecalActor(Transform(Vector(0, 0, 0), Quat(*q), Vector(*sc))))
+    basis = quat_to_mat(tuple(d["rotation_quat"]))
+    s = d["scale"]
+    basis = [[basis[i][j] * s[j] for j in range(3)] for i in range(3)]   # column scaling
+
+    # Godot renders half-extent along local axis j as 0.5 * size[j] * column j.
+    got = {
+        "width":  [basis[i][0] * 0.5 * SIZE_M[0] for i in range(3)],
+        "depth":  [basis[i][1] * 0.5 * SIZE_M[1] for i in range(3)],
+        "height": [basis[i][2] * 0.5 * SIZE_M[2] for i in range(3)],
+    }
+    # Truth: UE half-extent vectors DS[i]*scale[i] along the actor's local axes,
+    # converted with the layout map. UE local X=depth, Y=width, Z=height.
+    Ru = quat_to_mat(q)
+    want = {}
+    for name, axis in (("depth", 0), ("width", 1), ("height", 2)):
+        ue_vec = [Ru[i][axis] * DS[axis] * sc[axis] * 0.01 for i in range(3)]
+        want[name] = matvec(CB, ue_vec)
+    for name in want:
+        worst = max(worst, max(abs(got[name][i] - want[name][i]) for i in range(3)))
+check("decal box matches the UE decal box under rotation + mirrored scale (300 cases)",
+      worst < 1e-6, "worst half-extent error = %.3e m" % worst)
 
 print("\n" + "=" * 60)
 if FAIL:

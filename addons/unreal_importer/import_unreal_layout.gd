@@ -147,6 +147,10 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 
 			# The component's absolute placement, straight from the exporter.
 			var comp_transform := component_world_transform(comp_data, actor_transform)
+			# The glTF mesh is baked in a different axis order than the placement
+			# convention; re-seat it (and the collision that rides with it) so it
+			# lines up with its neighbours instead of yawing about its own pivot.
+			var mesh_place := Common.gltf_mesh_placement(comp_transform)
 
 			var gltf_path := find_model_for(models_folder, mesh_key, mesh_name)
 			if gltf_path == "":
@@ -155,9 +159,9 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 				continue
 
 			# Collision shapes are defined in mesh-local space, so the physics body
-			# sits at the component's world transform and the mesh sits at IDENTITY
-			# under it, keeping collision and mesh aligned.
-			var physics_body = setup_physics_body(active_scene_root, actor_name, comp_transform, mesh_key, meshes_lib)
+			# sits at the component's (axis-corrected) world transform and the mesh
+			# sits at IDENTITY under it, keeping collision and mesh aligned.
+			var physics_body = setup_physics_body(active_scene_root, actor_name, mesh_place, mesh_key, meshes_lib)
 			var instanced_mesh = instance_gltf(gltf_path)
 			
 			if instanced_mesh:
@@ -175,12 +179,13 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					_set_owner_recursive(instanced_mesh, active_scene_root)
 					instanced_mesh.transform = Transform3D.IDENTITY
 				else:
-					# Direct visual-only mesh instance at the component's world transform.
+					# Direct visual-only mesh instance at the component's world
+					# transform (axis-corrected, same as the physics-body case).
 					instanced_mesh.name = actor_name
 					active_scene_root.add_child(instanced_mesh)
 					instanced_mesh.owner = active_scene_root
 					_set_owner_recursive(instanced_mesh, active_scene_root)
-					instanced_mesh.transform = comp_transform
+					instanced_mesh.transform = mesh_place
 				imported_count += 1
 				if gameplay_helper:
 					gameplay_helper.apply_actor_metadata(physics_body if physics_body else instanced_mesh, actor_data, import_options)
@@ -205,6 +210,9 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 				var mesh_key: String = comp_data.get("mesh_key", mesh_name)
 
 				var comp_transform := actor_inverse * component_world_transform(comp_data, actor_transform)
+				# Re-seat the glTF mesh (and its collision) from the glTF axis order
+				# into the placement convention -- see Common.gltf_mesh_placement.
+				var mesh_place := Common.gltf_mesh_placement(comp_transform)
 
 				var gltf_path := find_model_for(models_folder, mesh_key, mesh_name)
 				if gltf_path == "":
@@ -212,7 +220,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					create_placeholder(actor_node, comp_name, comp_transform, mesh_key)
 					continue
 
-				var physics_body = setup_physics_body(actor_node, comp_name, comp_transform, mesh_key, meshes_lib)
+				var physics_body = setup_physics_body(actor_node, comp_name, mesh_place, mesh_key, meshes_lib)
 				var instanced_mesh = instance_gltf(gltf_path)
 				if instanced_mesh:
 					any_component_succeeded = true
@@ -232,7 +240,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 						actor_node.add_child(instanced_mesh)
 						instanced_mesh.owner = active_scene_root
 						_set_owner_recursive(instanced_mesh, active_scene_root)
-						instanced_mesh.transform = comp_transform
+						instanced_mesh.transform = mesh_place
 				else:
 					if physics_body:
 						physics_body.queue_free()
@@ -421,7 +429,9 @@ func get_transform_from_dict(t_dict: Dictionary) -> Transform3D:
 	var quat := Quaternion(qx, qy, qz, qw)
 	var scale := Vector3(sx, sy, sz)
 	
-	var basis := Basis(quat).scaled(scale)
+	# scaled_local() (R * S), not scaled() (S * R): the schema scale is local to
+	# the node. See Common.get_transform_from_dict for the full reasoning.
+	var basis := Basis(quat).scaled_local(scale)
 	return Transform3D(basis, translation)
 
 func convert_unreal_to_godot_transform(u_loc: Array, u_rot_quat: Array, u_scale: Array) -> Transform3D:
@@ -468,8 +478,11 @@ func convert_unreal_to_godot_transform(u_loc: Array, u_rot_quat: Array, u_scale:
 	var col2 = Vector3(-r10, -r20, r00)
 	
 	var basis := Basis(col0, col1, col2)
-	basis = basis.scaled(scale)
-	
+	# Scale each basis COLUMN by the matching axis (scaled_local), so the result
+	# equals C * (R_unreal * S_unreal) * C^T. Basis.scaled() scales rows instead,
+	# which applies the scale in the parent frame and shears rotated actors.
+	basis = basis.scaled_local(scale)
+
 	return Transform3D(basis, translation)
 
 func setup_physics_body(parent: Node, node_name: String, transform: Transform3D, mesh_name: String, meshes_lib: Dictionary) -> StaticBody3D:

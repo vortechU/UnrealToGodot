@@ -108,6 +108,16 @@ shutil.copytree(os.path.join(REPO, "addons"), os.path.join(HARNESS, "addons"))
 def t(x, y, z, s=1.0):
     return {"translation": [x, y, z], "rotation_quat": [0.0, 0.0, 0.0, 1.0], "scale": [s, s, s]}
 
+
+SQRT_HALF = 0.7071067811865476
+
+
+def ry90(sx, sy, sz):
+    """Origin-centred transform rotated +90 deg about Godot's Y, non-uniformly scaled."""
+    return {"translation": [0.0, 0.0, 0.0],
+            "rotation_quat": [0.0, SQRT_HALF, 0.0, SQRT_HALF],
+            "scale": [sx, sy, sz]}
+
 layout = {
     "format_version": 2,
     "level_name": "HarnessLevel",
@@ -182,6 +192,19 @@ layout = {
             ],
         },
         {
+            # Rotated (UE yaw +90) AND non-uniformly scaled. Guards that the
+            # schema's `scale` is treated as a LOCAL scale: the basis COLUMNS get
+            # scaled (Basis.scaled_local), not the rows (Basis.scaled), which
+            # would apply the scale in the parent frame and shear the actor.
+            # Godot quat for the converted yaw is Ry(+90) = (0, sin45, 0, cos45).
+            "name": "Skewed_1", "class": "StaticMeshActor",
+            "godot_transform": ry90(2.0, 3.0, 5.0),
+            "components": [{"name": "SM0", "mesh_key": "SM_Crate", "mesh_name": "SM_Crate",
+                            "godot_relative_transform": ry90(2.0, 3.0, 5.0),
+                            "godot_world_transform": ry90(2.0, 3.0, 5.0),
+                            "material_overrides": []}],
+        },
+        {
             # Drives the material path: packed RMA map + sibling-folder textures.
             "name": "Textured_1", "class": "StaticMeshActor",
             "godot_transform": t(0, 5, 0),
@@ -191,7 +214,33 @@ layout = {
                             "material_overrides": []}],
         },
     ],
-    "lights": [], "post_process": [], "decals": [], "foliage": [], "landscapes": [],
+    # One decal, written exactly as the exporter emits it for a UE DecalActor at
+    # the origin with yaw +90 and scale (X=5, Y=2, Z=3), keeping UE's default
+    # decal_size half-extents (128, 256, 256) cm = (depth, width, height).
+    #
+    #   size_m          = [Y*2, X*2, Z*2] * 0.01           = [5.12, 2.56, 5.12]
+    #   rotation_quat   = R_std . Rx(-90), R_std = Ry(-90) => (-.5, -.5, -.5, .5)
+    #   scale           = [usy, usx, usz]                  = [2, 5, 3]
+    #                     (Y/Z swapped vs the standard [usy, usz, usx] because the
+    #                      Rx(-90) fix-up re-labels the node's local Y and Z)
+    #
+    # Rendered half-extents are 0.5 * size[j] * basis column j, so the Decal must
+    # come out width (0,0,5.12), projection depth (6.4,0,0), height (0,7.68,0) --
+    # which is the UE box (256*2, 128*5, 256*3 cm along its local Y/X/Z) taken
+    # through the layout conversion. See test_math.py section 11.
+    "decals": [
+        {
+            "name": "Decal_Skewed",
+            "godot_transform": {"translation": [0.0, 0.0, 0.0],
+                                "rotation_quat": [-0.5, -0.5, -0.5, 0.5],
+                                "scale": [2.0, 5.0, 3.0]},
+            "size_m": [5.12, 2.56, 5.12],
+            "sort_order": 0,
+            "material_name": "MI_Decal", "material_path": "/Game/MI_Decal",
+            "textures": {"albedo": "TX_Test_ALB", "normal": None, "orm": None, "emission": None},
+        },
+    ],
+    "lights": [], "post_process": [], "foliage": [], "landscapes": [],
     "height_fog": None, "sky_light": None, "has_sky_atmosphere": False, "navigation": None,
 }
 

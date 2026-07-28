@@ -18,9 +18,16 @@ read and write exactly these structures.
   (see TECHNICAL_BRIEF.md). Use `ue2g_common.py` (Python) / `import_common.gd` (GDScript);
   never re-implement the math.
 
+- **`scale` is a LOCAL scale** — it names the node's own axes, so consumers must rebuild
+  the basis as `R * diag(scale)`, i.e. scale the basis **columns**. In GDScript that is
+  `Basis(quat).scaled_local(scale)`; `Basis.scaled()` scales *rows* and applies the scale
+  in the **parent** frame, which shears any rotated actor with a non-uniform scale.
+  Only column scaling reproduces `C * (R_unreal * S_unreal) * C^T`.
+
 - Note on directions: the basis conversion maps Unreal's forward **+X** onto Godot's
-  **-Z**, which is exactly the forward axis of Godot lights, decals and cameras.
-  Converted rotations can therefore be used **as-is** for lights/decals.
+  **-Z**, which is exactly the forward axis of Godot lights and cameras. Converted
+  rotations can therefore be used **as-is** for lights. Decals need an extra fix-up
+  (see the `decals` section).
 
 - Auxiliary files are written relative to the JSON file's directory:
   - `textures/` — exported PNG textures
@@ -257,6 +264,14 @@ UE `decal_size` is half-size cm in (X=projection depth, Y=width, Z=height); UE d
 project along **-X** (local). The exporter must fold whatever axis fix-up is needed into
 `godot_transform` so the Godot `Decal` (projects along **-Y**) matches, and set
 `size_m = [Y*2, X*2, Z*2] * 0.01`. Texture names refer to files in `textures/`.
+
+Because that fix-up re-labels the node's local Y and Z axes, `godot_transform.scale` for a
+decal is **conjugated by it too**: its Y and Z components are swapped relative to the
+standard `[usy, usz, usx]`, giving `[usy, usx, usz]`. The rotation and the scale must stay
+in the same frame — Godot renders the half-extent along local axis `j` as
+`0.5 * size_m[j] * basis_column[j]`, so a scale left in the un-fixed frame trades the
+decal's projection depth for its height. Guarded by `test_math.py` section 11 and the
+`Decal_Skewed` fixture in the Godot harness.
 
 ## landscapes
 

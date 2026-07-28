@@ -98,6 +98,45 @@ func _run_tests() -> void:
 		var p4: Vector3 = (deck as Node3D).global_transform.origin
 		check("Deck resolves to world (15, 0, 0)", near(p4, Vector3(15, 0, 0)), str(p4))
 
+	# 4. Rotated + non-uniformly scaled actor. The schema's `scale` is a LOCAL
+	#    scale, so the basis COLUMNS get scaled (Basis.scaled_local). Godot's
+	#    Basis.scaled() scales rows instead -- that applies the scale in the
+	#    parent frame and stretches rotated actors along the wrong world axes.
+	#    Ry(+90) with scale (2,3,5), then the glTF placement fix Ry(+90), gives
+	#    columns (-5,0,0)/(0,3,0)/(0,0,-2); row scaling gives (-2,0,0)/../(0,0,-5).
+	var skewed := find_node(root, "Skewed_1")
+	check("Skewed_1 exists", skewed != null)
+	if skewed and skewed is Node3D:
+		var b: Basis = (skewed as Node3D).global_transform.basis
+		check("Skewed_1 basis columns carry the LOCAL scale",
+			near(b.x, Vector3(-5, 0, 0)) and near(b.y, Vector3(0, 3, 0))
+			and near(b.z, Vector3(0, 0, -2)),
+			"x=%s y=%s z=%s" % [b.x, b.y, b.z])
+		check("Skewed_1 NOT row-scaled (scale applied in the parent frame)",
+			not near(b.x, Vector3(-2, 0, 0)), str(b.x))
+
+	# 5. Decal box. Godot renders the half-extent along local axis j as
+	#    0.5 * size[j] * basis column j, so the exported scale has to be in the
+	#    SAME frame as the exported (fix-up-folded) rotation. See the fixture in
+	#    build_harness.py for how these numbers come off the UE decal.
+	var decal := find_node(root, "Decal_Skewed")
+	check("Decal_Skewed exists", decal != null)
+	if decal and decal is Decal:
+		var d := decal as Decal
+		var db: Basis = d.global_transform.basis
+		check("Decal size survives the import", near(d.size, Vector3(5.12, 2.56, 5.12)), str(d.size))
+		var dw: Vector3 = db.x * 0.5 * d.size.x
+		var dd: Vector3 = db.y * 0.5 * d.size.y
+		var dh: Vector3 = db.z * 0.5 * d.size.z
+		check("Decal width half-extent == (0, 0, 5.12)", near(dw, Vector3(0, 0, 5.12)), str(dw))
+		check("Decal projection depth half-extent == (6.4, 0, 0)", near(dd, Vector3(6.4, 0, 0)), str(dd))
+		check("Decal height half-extent == (0, 7.68, 0)", near(dh, Vector3(0, 7.68, 0)), str(dh))
+		# Projection runs along local -Y and must land where UE local -X did.
+		check("Decal projects along the converted UE -X",
+			near((-db.y).normalized(), Vector3(-1, 0, 0)), str((-db.y).normalized()))
+		check("Decal depth NOT the pre-fix 2.56 m half-extent",
+			not near(dd, Vector3(2.56, 0, 0)), str(dd))
+
 	_test_materials(root)
 
 	print("\\n============================================")

@@ -165,12 +165,17 @@ def node_block(name):
     assert m, "node %s not found" % name
     return m.group(1)
 
-def origin_of(name):
+def transform_vals(name):
     blk = node_block(name)
     m = re.search(r"transform = Transform3D\(([^)]*)\)", blk)
     assert m, "node %s has no transform" % name
-    vals = [float(v) for v in m.group(1).split(",")]
-    return vals[9:12]
+    return [float(v) for v in m.group(1).split(",")]
+
+def origin_of(name):
+    return transform_vals(name)[9:12]
+
+def basis_of(name):
+    return transform_vals(name)[0:9]
 
 def near(a, b, eps=1e-4):
     return all(abs(x - y) < eps for x, y in zip(a, b))
@@ -188,6 +193,34 @@ assert near(crate_a, [0.5, 0.0, 0.0]), f"CrateA local should be (0.5,0,0), got {
 crate_b = origin_of("CrateB")
 assert near(crate_b, [-0.5, 0.0, 0.0]), f"CrateB local should be (-0.5,0,0), got {crate_b}"
 print("placement OK: Rock_1 at", rock, "| CrateA local", crate_a, "| CrateB local", crate_b)
+
+# --- glTF axis correction (regression guard for the "scattered building" bug) ---
+# The glTF mesh is baked in the (X,Z,Y) axis order while placement uses (Y,Z,-X);
+# the two differ by a +90 deg yaw about Y, which the writer must fold into every
+# mesh placement (basis only -- origins above are untouched). Rock_1's world basis
+# is Ry(45); after the fix it must serialize as Ry(45)*Ry(90) = Ry(135).
+def Ry(deg):
+    r = math.radians(deg); c, s = math.cos(r), math.sin(r)
+    return [c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c]
+rock_basis = basis_of("Rock_1")
+assert near(rock_basis, Ry(135.0)), f"Rock_1 basis must be Ry(135) after axis fix, got {rock_basis}"
+# CrateB's world basis is Ry(90) under a non-rotated actor, so its local basis
+# must be Ry(90)*Ry(90) = Ry(180) -- proves the multi-component path is corrected.
+crate_b_basis = basis_of("CrateB")
+assert near(crate_b_basis, Ry(180.0)), f"CrateB basis must be Ry(180) after axis fix, got {crate_b_basis}"
+
+# Foliage: first instance has an identity basis, so after the fix its MultiMesh
+# buffer basis (row-major 3x4) must be Ry(90) = [[0,0,1],[0,1,0],[-1,0,0]].
+mm_blk = re.search(r"\[sub_resource type=\"MultiMesh\"[^\]]*\](.*?)(?=\n\[)", text, re.S).group(1)
+buf = [float(v) for v in re.search(r"PackedFloat32Array\(([^)]*)\)", mm_blk).group(1).split(",")]
+inst0 = buf[0:12]  # [m00,m01,m02,ox, m10,m11,m12,oy, m20,m21,m22,oz]
+assert near([inst0[0], inst0[1], inst0[2]], [0.0, 0.0, 1.0]) \
+    and near([inst0[4], inst0[5], inst0[6]], [0.0, 1.0, 0.0]) \
+    and near([inst0[8], inst0[9], inst0[10]], [-1.0, 0.0, 0.0]), \
+    f"foliage instance 0 basis must be Ry(90) after axis fix, got {inst0}"
+assert near([inst0[3], inst0[7], inst0[11]], [1.0, 0.0, 1.0]), \
+    f"foliage instance 0 origin must be preserved at (1,0,1), got {inst0}"
+print("axis fix OK: Rock_1 basis Ry(135), CrateB basis Ry(180), foliage inst0 Ry(90)")
 
 print(f"OK: {ext_count} ext_resources, {sub_count} sub_resources, {len(nodes)} nodes, load_steps={load_steps}")
 print("--- excerpt ---")

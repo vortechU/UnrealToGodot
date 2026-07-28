@@ -36,8 +36,9 @@ RenderingServer / Transform3D / MultiMesh source semantics):
   * Transform3D(...) serialization is 12 reals: the 3x3 basis in ROW-MAJOR order followed by the
     origin, i.e. [m00,m01,m02, m10,m11,m12, m20,m21,m22, ox,oy,oz]. The basis COLUMN j is the
     rotated+scaled local axis j -> column0 = (m00,m10,m20). We build the basis from the schema's
-    quaternion (columns = rotated axes) and scale each column by scale[j] (mirrors Godot
-    Basis(quat).scaled(scale)), then compose parent*child as Godot Transform3D multiplication.
+    quaternion (columns = rotated axes) and scale each column by scale[j] -- the schema's `scale`
+    is a LOCAL scale, so it multiplies columns (Godot's Basis.scaled_local), NOT rows (Basis.scaled,
+    which applies it in the parent frame). Then compose parent*child as Transform3D multiplication.
 
   * MultiMesh buffer (transform_format = 1 / TRANSFORM_3D) is a PackedFloat32Array with 12 floats
     per instance laid out as a 3x4 ROW-MAJOR matrix: [m00,m01,m02,ox, m10,m11,m12,oy, m20,m21,m22,oz]
@@ -135,8 +136,9 @@ def _quat_to_matrix(quat):
 
 
 def _transform_dict_to_mat(t):
-    """Schema transform dict -> (rows3x3, origin3). Column j of the basis is scaled by scale[j]
-    (mirrors Godot Basis(quat).scaled(scale))."""
+    """Schema transform dict -> (rows3x3, origin3). Column j of the basis is scaled by scale[j]:
+    the schema's `scale` is LOCAL to the node, so it scales columns (Godot Basis.scaled_local),
+    not rows (Basis.scaled, which would apply the scale in the parent frame)."""
     if not isinstance(t, dict):
         return ([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], [0.0, 0.0, 0.0])
     trans = t.get("translation") or [0.0, 0.0, 0.0]
@@ -169,6 +171,23 @@ def _mat_compose(parent, child):
 
 
 _IDENTITY_MAT = ([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], [0.0, 0.0, 0.0])
+
+# Unreal's glTF exporter bakes mesh geometry in the (X, Z, Y) axis order, but the
+# layout places actors/components with the (Y, Z, -X) convention. The two right-
+# handed maps differ by a +90 deg yaw about up, so a mesh dropped at its layout
+# transform yaws about its own pivot -- invisible on centre-pivoted props, but it
+# scatters every off-centre modular piece (the "scattered building" bug). This is
+# a pure rotation (columns = rotated axes): local X -> -Z, local Y -> Y, local Z -> X.
+# Post-multiplying a placement basis by it re-seats the mesh (and the collision that
+# rides under it) where it belongs. Mirrors Common.gltf_mesh_placement in
+# import_common.gd; proof in tests/test_math.py section 9.
+_MESH_AXIS_FIX = ([[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]], [0.0, 0.0, 0.0])
+
+
+def _apply_mesh_axis_fix(mat):
+    """Post-multiply a layout placement by the glTF axis correction so a glTF mesh
+    sitting at identity beneath it lands aligned. Origin is preserved."""
+    return _mat_compose(mat, _MESH_AXIS_FIX)
 
 
 def _mat_affine_inverse(mat):
@@ -614,10 +633,16 @@ class _TscnWriter(object):
         ext_id = self._register_ext("PackedScene", res_path)
         collision = (meshes_lib.get(mesh_key) or {}).get("collision")
 
+        # Re-seat the glTF mesh from the glTF axis order into the placement
+        # convention (see _apply_mesh_axis_fix). Applied at the body, it carries
+        # the mesh-local collision shapes along, keeping them hugging the mesh.
+        mesh_place = _apply_mesh_axis_fix(world)
+
         if collision:
             # Collision shapes are mesh-local, so the body carries the component's
-            # world transform and the mesh instance sits at identity under it.
-            body_props = ["transform = " + _mat_to_transform3d(world)]
+            # (axis-corrected) world transform and the mesh instance sits at
+            # identity under it.
+            body_props = ["transform = " + _mat_to_transform3d(mesh_place)]
             body_path = self._add_node(actor_name, "StaticBody3D", root_path,
                                        props=body_props, metadata=actor_meta)
             self._emit_collision(body_path, collision)
@@ -627,7 +652,7 @@ class _TscnWriter(object):
                            instance_id=ext_id, props=inst_props, metadata=inst_meta)
         else:
             # Direct visual-only instance at the component's world transform
-            props = ["transform = " + _mat_to_transform3d(world)]
+            props = ["transform = " + _mat_to_transform3d(mesh_place)]
             meta = list(actor_meta)
             if emit_meta:
                 meta = self._component_metadata_lines(comp) + meta
@@ -658,8 +683,10 @@ class _TscnWriter(object):
 
             ext_id = self._register_ext("PackedScene", res_path)
             collision = (meshes_lib.get(mesh_key) or {}).get("collision")
+            # Re-seat the glTF mesh (and its collision) into the placement convention.
+            mesh_place = _apply_mesh_axis_fix(comp_mat)
             if collision:
-                body_props = ["transform = " + _mat_to_transform3d(comp_mat)]
+                body_props = ["transform = " + _mat_to_transform3d(mesh_place)]
                 body_path = self._add_node(comp_name, "StaticBody3D", actor_path,
                                            props=body_props, metadata=comp_meta)
                 self._emit_collision(body_path, collision)
@@ -667,7 +694,7 @@ class _TscnWriter(object):
                 self._add_node(_mesh_node_name(comp, mesh_key), None, body_path,
                                instance_id=ext_id)
             else:
-                props = ["transform = " + _mat_to_transform3d(comp_mat)]
+                props = ["transform = " + _mat_to_transform3d(mesh_place)]
                 self._add_node(comp_name, None, actor_path, instance_id=ext_id,
                                props=props, metadata=comp_meta)
 
@@ -848,9 +875,12 @@ class _TscnWriter(object):
                 if len(f) < 12:
                     break
                 # schema stores basis COLUMNS then origin; MultiMesh wants 3x4 ROW-major.
-                bxx, bxy, bxz = f[0], f[1], f[2]   # column X
-                byx, byy, byz = f[3], f[4], f[5]   # column Y
-                bzx, bzy, bzz = f[6], f[7], f[8]   # column Z
+                # Post-multiply the basis by the glTF axis correction (_MESH_AXIS_FIX)
+                # so foliage meshes match the layout meshes: local X -> -Z, Y -> Y,
+                # Z -> X means new column X = -old column Z, new Y = old Y, new Z = old X.
+                bxx, bxy, bxz = -f[6], -f[7], -f[8]   # column X <- -column Z
+                byx, byy, byz = f[3], f[4], f[5]      # column Y (unchanged)
+                bzx, bzy, bzz = f[0], f[1], f[2]      # column Z <- column X
                 ox, oy, oz = f[9], f[10], f[11]
                 buffer_vals.extend((
                     bxx, byx, bzx, ox,   # row 0 + origin.x

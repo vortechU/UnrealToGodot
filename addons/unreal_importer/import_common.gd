@@ -10,6 +10,29 @@ extends RefCounted
 const IMAGE_EXTENSIONS: Array[String] = [".png", ".tga", ".jpg", ".jpeg", ".dds", ".exr", ".webp"]
 const MODEL_EXTENSIONS: Array[String] = [".gltf", ".glb"]
 
+# Unreal's glTF exporter bakes mesh geometry in the (X, Z, Y) axis order, but the
+# layout places every actor/component with the (Y, Z, -X) convention
+# (ue2g_common.unreal_to_godot_transform). Those two right-handed maps differ by
+# exactly a +90 deg yaw about the up axis, so a mesh dropped in at its layout
+# transform ends up rotated about its OWN pivot. That is invisible on a prop whose
+# geometry is centred on its pivot, but it flings every off-centre modular piece
+# (walls, floors, stairs, containers) metres away -- the "scattered building" bug.
+#
+# gltf_mesh_placement() re-seats the mesh by post-multiplying the placement basis
+# with this yaw. Applied at the StaticBody (which carries both the mesh at identity
+# and the mesh-local collision shapes), it rotates mesh and collision together, so
+# the collision stays hugging the mesh while the whole unit lands where it belongs.
+# The quaternion (0, sin45, 0, cos45) is +90 deg about Y; proof in tests/test_math.py
+# section 9 and verified in-engine.
+const GLTF_MESH_AXIS_FIX := Basis(Quaternion(0.0, 0.70710678118654752, 0.0, 0.70710678118654752))
+
+
+static func gltf_mesh_placement(placement: Transform3D) -> Transform3D:
+	"""Corrects a layout-convention placement so a glTF mesh (baked in the glTF
+	axis order) sitting at identity beneath it renders aligned with its neighbours.
+	See GLTF_MESH_AXIS_FIX. Origin is preserved; only the basis is rotated."""
+	return Transform3D(placement.basis * GLTF_MESH_AXIS_FIX, placement.origin)
+
 
 static func get_transform_from_dict(t_dict: Dictionary) -> Transform3D:
 	"""Constructs a Transform3D from a schema transform dictionary (Godot-space)."""
@@ -28,7 +51,12 @@ static func get_transform_from_dict(t_dict: Dictionary) -> Transform3D:
 	if not quat.is_normalized():
 		quat = quat.normalized()
 
-	var basis := Basis(quat).scaled(scale)
+	# scaled_local(), NOT scaled(): the schema's scale is a LOCAL scale (it names
+	# the node's own axes), and Godot's Basis.scaled() scales rows -- i.e. it
+	# applies the scale in the PARENT frame (S * R). Rotated actors with a
+	# non-uniform scale then come out stretched along the wrong world axes.
+	# scaled_local() is R * S, which reproduces C * (A * S_unreal) * C^T exactly.
+	var basis := Basis(quat).scaled_local(scale)
 	return Transform3D(basis, translation)
 
 
