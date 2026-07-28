@@ -212,6 +212,55 @@
       gap: 0.75rem;
     }
 
+    /* Collapsed navigation (below the header breakpoint) */
+    .nav-toggle {
+      display: none;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      padding: 0.4rem 0.55rem;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .nav-toggle:hover { border-color: var(--accent-godot); }
+    .nav-toggle svg { display: block; }
+    .nav-toggle .icon-close { display: none; }
+    .nav-toggle[aria-expanded="true"] .icon-open { display: none; }
+    .nav-toggle[aria-expanded="true"] .icon-close { display: block; }
+
+    .nav-drawer {
+      display: none;
+      border-top: 1px solid var(--border-color);
+      background: var(--bg-surface);
+    }
+
+    .nav-drawer.open { display: block; }
+
+    .nav-drawer ul {
+      list-style: none;
+      padding: 0.5rem 0;
+    }
+
+    .nav-drawer a {
+      display: block;
+      padding: 0.75rem 1.5rem;
+      font-size: 0.95rem;
+      font-weight: 500;
+      color: var(--text-muted);
+      text-decoration: none;
+      border-left: 2px solid transparent;
+    }
+
+    .nav-drawer a:hover {
+      color: var(--text-main);
+      background: var(--bg-surface-elevated);
+      border-left-color: var(--accent-godot);
+      text-decoration: none;
+    }
+
     .btn-theme-toggle {
       background: var(--bg-surface);
       border: 1px solid var(--border-color);
@@ -923,6 +972,14 @@
        so the menu has to go well before the phone breakpoint, not at it. */
     @media (max-width: 1040px) {
       .nav-menu { display: none; }
+      .nav-toggle { display: inline-flex; }
+    }
+
+    /* The drawer is a below-breakpoint affordance only. If the window is
+       widened while it is open, the full menu comes back and the drawer must
+       not linger underneath it. */
+    @media (min-width: 1041px) {
+      .nav-drawer, .nav-drawer.open { display: none; }
     }
 
     @media (max-width: 640px) {
@@ -961,8 +1018,32 @@
         <a href="https://github.com/vortechU/UnrealToGodot" target="_blank" rel="noopener" class="btn btn-secondary" style="padding: 0.4rem 0.8rem; font-size: 0.85rem;">
           GitHub
         </a>
+
+        <button id="navToggle" class="nav-toggle" aria-label="Open navigation menu"
+                aria-expanded="false" aria-controls="navDrawer">
+          <svg class="icon-open" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <line x1="3" y1="6" x2="21" y2="6"></line>
+            <line x1="3" y1="12" x2="21" y2="12"></line>
+            <line x1="3" y1="18" x2="21" y2="18"></line>
+          </svg>
+          <svg class="icon-close" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
       </div>
     </div>
+
+    <!-- Collapsed navigation, shown below 1040px where the inline menu cannot fit -->
+    <nav class="nav-drawer" id="navDrawer">
+      <ul>
+        <li><a href="#moves">What it moves</a></li>
+        <li><a href="#scope">Honest scope</a></li>
+        <li><a href="#workflow">Workflow</a></li>
+        <li><a href="#reports">Audit reports</a></li>
+        <li><a href="#requirements">Requirements</a></li>
+      </ul>
+    </nav>
   </header>
 
   <main>
@@ -1433,6 +1514,33 @@
     themeToggleBtn.addEventListener('click', () => {
       const currentTheme = htmlElement.getAttribute('data-theme');
       setTheme(currentTheme === 'dark' ? 'light' : 'dark');
+    });
+
+    /* Collapsed navigation drawer */
+    const navToggle = document.getElementById('navToggle');
+    const navDrawer = document.getElementById('navDrawer');
+
+    function setDrawer(open) {
+      navDrawer.classList.toggle('open', open);
+      navToggle.setAttribute('aria-expanded', String(open));
+      navToggle.setAttribute('aria-label', open ? 'Close navigation menu' : 'Open navigation menu');
+    }
+
+    navToggle.addEventListener('click', () => {
+      setDrawer(navToggle.getAttribute('aria-expanded') !== 'true');
+    });
+
+    // Jumping to a section should dismiss the drawer, or it covers the target.
+    navDrawer.querySelectorAll('a').forEach(a => a.addEventListener('click', () => setDrawer(false)));
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') setDrawer(false);
+    });
+
+    // Leaving it open while the window grows past the breakpoint would strand
+    // an invisible-but-open drawer; reset so reopening behaves predictably.
+    window.matchMedia('(min-width: 1041px)').addEventListener('change', (e) => {
+      if (e.matches) setDrawer(false);
     });
 
     /* Before / After Comparison Slider */
