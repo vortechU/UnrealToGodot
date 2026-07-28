@@ -61,7 +61,9 @@ plain converted rotation is not enough for decals: it points the "projection
 direction" at the converted node's local +Z, not -Y. `_decal_transform` folds
 in an extra fix-up quaternion (a -90 degree rotation about the local X axis)
 so that after composition, the converted node's local -Y lines up with where
-the decal's local +Z used to be. See `_decal_transform`'s docstring for the
+the decal's local +Z used to be. Because that fix-up re-labels the node's
+local Y and Z axes, the converted **scale** has to be conjugated by it too --
+its Y and Z components are swapped. See `_decal_transform`'s docstring for the
 full worked derivation and a numeric sanity check.
 """
 
@@ -453,6 +455,17 @@ def _decal_transform(actor):
       +Z. With R_final = R_fix (since R_std = I here), the Decal node's
       local -Y axis maps to R_fix . (0,-1,0) = (0,0,1) by construction --
       also Godot world +Z. The two agree, confirming the fix-up.
+
+      The scale must travel with the rotation. unreal_to_godot_transform
+      returns the scale expressed along R_std's axes, as [usy, usz, usx].
+      The correct world basis is R_std . S_std . R_fix, and consumers build
+      it as R_final . S = (R_std . R_fix) . S, so:
+          S = R_fix^T . S_std . R_fix
+      Conjugating a diagonal by Rx(-90) just swaps its Y and Z entries, so
+      the decal's scale is [usy, usx, usz]. Leaving it as [usy, usz, usx]
+      swaps the decal's projection depth with its height -- a graffiti decal
+      1 m tall with a 1.9 m projection depth renders 3.7 m tall and 0.5 m
+      deep instead (measured on L_Overview's MI_Graffiti_01).
     """
     std = ue2g_common.unreal_to_godot_transform(actor.get_actor_transform())
     q_std = tuple(std.get("rotation_quat", [0.0, 0.0, 0.0, 1.0]))
@@ -463,6 +476,12 @@ def _decal_transform(actor):
         q_final = tuple(c / length for c in q_final)
     else:
         q_final = (0.0, 0.0, 0.0, 1.0)
+
+    scale = list(std.get("scale", [1.0, 1.0, 1.0]))
+    if len(scale) >= 3:
+        # R_fix^T . diag(sx, sy, sz) . R_fix  ==  diag(sx, sz, sy)
+        scale[1], scale[2] = scale[2], scale[1]
+        std["scale"] = scale
 
     std["rotation_quat"] = list(q_final)
     return std
