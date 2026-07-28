@@ -103,7 +103,7 @@ part-way through an import.
 1. Copy the `addons/unreal_importer` folder into your Godot project's `addons` directory.
 2. Open your Godot Project.
 3. Go to **Project > Project Settings > Plugins** and enable **Unreal Engine Layout Importer**.
-4. A new tab named **Unreal to Godot Importer** will appear in the bottom-right editor panel (under the Inspector tab).
+4. A new dock tab named **Unreal Importer** will appear in the bottom-right editor panel (alongside the Inspector tab).
 
 ---
 
@@ -149,7 +149,7 @@ Heightmaps/splatmaps go to a sibling `terrain/` folder, textures to `textures/`.
 ### Step 2: Importing into Godot
 
 1. Open or create a 3D scene in Godot to serve as the active root level.
-2. In the **Unreal to Godot Importer** dock (bottom-right panel):
+2. In the **Unreal Importer** dock (bottom-right panel):
    - **Layout JSON File**: Point to the exported JSON file.
    - **glTF Models Folder**: Select the folder where you exported the glTF meshes.
    - **Textures Folder**: Select the folder containing exported textures (if any).
