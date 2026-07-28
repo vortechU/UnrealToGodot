@@ -5,7 +5,7 @@
 	"FriendlyName": "Unreal to Godot Exporter",
 	"Description": "Exporter tool to migrate Static Meshes, Level layouts, lighting, terrain, foliage, navigation and gameplay metadata to Godot Engine.",
 	"Category": "Importers",
-	"CreatedBy": "Antigravity",
+	"CreatedBy": "Vordev",
 	"CreatedByURL": "",
 	"DocsURL": "",
 	"MarketplaceURL": "",
