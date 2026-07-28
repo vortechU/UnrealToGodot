@@ -18,6 +18,13 @@ const TEXTURES_FOLDER_PATH: String = "res://textures/"
 
 const Common = preload("res://addons/unreal_importer/import_common.gd")
 
+# The layout schema this addon understands (docs/SCHEMA_V2.md). The exporter
+# stamps a matching "format_version" into every layout it writes. The two halves
+# of the toolchain are downloaded separately, so they drift apart on their own --
+# checking here turns a mismatch into one sentence instead of a confusing failure
+# somewhere deep in the actor loop.
+const SUPPORTED_FORMAT_VERSION: int = 2
+
 # Per-feature import toggles (see docs/SCHEMA_V2.md). The dock passes a matching
 # dictionary; anything omitted falls back to these defaults.
 const DEFAULT_IMPORT_OPTIONS := {
@@ -99,6 +106,9 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 		printerr("Import Error: Failed to parse JSON file.")
 		_fail_report("level_layout.json is not valid JSON. The export may have "
 			+ "been interrupted, leaving a truncated file.")
+		return false
+
+	if not _check_format_version(data):
 		return false
 
 	if not data.has("actors") or not (data["actors"] is Array):
@@ -310,6 +320,34 @@ func _fail_report(reason: String) -> void:
 	report.section("Result")
 	report.error(reason)
 	report.write()
+
+
+func _check_format_version(data: Dictionary) -> bool:
+	"""Rejects a layout this addon cannot read, naming which half is out of date.
+
+	The exporter (Unreal plugin) and this importer (Godot addon) are installed
+	separately and updated separately, so a user running mismatched versions is
+	the normal case, not the exotic one.
+	"""
+	if not data.has("format_version"):
+		printerr("Import Error: layout has no 'format_version'.")
+		_fail_report("level_layout.json carries no 'format_version', so it was "
+			+ "written by an exporter older than the v2 schema (or is not a "
+			+ "layout file at all). Update the Unreal plugin and export again.")
+		return false
+
+	var found := int(data["format_version"])
+	if found == SUPPORTED_FORMAT_VERSION:
+		return true
+
+	var stale_half := "The Unreal plugin is newer than the addon -- update addons/unreal_importer to a matching release."
+	if found < SUPPORTED_FORMAT_VERSION:
+		stale_half = "The Unreal plugin is older than the addon -- update the plugin and export the level again."
+	printerr("Import Error: layout format_version %d, but this addon supports %d."
+		% [found, SUPPORTED_FORMAT_VERSION])
+	_fail_report("level_layout.json is format_version %d, but this Godot addon understands version %d. %s"
+		% [found, SUPPORTED_FORMAT_VERSION, stale_half])
+	return false
 
 
 func component_world_transform(comp_data: Dictionary, actor_transform: Transform3D) -> Transform3D:
