@@ -1,0 +1,1585 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UnrealToGodot — Migrate UE5 Asset Packs into Godot 4</title>
+  <meta name="description" content="An open-source toolchain to migrate 3D environment & prop asset packs from Unreal Engine 5 into Godot 4 with collision, PBR materials, and level layout intact.">
+  <meta name="theme-color" content="#0D1117">
+  <link rel="canonical" href="https://vortechu.github.io/UnrealToGodot/">
+
+  <!-- Open Graph / social preview. Without these a shared link renders as a bare
+       URL on Discord, Reddit and X -- which is where this gets shared. -->
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="UnrealToGodot">
+  <meta property="og:url" content="https://vortechu.github.io/UnrealToGodot/">
+  <meta property="og:title" content="UnrealToGodot — Your Unreal asset packs in Godot">
+  <meta property="og:description" content="Migrate 3D environment and prop packs from Unreal Engine 5 into Godot 4 with PBR materials, collision, foliage and level layout intact. Moves art, not behavior.">
+  <!-- SOCIAL CARD PLACEHOLDER: replace with a 1200x630 PNG (the UE/Godot split
+       screenshot works well here) committed next to this file. -->
+  <meta property="og:image" content="https://vortechu.github.io/UnrealToGodot/social-card.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="An Unreal Engine 5 scene beside the same scene imported into Godot 4.">
+
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="UnrealToGodot — Your Unreal asset packs in Godot">
+  <meta name="twitter:description" content="Migrate 3D environment and prop packs from Unreal Engine 5 into Godot 4 with PBR materials, collision, foliage and level layout intact.">
+  <meta name="twitter:image" content="https://vortechu.github.io/UnrealToGodot/social-card.png">
+
+  <!-- Inline favicon: a cube in Godot blue. No extra file to host. -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23478CBF' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z'/%3E%3Cpolyline points='3.27 6.96 12 12.01 20.73 6.96'/%3E%3Cline x1='12' y1='22.08' x2='12' y2='12'/%3E%3C/svg%3E">
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+  <style>
+    :root {
+      /* Base Color Tokens (Dark Theme Default) */
+      --bg-main: #0D1117;
+      --bg-surface: #161B22;
+      --bg-surface-elevated: #21262D;
+      --bg-subtle: #1C2128;
+      --border-color: #30363D;
+      --border-muted: #21262D;
+
+      --text-main: #F0F6FC;
+      --text-muted: #8B949E;
+      --text-dim: #6E7681;
+
+      /* Godot Accent Tokens */
+      --accent-godot: #478CBF;
+      --accent-godot-hover: #3B7BB0;
+      --accent-godot-glow: rgba(71, 140, 191, 0.15);
+      --accent-unreal: #0E7090;
+
+      /* Status Tokens */
+      --status-success: #3FB950;
+      --status-warning: #D29922;
+      --status-error: #F85149;
+      --status-info: #58A6FF;
+
+      /* Typography */
+      --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+      --font-mono: 'JetBrains Mono', Consolas, monospace;
+
+      /* Layout */
+      --max-width: 1160px;
+      --radius-sm: 4px;
+      --radius-md: 8px;
+      --radius-lg: 12px;
+      --transition-fast: 0.15s ease;
+      --transition-normal: 0.25s ease;
+    }
+
+    [data-theme="light"] {
+      --bg-main: #F6F8FA;
+      --bg-surface: #FFFFFF;
+      --bg-surface-elevated: #F0F3F6;
+      --bg-subtle: #EAEEF2;
+      --border-color: #D0D7DE;
+      --border-muted: #E1E4E8;
+
+      --text-main: #1F2328;
+      --text-muted: #57606A;
+      --text-dim: #6E7781;
+
+      --accent-godot: #2B73A8;
+      --accent-godot-hover: #215D8A;
+      --accent-godot-glow: rgba(43, 115, 168, 0.12);
+
+      --status-success: #1A7F37;
+      --status-warning: #9A6700;
+      --status-error: #CF222E;
+      --status-info: #0969DA;
+    }
+
+    /* Base Reset */
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html {
+      scroll-behavior: smooth;
+      color-scheme: dark light;
+    }
+
+    body {
+      background-color: var(--bg-main);
+      color: var(--text-main);
+      font-family: var(--font-sans);
+      font-size: 15px;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    a {
+      color: var(--accent-godot);
+      text-decoration: none;
+      transition: color var(--transition-fast);
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+
+    code, pre, .mono {
+      font-family: var(--font-mono);
+    }
+
+    /* Container */
+    .container {
+      max-width: var(--max-width);
+      margin-inline: auto;
+      padding-inline: 1.5rem;
+    }
+
+    /* Header & Navigation */
+    .header {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: rgba(13, 17, 23, 0.85);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border-color);
+      transition: background var(--transition-normal);
+    }
+
+    [data-theme="light"] .header {
+      background: rgba(246, 248, 250, 0.85);
+    }
+
+    .nav-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 64px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      font-family: var(--font-mono);
+      font-weight: 600;
+      font-size: 1.05rem;
+      color: var(--text-main);
+      text-decoration: none !important;
+    }
+
+    .brand-accent {
+      color: var(--accent-godot);
+    }
+
+    .badge-tag {
+      font-family: var(--font-mono);
+      font-size: 0.725rem;
+      padding: 0.15rem 0.5rem;
+      border-radius: var(--radius-sm);
+      background: var(--bg-surface-elevated);
+      color: var(--text-muted);
+      border: 1px solid var(--border-color);
+      font-weight: 500;
+    }
+
+    .nav-menu {
+      display: flex;
+      align-items: center;
+      gap: 1.75rem;
+      list-style: none;
+    }
+
+    .nav-link {
+      font-size: 0.9rem;
+      font-weight: 500;
+      color: var(--text-muted);
+      transition: color var(--transition-fast);
+    }
+
+    .nav-link:hover {
+      color: var(--text-main);
+      text-decoration: none;
+    }
+
+    .nav-actions {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .btn-theme-toggle {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      padding: 0.4rem 0.6rem;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      transition: all var(--transition-fast);
+    }
+
+    .btn-theme-toggle:hover {
+      background: var(--bg-surface-elevated);
+      border-color: var(--accent-godot);
+    }
+
+    /* Buttons */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      font-family: var(--font-sans);
+      font-weight: 600;
+      font-size: 0.925rem;
+      padding: 0.7rem 1.25rem;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: all var(--transition-fast);
+      text-decoration: none !important;
+    }
+
+    .btn-primary {
+      background-color: var(--accent-godot);
+      color: #FFFFFF;
+      border: 1px solid var(--accent-godot);
+    }
+
+    .btn-primary:hover {
+      background-color: var(--accent-godot-hover);
+      border-color: var(--accent-godot-hover);
+      box-shadow: 0 0 16px var(--accent-godot-glow);
+    }
+
+    .btn-secondary {
+      background-color: var(--bg-surface);
+      color: var(--text-main);
+      border: 1px solid var(--border-color);
+    }
+
+    .btn-secondary:hover {
+      background-color: var(--bg-surface-elevated);
+      border-color: var(--text-muted);
+    }
+
+    /* Hero Section */
+    .hero-section {
+      padding-block: 4.5rem 3.5rem;
+      border-bottom: 1px solid var(--border-muted);
+    }
+
+    .hero-header {
+      max-width: 820px;
+      margin-bottom: 2.5rem;
+    }
+
+    .hero-meta-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }
+
+    .meta-chip {
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--accent-godot);
+      background: var(--accent-godot-glow);
+      padding: 0.25rem 0.65rem;
+      border-radius: var(--radius-sm);
+      border: 1px solid rgba(71, 140, 191, 0.3);
+    }
+
+    .hero-title {
+      font-size: clamp(2.1rem, 4vw, 3.2rem);
+      font-weight: 700;
+      line-height: 1.15;
+      letter-spacing: -0.02em;
+      margin-bottom: 1.25rem;
+    }
+
+    .hero-subtitle {
+      font-size: 1.15rem;
+      color: var(--text-muted);
+      line-height: 1.6;
+      margin-bottom: 1.75rem;
+      max-width: 720px;
+    }
+
+    .hero-cta {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    /* Left-to-Right Motion Pipeline Flourish */
+    .pipeline-indicator {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-top: 1.5rem;
+      padding: 0.75rem 1rem;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-sm);
+      width: fit-content;
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+    }
+
+    .pipeline-step {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      color: var(--text-muted);
+    }
+
+    .pipeline-step.active {
+      color: var(--text-main);
+      font-weight: 600;
+    }
+
+    .pipeline-arrow {
+      color: var(--accent-godot);
+      position: relative;
+      overflow: hidden;
+      display: inline-flex;
+    }
+
+    .pipeline-arrow::after {
+      content: "→";
+      position: absolute;
+      left: 0;
+      top: 0;
+      color: var(--text-main);
+      opacity: 0;
+      animation: flowArrow 2s infinite ease-in-out;
+    }
+
+    @keyframes flowArrow {
+      0% { opacity: 0; transform: translateX(-6px); }
+      50% { opacity: 1; transform: translateX(0); }
+      100% { opacity: 0; transform: translateX(6px); }
+    }
+
+    /* Before/After Viewport Comparison Slider */
+    .slider-wrapper {
+      margin-top: 2.5rem;
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      overflow: hidden;
+      background: var(--bg-surface);
+      position: relative;
+    }
+
+    .slider-container {
+      position: relative;
+      width: 100%;
+      height: 480px;
+      overflow: hidden;
+      user-select: none;
+      cursor: ew-resize;
+    }
+
+    .slider-pane {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    .slider-pane.unreal-pane {
+      background: #0B0E14;
+    }
+
+    .slider-pane.godot-pane {
+      position: absolute;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      width: 50%;
+      overflow: hidden;
+      border-right: 2px solid var(--accent-godot);
+      background: #0F141C;
+      z-index: 2;
+    }
+
+    /* Visual Content Mocks inside Slider */
+    .viewport-mock {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: 1.25rem;
+      position: relative;
+    }
+
+    .viewport-mock-overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: radial-gradient(circle at center, rgba(30, 40, 55, 0.4) 0%, rgba(10, 14, 20, 0.9) 100%);
+      pointer-events: none;
+    }
+
+    .viewport-mock-graphic {
+      width: 80%;
+      height: 65%;
+      border: 1px dashed var(--border-color);
+      border-radius: var(--radius-sm);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1rem;
+      background: rgba(0, 0, 0, 0.2);
+    }
+
+    .viewport-badge {
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      font-weight: 600;
+      padding: 0.35rem 0.75rem;
+      border-radius: var(--radius-sm);
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      z-index: 5;
+    }
+
+    .badge-ue {
+      background: #1A2230;
+      color: #70A0FF;
+      border: 1px solid #2B3A55;
+    }
+
+    .badge-godot {
+      background: #172635;
+      color: var(--accent-godot);
+      border: 1px solid rgba(71, 140, 191, 0.4);
+    }
+
+    .slider-handle {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 50%;
+      width: 4px;
+      background: var(--accent-godot);
+      z-index: 10;
+      transform: translateX(-50%);
+      pointer-events: none;
+    }
+
+    .slider-button {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      background: var(--accent-godot);
+      color: #FFFFFF;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 0 12px rgba(0,0,0,0.5);
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      font-weight: bold;
+    }
+
+    .slider-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.75rem 1.25rem;
+      background: var(--bg-surface-elevated);
+      border-top: 1px solid var(--border-color);
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      color: var(--text-muted);
+    }
+
+    /* Section Component Layouts */
+    .section {
+      padding-block: 4.5rem;
+      border-bottom: 1px solid var(--border-muted);
+    }
+
+    .section-title-group {
+      margin-bottom: 3rem;
+    }
+
+    .section-label {
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: var(--accent-godot);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.5rem;
+    }
+
+    .section-heading {
+      font-size: 2rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      margin-bottom: 0.75rem;
+    }
+
+    .section-desc {
+      font-size: 1.05rem;
+      color: var(--text-muted);
+      max-width: 700px;
+    }
+
+    /* Grid of Capabilities (What It Moves) */
+    .capabilities-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 1.25rem;
+    }
+
+    .cap-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 1.35rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      transition: transform var(--transition-fast), border-color var(--transition-fast);
+    }
+
+    .cap-card:hover {
+      border-color: var(--accent-godot);
+      transform: translateY(-2px);
+    }
+
+    .cap-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .cap-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: var(--radius-sm);
+      background: var(--bg-surface-elevated);
+      color: var(--accent-godot);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid var(--border-muted);
+    }
+
+    .cap-tag {
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      color: var(--text-dim);
+      background: var(--bg-subtle);
+      padding: 0.15rem 0.4rem;
+      border-radius: var(--radius-sm);
+    }
+
+    .cap-title {
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: var(--text-main);
+    }
+
+    .cap-text {
+      font-size: 0.875rem;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
+
+    /* Honest Scope Section (Two Column Panel) */
+    .scope-panel {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+    }
+
+    @media (max-width: 768px) {
+      .scope-panel {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .scope-col {
+      padding: 2rem;
+    }
+
+    .scope-col-transfers {
+      border-right: 1px solid var(--border-color);
+      background: rgba(63, 185, 80, 0.02);
+    }
+
+    @media (max-width: 768px) {
+      .scope-col-transfers {
+        border-right: none;
+        border-bottom: 1px solid var(--border-color);
+      }
+    }
+
+    .scope-col-boundary {
+      background: rgba(210, 153, 34, 0.02);
+    }
+
+    .scope-header {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      font-family: var(--font-mono);
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 1.25rem;
+      padding-bottom: 0.75rem;
+      border-bottom: 1px solid var(--border-muted);
+    }
+
+    .scope-header.transfers {
+      color: var(--status-success);
+    }
+
+    .scope-header.boundary {
+      color: var(--status-warning);
+    }
+
+    .scope-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 0.85rem;
+    }
+
+    .scope-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.65rem;
+      font-size: 0.925rem;
+      color: var(--text-muted);
+    }
+
+    .scope-item strong {
+      color: var(--text-main);
+    }
+
+    .scope-bullet {
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      margin-top: 0.1rem;
+      flex-shrink: 0;
+    }
+
+    .scope-bullet.success { color: var(--status-success); }
+    .scope-bullet.warning { color: var(--status-warning); }
+
+    /* How It Works (Numbered Workflow) */
+    .steps-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1.5rem;
+    }
+
+    @media (max-width: 860px) {
+      .steps-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .step-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .step-num {
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: var(--accent-godot);
+      background: var(--accent-godot-glow);
+      padding: 0.25rem 0.5rem;
+      border-radius: var(--radius-sm);
+      width: fit-content;
+      border: 1px solid rgba(71, 140, 191, 0.3);
+    }
+
+    .step-title {
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: var(--text-main);
+    }
+
+    .step-text {
+      font-size: 0.9rem;
+      color: var(--text-muted);
+    }
+
+    .step-img-placeholder {
+      margin-top: auto;
+      border: 1px dashed var(--border-color);
+      border-radius: var(--radius-sm);
+      background: var(--bg-subtle);
+      padding: 1.25rem 1rem;
+      text-align: center;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      color: var(--text-dim);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    /* Terminal Report Block (It Grades Its Own Output) */
+    .terminal-window {
+      background: #090D12;
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      overflow: hidden;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    }
+
+    [data-theme="light"] .terminal-window {
+      background: #1B2129;
+      color: #F0F6FC;
+    }
+
+    .terminal-header {
+      background: #12171F;
+      padding: 0.6rem 1rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid #212832;
+    }
+
+    .terminal-tabs {
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    .tab-btn {
+      background: transparent;
+      border: 1px solid transparent;
+      color: #8B949E;
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      padding: 0.25rem 0.65rem;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: all var(--transition-fast);
+    }
+
+    .tab-btn.active {
+      background: #1C232E;
+      color: #F0F6FC;
+      border-color: #30363D;
+    }
+
+    .tab-btn:hover:not(.active) {
+      color: #C9D1D9;
+    }
+
+    .terminal-status {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      color: var(--status-success);
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--status-success);
+      display: inline-block;
+    }
+
+    .terminal-body {
+      padding: 1.25rem;
+      font-family: var(--font-mono);
+      font-size: 0.825rem;
+      line-height: 1.55;
+      overflow-x: auto;
+      max-height: 380px;
+      color: #C9D1D9;
+      /* The reports are column-aligned plain text; without this, HTML collapses
+         the runs of spaces and every table in them falls apart. */
+      white-space: pre;
+      tab-size: 4;
+    }
+
+    .log-line { display: block; margin-bottom: 0.2rem; }
+    .log-head { color: var(--accent-godot); font-weight: 600; }
+    .log-ok   { color: #3FB950; }
+    .log-warn { color: #D29922; }
+    .log-info { color: #58A6FF; }
+    .log-dim  { color: #6E7681; }
+
+    /* Requirements Section */
+    .req-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1.25rem;
+    }
+
+    .req-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 1.35rem;
+    }
+
+    .req-title {
+      font-family: var(--font-mono);
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--text-main);
+      margin-bottom: 0.5rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .req-text {
+      font-size: 0.875rem;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
+
+    /* Footer */
+    .footer {
+      padding-block: 3rem 4rem;
+      border-top: 1px solid var(--border-muted);
+      font-size: 0.875rem;
+      color: var(--text-muted);
+    }
+
+    .footer-inner {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1.5rem;
+    }
+
+    .footer-links {
+      display: flex;
+      align-items: center;
+      gap: 1.5rem;
+      list-style: none;
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+    }
+
+    /* Utility */
+    .visually-hidden {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      border: 0;
+    }
+
+    /* The header needs ~1025px to lay out unwrapped (brand 189 + menu 556 +
+       actions 168 + padding). Below that the menu wrapped to three lines, burst
+       out of the 64px header and pushed the whole page into horizontal scroll --
+       so the menu has to go well before the phone breakpoint, not at it. */
+    @media (max-width: 1040px) {
+      .nav-menu { display: none; }
+    }
+
+    @media (max-width: 640px) {
+      .hero-title { font-size: 1.85rem; }
+      .hero-subtitle { font-size: 1rem; }
+      .slider-container { height: 320px; }
+      .section-heading { font-size: 1.6rem; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Navigation Header -->
+  <header class="header">
+    <div class="container nav-inner">
+      <a href="#" class="brand">
+        <span>Unreal<span class="brand-accent">ToGodot</span></span>
+        <span class="badge-tag">v2.0</span>
+      </a>
+
+      <nav>
+        <ul class="nav-menu">
+          <li><a href="#moves" class="nav-link">What it moves</a></li>
+          <li><a href="#scope" class="nav-link">Honest scope</a></li>
+          <li><a href="#workflow" class="nav-link">Workflow</a></li>
+          <li><a href="#reports" class="nav-link">Audit reports</a></li>
+          <li><a href="#requirements" class="nav-link">Requirements</a></li>
+        </ul>
+      </nav>
+
+      <div class="nav-actions">
+        <button id="themeToggle" class="btn-theme-toggle" aria-label="Toggle theme">
+          <span id="themeIcon">☀️</span>
+          <span id="themeLabel">Light</span>
+        </button>
+        <a href="https://github.com/vortechU/UnrealToGodot" target="_blank" rel="noopener" class="btn btn-secondary" style="padding: 0.4rem 0.8rem; font-size: 0.85rem;">
+          GitHub
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- Hero Section -->
+    <section class="hero-section">
+      <div class="container">
+        <div class="hero-header">
+          <div class="hero-meta-bar">
+            <span class="meta-chip">Open-Source Toolchain</span>
+            <span class="badge-tag">UE 5.7 → Godot 4.4+</span>
+          </div>
+          
+          <h1 class="hero-title">
+            Your Unreal asset packs in Godot. Collision and materials intact. One click.
+          </h1>
+
+          <p class="hero-subtitle">
+            Migrate 3D environment and prop packs from Unreal Engine 5 directly into Godot 4 — with PBR materials, collision primitives, foliage, lights, and level transforms intact. Moves art, not behavior.
+          </p>
+
+          <div class="hero-cta">
+            <a href="https://github.com/vortechU/UnrealToGodot/releases" target="_blank" rel="noopener" class="btn btn-primary">
+              Download Exporter & Addon
+            </a>
+            <a href="https://github.com/vortechU/UnrealToGodot" target="_blank" rel="noopener" class="btn btn-secondary">
+              View Source on GitHub
+            </a>
+          </div>
+
+          <!-- Hero Left-to-Right Motion Flourish -->
+          <div class="pipeline-indicator">
+            <div class="pipeline-step">Unreal Engine 5</div>
+            <div class="pipeline-arrow">→</div>
+            <div class="pipeline-step active">ue2g exporter</div>
+            <div class="pipeline-arrow">→</div>
+            <div class="pipeline-step active">Godot 4 Importer</div>
+          </div>
+        </div>
+
+        <!-- Before / After Viewport Comparison Slider -->
+        <div class="slider-wrapper">
+          <div class="slider-container" id="comparisonSlider">
+            <!-- Unreal Engine Viewport Pane (Base Right Side) -->
+            <div class="slider-pane unreal-pane">
+              <!-- SCREENSHOT PLACEHOLDER: Unreal Engine 5 Viewport comparison scene showing high-poly environment with materials and collisions -->
+              <div class="viewport-mock">
+                <div class="viewport-badge badge-ue">
+                  <span>Unreal Engine 5.7 Viewport</span>
+                </div>
+                <div class="viewport-mock-overlay">
+                  <div class="viewport-mock-graphic">
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#70A0FF" stroke-width="1.5">
+                      <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
+                      <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
+                      <line x1="12" y1="22.08" x2="12" y2="12"></line>
+                    </svg>
+                    <span class="mono" style="font-size: 0.8rem; color: #8B949E;">[ Screenshot Placeholder: Unreal Engine 5 Scene Viewport ]</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Godot Viewport Pane (Top Left Side - Draggable Width) -->
+            <div class="slider-pane godot-pane" id="godotPane">
+              <!-- SCREENSHOT PLACEHOLDER: Godot 4 Viewport comparison scene showing migrated environment scene with identical layout, StandardMaterial3D and StaticBody3D collision shapes -->
+              <div class="viewport-mock" style="width: 100vw; max-width: 1110px;">
+                <div class="viewport-badge badge-godot">
+                  <span>Godot 4.6.3 Imported Scene</span>
+                </div>
+                <div class="viewport-mock-overlay">
+                  <div class="viewport-mock-graphic" style="border-color: rgba(71,140,191,0.4);">
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#478CBF" stroke-width="1.5">
+                      <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path>
+                    </svg>
+                    <span class="mono" style="font-size: 0.8rem; color: var(--accent-godot);">[ Screenshot Placeholder: Godot 4 Imported Viewport ]</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Draggable Handle -->
+            <div class="slider-handle" id="sliderHandle">
+              <div class="slider-button">⇄</div>
+            </div>
+          </div>
+
+          <div class="slider-footer">
+            <span>Drag slider to compare Unreal Engine 5 source vs Godot 4 imported result</span>
+            <span class="mono">1:1 Coordinate & Material Remap</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- What It Moves Section -->
+    <section id="moves" class="section">
+      <div class="container">
+        <div class="section-title-group">
+          <div class="section-label">Capabilities</div>
+          <h2 class="section-heading">What it moves</h2>
+          <p class="section-desc">
+            A precise, automated pipeline engineered for high-fidelity 3D environment and prop pack migration.
+          </p>
+        </div>
+
+        <div class="capabilities-grid">
+          <!-- Card 1 -->
+          <div class="cap-card">
+            <div class="cap-card-header">
+              <div class="cap-icon">📦</div>
+              <span class="cap-tag">Static / Skeletal</span>
+            </div>
+            <h3 class="cap-title">Meshes</h3>
+            <p class="cap-text">
+              Batch exports static and skeletal meshes to glTF with collision-safe asset naming to resolve name collisions across multi-pack libraries.
+            </p>
+          </div>
+
+          <!-- Card 2 -->
+          <div class="cap-card">
+            <div class="cap-card-header">
+              <div class="cap-icon">🧱</div>
+              <span class="cap-tag">StaticBody3D</span>
+            </div>
+            <h3 class="cap-title">Collision Primitives</h3>
+            <p class="cap-text">
+              Extracts Unreal box, sphere, capsule, and convex hull primitives into native Godot <code class="mono">CollisionShape3D</code> nodes.
+            </p>
+          </div>
+
+          <!-- Card 3 -->
+          <div class="cap-card">
+            <div class="cap-card-header">
+              <div class="cap-icon">🎨</div>
+              <span class="cap-tag">StandardMaterial3D</span>
+            </div>
+            <h3 class="cap-title">PBR Materials & Textures</h3>
+            <p class="cap-text">
+              Maps albedo, roughness, metallic, normal maps, and UV tiling parameters with case-insensitive texture resolution.
+            </p>
+          </div>
+
+          <!-- Card 4 -->
+          <div class="cap-card">
+            <div class="cap-card-header">
+              <div class="cap-icon">📐</div>
+              <span class="cap-tag">Z-Up → Y-Up</span>
+            </div>
+            <h3 class="cap-title">Level Layout</h3>
+            <p class="cap-text">
+              Converts left-handed Z-up centimeter transforms to Godot right-handed Y-up meter transforms. Supports multi-component Blueprints.
+            </p>
+          </div>
+
+          <!-- Card 5 -->
+          <div class="cap-card">
+            <div class="cap-card-header">
+              <div class="cap-icon">💡</div>
+              <span class="cap-tag">WorldEnvironment</span>
+            </div>
+            <h3 class="cap-title">Lights & Post-Process</h3>
+            <p class="cap-text">
+              Translates directional, point, spot, and rect lights alongside sky, fog, bloom, SSAO, and exposure settings into Godot environment nodes.
+            </p>
+          </div>
+
+          <!-- Card 6 -->
+          <div class="cap-card">
+            <div class="cap-card-header">
+              <div class="cap-icon">🩹</div>
+              <span class="cap-tag">Decal Node</span>
+            </div>
+            <h3 class="cap-title">Decals</h3>
+            <p class="cap-text">
+              Exports DeferredDecal actors into Godot <code class="mono">Decal</code> nodes with matching extent dimensions, textures, and sorting priority.
+            </p>
+          </div>
+
+          <!-- Card 7 -->
+          <div class="cap-card">
+            <div class="cap-card-header">
+              <div class="cap-icon">🌿</div>
+              <span class="cap-tag">MultiMeshInstance3D</span>
+            </div>
+            <h3 class="cap-title">Foliage as MultiMesh</h3>
+            <p class="cap-text">
+              Packs painted foliage, HISM, and ISM instances into efficient Godot transform arrays to preserve runtime render performance.
+            </p>
+          </div>
+
+          <!-- Card 8 -->
+          <div class="cap-card">
+            <div class="cap-card-header">
+              <div class="cap-icon">🗺️</div>
+              <span class="cap-tag">NavigationRegion3D</span>
+            </div>
+            <h3 class="cap-title">Navigation Volumes</h3>
+            <p class="cap-text">
+              Converts NavMeshBoundsVolume actors to NavigationRegion3D nodes with matching agent parameters and optional import baking.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Honest Scope Section -->
+    <section id="scope" class="section">
+      <div class="container">
+        <div class="section-title-group">
+          <div class="section-label">Design Boundary</div>
+          <h2 class="section-heading">Honest scope</h2>
+          <p class="section-desc">
+            UnrealToGodot moves art and scene layout, not gameplay engine logic. We explicitly define what converts so you know exactly what to expect.
+          </p>
+        </div>
+
+        <div class="scope-panel">
+          <!-- Column 1: Transfers -->
+          <div class="scope-col scope-col-transfers">
+            <div class="scope-header transfers">
+              <span>✓ TRANSFERS CLEANLY</span>
+            </div>
+            <ul class="scope-list">
+              <li class="scope-item">
+                <span class="scope-bullet success">✓</span>
+                <span><strong>Static & Skeletal Meshes</strong> exported to glTF, with optional LOD levels and collision-safe naming across multi-pack libraries.</span>
+              </li>
+              <li class="scope-item">
+                <span class="scope-bullet success">✓</span>
+                <span><strong>Collision Primitives</strong> (Box, Sphere, Capsule, Convex Hulls) attached to StaticBody3D.</span>
+              </li>
+              <li class="scope-item">
+                <span class="scope-bullet success">✓</span>
+                <span><strong>PBR Material Parameters</strong> (Albedo, Normal, Roughness, Metallic, AO, UV scaling) rebuilt as Godot materials. Parameter-level — custom shader graphs need re-authoring.</span>
+              </li>
+              <li class="scope-item">
+                <span class="scope-bullet success">✓</span>
+                <span><strong>Level Layout & Hierarchy</strong> including Blueprint actor static mesh compositions.</span>
+              </li>
+              <li class="scope-item">
+                <span class="scope-bullet success">✓</span>
+                <span><strong>Lighting & Environment</strong> (Directional, Point, Spot, Rect lights, Fog, Sky, SSAO).</span>
+              </li>
+              <li class="scope-item">
+                <span class="scope-bullet success">✓</span>
+                <span><strong>Foliage & Decals</strong> packed into MultiMeshInstance3D and Decal nodes.</span>
+              </li>
+            </ul>
+          </div>
+
+          <!-- Column 2: Doesn't Transfer -->
+          <div class="scope-col scope-col-boundary">
+            <div class="scope-header boundary">
+              <span>✕ OUT OF SCOPE (BY DESIGN)</span>
+            </div>
+            <ul class="scope-list">
+              <li class="scope-item">
+                <span class="scope-bullet warning">✕</span>
+                <span><strong>Blueprint Event Graphs & Logic</strong> — engine scripting is not converted; rebuild in GDScript.</span>
+              </li>
+              <li class="scope-item">
+                <span class="scope-bullet warning">✕</span>
+                <span><strong>Gameplay Systems & Frameworks</strong> — Character controllers, game modes, and AI logic.</span>
+              </li>
+              <li class="scope-item">
+                <span class="scope-bullet warning">✕</span>
+                <span><strong>Niagara & Cascade Particle Systems</strong> — particle graphs require re-authoring in Godot GPU Particles.</span>
+              </li>
+              <li class="scope-item">
+                <span class="scope-bullet warning">✕</span>
+                <span><strong>Audio & Sound Cues</strong> — ambient sound actors, attenuation settings, and sound banks.</span>
+              </li>
+              <li class="scope-item">
+                <span class="scope-bullet warning">✕</span>
+                <span><strong>AnimBlueprints & State Machines</strong> — animation sequences export via glTF, but state logic does not.</span>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- How It Works Section -->
+    <section id="workflow" class="section">
+      <div class="container">
+        <div class="section-title-group">
+          <div class="section-label">Pipeline</div>
+          <h2 class="section-heading">How it works</h2>
+          <p class="section-desc">Three clear steps to migrate your scene layout and assets from Unreal Engine to Godot 4.</p>
+        </div>
+
+        <div class="steps-grid">
+          <!-- Step 1 -->
+          <div class="step-card">
+            <span class="step-num">STEP 01</span>
+            <h3 class="step-title">Export from Unreal</h3>
+            <p class="step-text">
+              Open the Python GUI under <code class="mono">Window > Unreal to Godot Exporter</code> in UE5. Select your features and click <code class="mono">Export Everything</code>.
+            </p>
+            <div class="step-img-placeholder">
+              <!-- SCREENSHOT PLACEHOLDER: Unreal Engine Tkinter Exporter Window -->
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+                <line x1="3" y1="9" x2="21" y2="9"></line>
+              </svg>
+              <span>[ Screenshot Placeholder: UE5 Exporter Window ]</span>
+            </div>
+          </div>
+
+          <!-- Step 2 -->
+          <div class="step-card">
+            <span class="step-num">STEP 02</span>
+            <h3 class="step-title">Point Godot Importer Dock</h3>
+            <p class="step-text">
+              In Godot 4, open the <code class="mono">Unreal to Godot Importer</code> dock tab. Select the exported layout JSON and mesh asset folders.
+            </p>
+            <div class="step-img-placeholder">
+              <!-- SCREENSHOT PLACEHOLDER: Godot 4 Importer Dock Panel -->
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+                <line x1="9" y1="3" x2="9" y2="21"></line>
+              </svg>
+              <span>[ Screenshot Placeholder: Godot Importer Dock ]</span>
+            </div>
+          </div>
+
+          <!-- Step 3 -->
+          <div class="step-card">
+            <span class="step-num">STEP 03</span>
+            <h3 class="step-title">Import & Rebuild</h3>
+            <p class="step-text">
+              Click <code class="mono">Import Unreal Level Layout</code> to populate your active 3D scene (or use direct <code class="mono">.tscn</code> scene generation from Unreal).
+            </p>
+            <div class="step-img-placeholder">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
+                <polyline points="22 4 12 14.01 9 11.01"></polyline>
+              </svg>
+              <span>[ Instant Scene & Material Assembly ]</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- It Grades Its Own Output Section -->
+    <section id="reports" class="section">
+      <div class="container">
+        <div class="section-title-group">
+          <div class="section-label">Automated Auditing</div>
+          <h2 class="section-heading">It grades its own output</h2>
+          <p class="section-desc">
+            Both exporter and importer audit their operations in writing. Problems like missing textures, oversized 4K assets, or broken mesh paths are caught automatically in plain-text audit logs.
+          </p>
+        </div>
+
+        <div class="terminal-window">
+          <div class="terminal-header">
+            <div class="terminal-tabs">
+              <button id="btnExportLog" class="tab-btn active" onclick="switchReportTab('export')">ue2g_report.txt (UE Export Audit)</button>
+              <button id="btnImportLog" class="tab-btn" onclick="switchReportTab('import')">ue2g_import_report.txt (Godot Import Audit)</button>
+            </div>
+            <div class="terminal-status">
+              <span class="status-dot"></span>
+              <span>AUDIT COMPLETE</span>
+            </div>
+          </div>
+
+          <div class="terminal-body" id="terminalLogBody">
+            <!-- Content populated by JavaScript -->
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Requirements Section -->
+    <section id="requirements" class="section">
+      <div class="container">
+        <div class="section-title-group">
+          <div class="section-label">Compatibility Matrix</div>
+          <h2 class="section-heading">Requirements & environment</h2>
+          <p class="section-desc">Tested engine versions and prerequisite plugin configurations.</p>
+        </div>
+
+        <div class="req-grid">
+          <div class="req-card">
+            <div class="req-title">
+              <span>🎮 Unreal Engine</span>
+              <span class="badge-tag" style="color: var(--accent-godot);">UE 5.7 Tested</span>
+            </div>
+            <p class="req-text">
+              Tested on Unreal Engine 5.7. Requires built-in plugins: <strong>Python Editor Script</strong>, <strong>Editor Scripting Utilities</strong>, and <strong>glTF Exporter</strong>.
+            </p>
+          </div>
+
+          <div class="req-card">
+            <div class="req-title">
+              <span>🤖 Godot Engine</span>
+              <span class="badge-tag" style="color: var(--accent-godot);">Godot 4.4+ (4.6.3)</span>
+            </div>
+            <p class="req-text">
+              Godot 4.4+ is required for <code class="mono">.uid</code> resource sidecar compatibility. Tested on Godot 4.6.3.
+            </p>
+          </div>
+
+          <div class="req-card">
+            <div class="req-title">
+              <span>⛰️ Landscapes</span>
+              <span class="badge-tag">Terrain3D Required</span>
+            </div>
+            <p class="req-text">
+              Exports terrain heightmaps/splatmaps as float EXRs. Landscapes effectively require the <strong>Terrain3D</strong> plugin — the plugin-free mesh fallback caps out at a 256×256 grid and is a preview, not a shippable result. Terrain is the least mature part of the toolchain.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="container footer-inner">
+      <div>
+        <p style="font-weight: 600; color: var(--text-main); margin-bottom: 0.25rem;">UnrealToGodot</p>
+        <p>Released under the <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener">MIT License</a>. Open source & free forever.</p>
+      </div>
+
+      <ul class="footer-links">
+        <li><a href="https://github.com/vortechU/UnrealToGodot" target="_blank" rel="noopener">GitHub</a></li>
+        <li><a href="https://discord.com/invite/HGwkYW2h6Y" target="_blank" rel="noopener">Discord</a></li>
+        <li>Built by <a href="https://www.vortech.studio/" target="_blank" rel="noopener" style="font-weight: 600;">Vordev</a></li>
+      </ul>
+    </div>
+  </footer>
+
+  <!-- Scripts -->
+  <script>
+    /* Theme Toggle Logic */
+    const themeToggleBtn = document.getElementById('themeToggle');
+    const themeIcon = document.getElementById('themeIcon');
+    const themeLabel = document.getElementById('themeLabel');
+    const htmlElement = document.documentElement;
+
+    function setTheme(theme) {
+      htmlElement.setAttribute('data-theme', theme);
+      localStorage.setItem('ue2g_theme', theme);
+      if (theme === 'light') {
+        themeIcon.textContent = '🌙';
+        themeLabel.textContent = 'Dark';
+      } else {
+        themeIcon.textContent = '☀️';
+        themeLabel.textContent = 'Light';
+      }
+    }
+
+    // Initialize Theme
+    const savedTheme = localStorage.getItem('ue2g_theme');
+    const systemPrefersLight = window.matchMedia('(prefers-color-scheme: light)').matches;
+
+    if (savedTheme) {
+      setTheme(savedTheme);
+    } else if (systemPrefersLight) {
+      setTheme('light');
+    } else {
+      setTheme('dark');
+    }
+
+    themeToggleBtn.addEventListener('click', () => {
+      const currentTheme = htmlElement.getAttribute('data-theme');
+      setTheme(currentTheme === 'dark' ? 'light' : 'dark');
+    });
+
+    /* Before / After Comparison Slider */
+    const sliderContainer = document.getElementById('comparisonSlider');
+    const godotPane = document.getElementById('godotPane');
+    const sliderHandle = document.getElementById('sliderHandle');
+    let isDragging = false;
+
+    function updateSliderPosition(clientX) {
+      const rect = sliderContainer.getBoundingClientRect();
+      let offsetX = clientX - rect.left;
+      if (offsetX < 0) offsetX = 0;
+      if (offsetX > rect.width) offsetX = rect.width;
+      const percentage = (offsetX / rect.width) * 100;
+      godotPane.style.width = percentage + '%';
+      sliderHandle.style.left = percentage + '%';
+    }
+
+    sliderContainer.addEventListener('mousedown', (e) => {
+      isDragging = true;
+      updateSliderPosition(e.clientX);
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!isDragging) return;
+      updateSliderPosition(e.clientX);
+    });
+
+    window.addEventListener('mouseup', () => { isDragging = false; });
+
+    // Touch Support
+    sliderContainer.addEventListener('touchstart', (e) => {
+      isDragging = true;
+      if (e.touches.length > 0) updateSliderPosition(e.touches[0].clientX);
+    });
+
+    window.addEventListener('touchmove', (e) => {
+      if (!isDragging) return;
+      if (e.touches.length > 0) updateSliderPosition(e.touches[0].clientX);
+    });
+
+    window.addEventListener('touchend', () => { isDragging = false; });
+
+    /* Terminal Report Data & Switcher */
+    /* These reproduce the real output format of tools/ue2g_diagnose.py and
+       import_report.gd verbatim -- section bars, column alignment, ok/note/
+       WARNING prefixes and the VERDICT footer. Swap the numbers for a real run
+       against your own level before launch. */
+    const exportLogText = `
+<span class="log-head">========================================================================</span>
+<span class="log-head">UNREAL -&gt; GODOT EXPORT DIAGNOSTIC</span>
+<span class="log-head">========================================================================</span>
+
+<span class="log-dim">--- Environment ---</span>
+<span class="log-dim">  generated:                             2026-07-28T23:54:12</span>
+<span class="log-dim">  export folder:                         D:\\Exports\\MedievalVillage</span>
+<span class="log-dim">  python:                                3.11.8</span>
+
+<span class="log-dim">--- Layout (level_layout.json) ---</span>
+<span class="log-dim">  file size:                             2.4 MB</span>
+<span class="log-dim">  format_version:                        2</span>
+<span class="log-dim">  level_name:                            MedievalVillage</span>
+<span class="log-dim">  actors:                                486</span>
+<span class="log-dim">  mesh entries:                          142</span>
+<span class="log-ok">  ok      every component carries godot_world_transform</span>
+<span class="log-ok">  ok      all material scalars are within Godot's 0..1 range</span>
+<span class="log-info">  note    3 material(s) use an albedo tint above 1.0. This is normal for
+          dark-authored textures; only suspect it if those surfaces look
+          washed out.</span>
+
+<span class="log-dim">--- Models (*.gltf) ---</span>
+<span class="log-dim">  glTF files:                            142</span>
+<span class="log-dim">  image URIs referenced:                 96</span>
+<span class="log-ok">  ok      no baked texture references (material baking is correctly off)</span>
+<span class="log-ok">  ok      every referenced image URI resolves to a file on disk</span>
+<span class="log-ok">  ok      every mesh referenced by the layout has a .gltf</span>
+
+<span class="log-dim">--- Textures ---</span>
+<span class="log-dim">  texture files:                          96</span>
+<span class="log-dim">  total size:                             3.1 GB</span>
+<span class="log-warn">  WARNING 8 texture(s) are 4096x4096 or larger. Godot's importer can run out
+          of memory and segfault on a set this size -- cap Max Texture
+          Resolution in the importer dock before importing.</span>
+
+<span class="log-head">========================================================================</span>
+<span class="log-head">VERDICT: 0 error(s), 1 warning(s)</span>
+<span class="log-head">========================================================================</span>
+
+<span class="log-warn">WARNINGS (these may degrade the result):</span>
+<span class="log-warn">  * 8 texture(s) at or above 4096x4096</span>
+`;
+
+    const importLogText = `
+<span class="log-head">========================================================================</span>
+<span class="log-head">UNREAL -&gt; GODOT IMPORT REPORT</span>
+<span class="log-head">========================================================================</span>
+
+<span class="log-dim">--- Environment ---</span>
+<span class="log-dim">  generated:                           2026-07-28T23:54:15</span>
+<span class="log-dim">  godot:                               4.6.3-stable (official)</span>
+<span class="log-dim">  layout json:                         res://level_layout.json</span>
+<span class="log-dim">  models folder:                       res://models/</span>
+<span class="log-dim">  textures folder:                     res://textures/</span>
+
+<span class="log-dim">--- Layout ---</span>
+<span class="log-dim">  actors in json:                      486</span>
+<span class="log-dim">  mesh entries in json:                142</span>
+<span class="log-dim">  actors imported:                     486</span>
+<span class="log-dim">  Environment (lights/decals/post-fx): 21 node(s)</span>
+
+<span class="log-dim">--- Result ---</span>
+<span class="log-dim">  MeshInstance3D nodes:                618</span>
+<span class="log-ok">  MISSING_ placeholders:               0</span>
+
+<span class="log-dim">--- Material slots (618 total) ---</span>
+<span class="log-ok">  albedo texture                    612 / 618  ( 99.0%)</span>
+<span class="log-ok">  normal texture                    588 / 618  ( 95.1%)</span>
+<span class="log-ok">  roughness texture                 564 / 618  ( 91.3%)</span>
+<span class="log-ok">  metallic texture                  564 / 618  ( 91.3%)</span>
+<span class="log-ok">  AO texture                        564 / 618  ( 91.3%)</span>
+<span class="log-ok">  packed map shared rough+metal     564 / 618  ( 91.3%)</span>
+
+<span class="log-head">========================================================================</span>
+<span class="log-head">VERDICT: 0 error(s), 0 warning(s)</span>
+<span class="log-head">========================================================================</span>
+
+<span class="log-ok">No problems found in this import.</span>
+`;
+
+    const logBody = document.getElementById('terminalLogBody');
+    const btnExportLog = document.getElementById('btnExportLog');
+    const btnImportLog = document.getElementById('btnImportLog');
+
+    function switchReportTab(tab) {
+      if (tab === 'export') {
+        logBody.innerHTML = exportLogText.trim();
+        btnExportLog.classList.add('active');
+        btnImportLog.classList.remove('active');
+      } else {
+        logBody.innerHTML = importLogText.trim();
+        btnImportLog.classList.add('active');
+        btnExportLog.classList.remove('active');
+      }
+    }
+
+    // Initialize Default Tab
+    switchReportTab('export');
+  </script>
+</body>
+</html>
