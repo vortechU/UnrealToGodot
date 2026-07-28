@@ -75,9 +75,10 @@ been tried; the flag is only known to work for the texture probe.
 
 | File | Covers |
 | --- | --- |
-| `test_math.py` | Coordinate conversion in `ue2g_common.py`: `C·R·Cᵀ`, the packed 12-float foliage basis, `matrix_to_quat` (all four branches), the decal fix-up quaternion, export-name collision hashing. Stubs the `unreal` module. |
+| `test_math.py` | Coordinate conversion in `ue2g_common.py`: `C·R·Cᵀ`, the packed 12-float foliage basis, `matrix_to_quat` (all four branches), the glTF placement yaw fix, the schema `scale` being a **local** scale (column scaling, not row), and the decal fix-up quaternion **plus** the matching scale conjugation. Stubs the `unreal` module. |
 | `test_layout.py` | Component placement in `tscn_writer.py`, including an explicit reproduction of the double-transform bug and `affine_inverse` round-trips. |
 | `test_tscn_writer.py` | End-to-end `.tscn` generation: resource/node structure, `load_steps` accounting, dangling-reference checks, and node placement. |
+| `test_exporter_gui.py` | Layout of the Unreal-side Tkinter panel: the window fits the screen, the body scrolls far enough to reach the Godot integration controls, and the status bar stays pinned below the scroll area at any window height. Opens a real Tk window; skips itself when there is no display. |
 | `godot_harness/` | Builds a throwaway Godot project (minimal glTF, fixture `level_layout.json`) and runs `import_unreal_layout.gd` for real, asserting where nodes land. |
 | `test_texture_shrink.py` | Drives `texture_import_limit.shrink_source_files` in headless Godot against real 4K exports, then checks the pixels with PIL: capped dimensions, and no channel collapsed to a constant. The normal map's blue channel is the case that matters — see `docs/texture-sizing.md`. |
 | `probe_unreal_api.py` | Run *inside* Unreal to confirm `GLTFExportOptions` property names exist on your engine version. |

@@ -11,7 +11,7 @@ import queue
 import threading
 import json
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, ttk
 import unreal
 
 # Import underlying exporters
@@ -74,16 +74,24 @@ class UnrealToGodotApp:
         self.project_dir = project_dir
         self.root = tk.Tk()
         self.root.title("Unreal ➔ Godot Exporter")
-        self.root.geometry("540x880")
         self.root.configure(bg="#1e1e1e")
         self.root.resizable(True, True)
-        
+
+        # The panel is taller than it is wide and used to open at a fixed 880px,
+        # which is taller than the usable area of a 1080p screen once the taskbar
+        # and title bar are taken out -- the Godot integration section and the
+        # status line fell off the bottom with no way to reach them. Fit the
+        # window to the screen instead, and make the body scroll (see
+        # _build_scroll_area) so no control is ever unreachable.
+        self.root.minsize(480, 320)
+        self.root.geometry(self._fitted_geometry(560, 880))
+
         # Keep window permanently on top of the Unreal Editor
         self.root.attributes("-topmost", True)
-        
+
         # Initialize UI layout
         self.init_ui()
-        
+
         # Load persisted settings and update UI
         self.load_settings()
         self.toggle_godot_path_state()
@@ -95,11 +103,142 @@ class UnrealToGodotApp:
         # Start the GUI polling loop for editor state updates
         self.poll_state()
 
+    def _fitted_geometry(self, want_w, want_h):
+        """A 'WxH+X+Y' string that is guaranteed to fit on the current screen.
+
+        Leaves room for the title bar and taskbar, then centres vertically-ish so
+        the window does not open half off-screen on a short display.
+        """
+        try:
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+        except Exception:
+            return "%dx%d" % (want_w, want_h)
+        width = max(480, min(want_w, screen_w - 80))
+        height = max(320, min(want_h, screen_h - 120))
+        pos_x = max(0, (screen_w - width) // 2)
+        pos_y = max(0, (screen_h - height) // 3)
+        return "%dx%d+%d+%d" % (width, height, pos_x, pos_y)
+
+    def _style_scrollbar(self):
+        """Defines a dark ttk scrollbar style.
+
+        A plain tk.Scrollbar is drawn by the native Windows theme, which ignores
+        every colour option -- it comes out as a bright white bar down the side of
+        a dark panel. ttk's 'clam' theme is fully colourable on all platforms, so
+        the scrollbar is a ttk widget with a private style built on top of it.
+        Falls back silently to the default look if clam is unavailable.
+        """
+        try:
+            style = ttk.Style(self.root)
+            if "clam" in style.theme_names():
+                style.theme_use("clam")
+            style.configure(
+                "Ue2g.Vertical.TScrollbar",
+                background="#3f3f46",      # the thumb
+                troughcolor="#141414",
+                bordercolor="#141414",
+                darkcolor="#3f3f46",
+                lightcolor="#3f3f46",
+                arrowcolor="#a1a1aa",
+                gripcount=0,
+                borderwidth=0,
+                width=12,
+            )
+            style.map(
+                "Ue2g.Vertical.TScrollbar",
+                background=[("active", "#52525b"), ("pressed", "#71717a")],
+            )
+        except Exception as e:
+            unreal.log_warning("Unreal to Godot Exporter: could not style the "
+                               "scrollbar (%s); using the default look." % e)
+
+    def _build_scroll_area(self):
+        """Puts every section inside a vertically scrollable canvas.
+
+        Returns the frame sections should be packed into. The status bar is
+        deliberately NOT in here -- it is packed against the bottom of the window
+        first, so progress and error messages stay visible no matter how far the
+        body is scrolled or how short the window is.
+        """
+        container = tk.Frame(self.root, bg="#1e1e1e")
+        container.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self._style_scrollbar()
+
+        self.canvas = tk.Canvas(container, bg="#1e1e1e", highlightthickness=0, bd=0)
+        self.scrollbar = ttk.Scrollbar(
+            container,
+            orient=tk.VERTICAL,
+            command=self.canvas.yview,
+            style="Ue2g.Vertical.TScrollbar",
+        )
+        self.canvas.configure(yscrollcommand=self._on_scrollbar_set)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # The scrollbar is packed on demand by _on_scrollbar_set: showing a
+        # permanently-disabled bar on a window tall enough for its content is
+        # just noise, and hiding it gives the sections their full width back.
+
+        body = tk.Frame(self.canvas, bg="#1e1e1e")
+        self._body_window = self.canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def _on_body_configure(_event=None):
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            # Match the inner frame to the canvas width so fill=tk.X still works.
+            self.canvas.itemconfigure(self._body_window, width=event.width)
+
+        body.bind("<Configure>", _on_body_configure)
+        self.canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Wheel + keyboard scrolling. bind_all is safe here: this is a standalone
+        # Tk window with exactly one scrollable region.
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.root.bind_all("<Button-4>", self._on_mousewheel)   # X11 wheel up
+        self.root.bind_all("<Button-5>", self._on_mousewheel)   # X11 wheel down
+        self.root.bind("<Prior>", lambda e: self.canvas.yview_scroll(-1, "pages"))
+        self.root.bind("<Next>", lambda e: self.canvas.yview_scroll(1, "pages"))
+        self.root.bind("<Home>", lambda e: self.canvas.yview_moveto(0.0))
+        self.root.bind("<End>", lambda e: self.canvas.yview_moveto(1.0))
+
+        return body
+
+    def _on_scrollbar_set(self, first, last):
+        """Shows the scrollbar only while there is something to scroll."""
+        self.scrollbar.set(first, last)
+        needed = not (float(first) <= 0.0 and float(last) >= 1.0)
+        if needed and not self.scrollbar.winfo_ismapped():
+            self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        elif not needed and self.scrollbar.winfo_ismapped():
+            self.scrollbar.pack_forget()
+
+    def _on_mousewheel(self, event):
+        """Wheel scrolling, normalised across Windows/macOS/X11 event shapes."""
+        first, last = self.canvas.yview()
+        if first <= 0.0 and last >= 1.0:
+            return          # nothing to scroll; let the event through
+        if getattr(event, "num", None) == 4:
+            delta = -1
+        elif getattr(event, "num", None) == 5:
+            delta = 1
+        elif abs(event.delta) >= 120:
+            delta = -int(event.delta / 120)     # Windows
+        else:
+            delta = -int(event.delta)           # macOS reports small deltas
+        if delta:
+            self.canvas.yview_scroll(delta, "units")
+
     def init_ui(self):
+        # Status bar first, pinned to the bottom of the WINDOW (not the scrolling
+        # body) so export feedback is always on screen.
+        self._build_status_bar()
+        body = self._build_scroll_area()
+
         # Header container
-        header_frame = tk.Frame(self.root, bg="#1e1e1e")
+        header_frame = tk.Frame(body, bg="#1e1e1e")
         header_frame.pack(fill=tk.X, padx=20, pady=(15, 10))
-        
+
         title_lbl = tk.Label(
             header_frame, 
             text="Unreal Engine to Godot Exporter", 
@@ -121,7 +260,7 @@ class UnrealToGodotApp:
         
         # --- Section 1: Static Mesh Exporter ---
         mesh_frame = tk.LabelFrame(
-            self.root, 
+            body, 
             text=" Static Mesh glTF Exporter ", 
             fg="#f59e0b", 
             bg="#1e1e1e", 
@@ -274,7 +413,7 @@ class UnrealToGodotApp:
         
         # --- Section 2: Level Layout Exporter ---
         layout_frame = tk.LabelFrame(
-            self.root, 
+            body, 
             text=" Level Layout JSON Exporter ", 
             fg="#f59e0b", 
             bg="#1e1e1e", 
@@ -361,7 +500,7 @@ class UnrealToGodotApp:
 
         # --- Section 2b: Level Export Features (per-feature toggles) ---
         features_frame = tk.LabelFrame(
-            self.root,
+            body,
             text=" Level Export Features ",
             fg="#f59e0b",
             bg="#1e1e1e",
@@ -448,7 +587,7 @@ class UnrealToGodotApp:
 
         # --- Section 3: Godot Integration Exporter ---
         godot_frame = tk.LabelFrame(
-            self.root, 
+            body, 
             text=" Godot Engine Integration ", 
             fg="#f59e0b", 
             bg="#1e1e1e", 
@@ -488,13 +627,18 @@ class UnrealToGodotApp:
         )
         self.godot_path_lbl.pack(side=tk.LEFT, padx=(0, 6))
         
+        # disabledbackground/-foreground are set explicitly: a tk.Entry falls back
+        # to the SYSTEM colours when disabled, which renders a bright white box in
+        # the middle of the dark panel whenever auto-transfer is off.
         self.godot_path_entry = tk.Entry(
-            self.godot_path_row, 
-            bg="#121212", 
-            fg="#ffffff", 
-            insertbackground="#ffffff", 
-            bd=1, 
-            relief=tk.SOLID, 
+            self.godot_path_row,
+            bg="#121212",
+            fg="#ffffff",
+            disabledbackground="#191919",
+            disabledforeground="#6b7280",
+            insertbackground="#ffffff",
+            bd=1,
+            relief=tk.SOLID,
             font=("Segoe UI", 10)
         )
         self.godot_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
@@ -512,16 +656,40 @@ class UnrealToGodotApp:
             command=self.browse_godot_project
         )
         self.browse_godot_btn.pack(side=tk.LEFT, padx=(6, 0))
-        
-        # --- Footer Status Bar ---
+
+        # Trailing breathing room so the last control clears the status bar when
+        # the body is scrolled all the way down.
+        tk.Frame(body, bg="#1e1e1e", height=12).pack(fill=tk.X)
+
+    def _build_status_bar(self):
+        """The always-visible footer. Packed against the bottom of the window
+        BEFORE the scrolling body claims the remaining space, so it survives any
+        window height and any scroll position -- it used to be the last widget in
+        one long column and simply fell off the bottom of the screen.
+
+        wraplength is set from the window width on <Configure> so a long message
+        (a file path, an exporter error) wraps instead of being clipped.
+        """
+        status_frame = tk.Frame(self.root, bg="#171717", bd=0,
+                                highlightthickness=1, highlightbackground="#3f3f46")
+        status_frame.pack(side=tk.BOTTOM, fill=tk.X)
+
         self.status_lbl = tk.Label(
-            self.root, 
-            text="Ready", 
-            fg="#a3a3a3", 
-            bg="#1e1e1e", 
-            font=("Segoe UI", 10)
+            status_frame,
+            text="Ready",
+            fg="#a3a3a3",
+            bg="#171717",
+            font=("Segoe UI", 10),
+            justify=tk.LEFT,
+            anchor=tk.W,
+            wraplength=520
         )
-        self.status_lbl.pack(fill=tk.X, padx=20, pady=(5, 0), anchor=tk.W)
+        self.status_lbl.pack(fill=tk.X, padx=12, pady=(6, 7))
+
+        def _rewrap(event):
+            self.status_lbl.config(wraplength=max(200, event.width - 30))
+
+        status_frame.bind("<Configure>", _rewrap)
 
     def poll_state(self):
         """Thread-safe state poller. Runs on the Tkinter thread."""
