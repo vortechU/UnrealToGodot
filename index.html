@@ -15,9 +15,7 @@
   <meta property="og:url" content="https://vortechu.github.io/UnrealToGodot/">
   <meta property="og:title" content="UnrealToGodot — Your Unreal asset packs in Godot">
   <meta property="og:description" content="Migrate 3D environment and prop packs from Unreal Engine 5 into Godot 4 with PBR materials, collision, foliage and level layout intact. Moves art, not behavior.">
-  <!-- SOCIAL CARD PLACEHOLDER: replace with a 1200x630 PNG (the UE/Godot split
-       screenshot works well here) committed next to this file. -->
-  <meta property="og:image" content="https://vortechu.github.io/UnrealToGodot/social-card.png">
+  <meta property="og:image" content="https://vortechu.github.io/UnrealToGodot/assets/social-card.jpg">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta property="og:image:alt" content="An Unreal Engine 5 scene beside the same scene imported into Godot 4.">
@@ -25,7 +23,7 @@
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="UnrealToGodot — Your Unreal asset packs in Godot">
   <meta name="twitter:description" content="Migrate 3D environment and prop packs from Unreal Engine 5 into Godot 4 with PBR materials, collision, foliage and level layout intact.">
-  <meta name="twitter:image" content="https://vortechu.github.io/UnrealToGodot/social-card.png">
+  <meta name="twitter:image" content="https://vortechu.github.io/UnrealToGodot/assets/social-card.jpg">
 
   <!-- Inline favicon: a cube in Godot blue. No extra file to host. -->
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23478CBF' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z'/%3E%3Cpolyline points='3.27 6.96 12 12.01 20.73 6.96'/%3E%3Cline x1='12' y1='22.08' x2='12' y2='12'/%3E%3C/svg%3E">
@@ -437,10 +435,15 @@
     .slider-container {
       position: relative;
       width: 100%;
-      height: 480px;
+      /* Matches the exported hero pair (1600x762). Driving the height from the
+         image aspect instead of a fixed px value means the two shots are never
+         letterboxed or cropped differently from one another. */
+      aspect-ratio: 1600 / 762;
       overflow: hidden;
       user-select: none;
       cursor: ew-resize;
+      touch-action: pan-y;
+      background: #0B0E14;
     }
 
     .slider-pane {
@@ -466,41 +469,31 @@
       z-index: 2;
     }
 
-    /* Visual Content Mocks inside Slider */
-    .viewport-mock {
+    /* Screenshots inside the slider */
+    .viewport-shot {
+      display: block;
       width: 100%;
       height: 100%;
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-      padding: 1.25rem;
-      position: relative;
-    }
-
-    .viewport-mock-overlay {
-      position: absolute;
-      inset: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: radial-gradient(circle at center, rgba(30, 40, 55, 0.4) 0%, rgba(10, 14, 20, 0.9) 100%);
+      object-fit: cover;
+      object-position: center;
       pointer-events: none;
     }
 
-    .viewport-mock-graphic {
-      width: 80%;
-      height: 65%;
-      border: 1px dashed var(--border-color);
-      border-radius: var(--radius-sm);
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 1rem;
-      background: rgba(0, 0, 0, 0.2);
+    /* Pinned to the container's width so the clipped pane reveals the image
+       rather than compressing it. Without this the two shots drift out of
+       registration as the handle moves and the comparison stops being one. */
+    .pane-sizer {
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 100%;
+      width: var(--slider-w, 100%);
     }
 
     .viewport-badge {
+      position: absolute;
+      top: 1rem;
+      left: 1rem;
       font-family: var(--font-mono);
       font-size: 0.8rem;
       font-weight: 600;
@@ -512,7 +505,11 @@
       z-index: 5;
     }
 
+    /* Sits on the right so it stays in the Unreal half rather than hiding
+       under the Godot pane, which grows from the left. */
     .badge-ue {
+      left: auto;
+      right: 1rem;
       background: #1A2230;
       color: #70A0FF;
       border: 1px solid #2B3A55;
@@ -794,6 +791,16 @@
       color: var(--text-muted);
     }
 
+    .step-shot {
+      margin-top: auto;
+      display: block;
+      width: 100%;
+      height: auto;
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-sm);
+      background: var(--bg-subtle);
+    }
+
     .step-img-placeholder {
       margin-top: auto;
       border: 1px dashed var(--border-color);
@@ -985,7 +992,8 @@
     @media (max-width: 640px) {
       .hero-title { font-size: 1.85rem; }
       .hero-subtitle { font-size: 1rem; }
-      .slider-container { height: 320px; }
+      /* No fixed height here -- aspect-ratio drives it, and forcing a height
+         would letterbox or stretch the two shots differently. */
       .section-heading { font-size: 1.6rem; }
     }
   </style>
@@ -1086,40 +1094,27 @@
         <!-- Before / After Viewport Comparison Slider -->
         <div class="slider-wrapper">
           <div class="slider-container" id="comparisonSlider">
-            <!-- Unreal Engine Viewport Pane (Base Right Side) -->
+            <!-- Unreal pane: the full-width base layer the wipe reveals over. -->
             <div class="slider-pane unreal-pane">
-              <!-- SCREENSHOT PLACEHOLDER: Unreal Engine 5 Viewport comparison scene showing high-poly environment with materials and collisions -->
-              <div class="viewport-mock">
-                <div class="viewport-badge badge-ue">
-                  <span>Unreal Engine 5.7 Viewport</span>
-                </div>
-                <div class="viewport-mock-overlay">
-                  <div class="viewport-mock-graphic">
-                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#70A0FF" stroke-width="1.5">
-                      <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
-                      <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
-                      <line x1="12" y1="22.08" x2="12" y2="12"></line>
-                    </svg>
-                    <span class="mono" style="font-size: 0.8rem; color: #8B949E;">[ Screenshot Placeholder: Unreal Engine 5 Scene Viewport ]</span>
-                  </div>
-                </div>
+              <img class="viewport-shot" src="assets/hero-unreal.jpg"
+                   alt="A wasteland rock formation asset pack in the Unreal Engine 5 viewport."
+                   width="1600" height="762" fetchpriority="high" decoding="async">
+              <div class="viewport-badge badge-ue">
+                <span>Unreal Engine 5.7</span>
               </div>
             </div>
 
-            <!-- Godot Viewport Pane (Top Left Side - Draggable Width) -->
+            <!-- Godot pane: clipped to the handle position. The inner sizer is
+                 pinned to the slider's full width so the image does not squash
+                 as the pane narrows -- that is what keeps the two halves
+                 registered against each other while dragging. -->
             <div class="slider-pane godot-pane" id="godotPane">
-              <!-- SCREENSHOT PLACEHOLDER: Godot 4 Viewport comparison scene showing migrated environment scene with identical layout, StandardMaterial3D and StaticBody3D collision shapes -->
-              <div class="viewport-mock" style="width: 100vw; max-width: 1110px;">
+              <div class="pane-sizer" id="godotSizer">
+                <img class="viewport-shot" src="assets/hero-godot.jpg"
+                     alt="The same rock formation pack after import into Godot 4, with meshes, materials and layout preserved."
+                     width="1600" height="762" fetchpriority="high" decoding="async">
                 <div class="viewport-badge badge-godot">
-                  <span>Godot 4.6.3 Imported Scene</span>
-                </div>
-                <div class="viewport-mock-overlay">
-                  <div class="viewport-mock-graphic" style="border-color: rgba(71,140,191,0.4);">
-                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#478CBF" stroke-width="1.5">
-                      <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path>
-                    </svg>
-                    <span class="mono" style="font-size: 0.8rem; color: var(--accent-godot);">[ Screenshot Placeholder: Godot 4 Imported Viewport ]</span>
-                  </div>
+                  <span>Godot 4.6.3 — imported</span>
                 </div>
               </div>
             </div>
@@ -1343,14 +1338,9 @@
             <p class="step-text">
               Open the Python GUI under <code class="mono">Window > Unreal to Godot Exporter</code> in UE5. Select your features and click <code class="mono">Export Everything</code>.
             </p>
-            <div class="step-img-placeholder">
-              <!-- SCREENSHOT PLACEHOLDER: Unreal Engine Tkinter Exporter Window -->
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                <rect x="3" y="3" width="18" height="18" rx="2"></rect>
-                <line x1="3" y1="9" x2="21" y2="9"></line>
-              </svg>
-              <span>[ Screenshot Placeholder: UE5 Exporter Window ]</span>
-            </div>
+            <img class="step-shot" src="assets/ui-exporter.png"
+                 alt="The Unreal to Godot Exporter window, showing the glTF export path and per-feature toggles."
+                 width="900" height="546" loading="lazy" decoding="async">
           </div>
 
           <!-- Step 2 -->
@@ -1360,14 +1350,9 @@
             <p class="step-text">
               In Godot 4, open the <code class="mono">Unreal to Godot Importer</code> dock tab. Select the exported layout JSON and mesh asset folders.
             </p>
-            <div class="step-img-placeholder">
-              <!-- SCREENSHOT PLACEHOLDER: Godot 4 Importer Dock Panel -->
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                <rect x="3" y="3" width="18" height="18" rx="2"></rect>
-                <line x1="9" y1="3" x2="9" y2="21"></line>
-              </svg>
-              <span>[ Screenshot Placeholder: Godot Importer Dock ]</span>
-            </div>
+            <img class="step-shot" src="assets/ui-importer-dock.png"
+                 alt="The Unreal Importer dock in Godot, with the layout JSON, models and textures paths and the texture size limit."
+                 width="787" height="452" loading="lazy" decoding="async">
           </div>
 
           <!-- Step 3 -->
@@ -1548,6 +1533,18 @@
     const godotPane = document.getElementById('godotPane');
     const sliderHandle = document.getElementById('sliderHandle');
     let isDragging = false;
+
+    const godotSizer = document.getElementById('godotSizer');
+
+    // Keep the clipped pane's inner image locked to the container's full width,
+    // otherwise it squashes as the pane narrows and the two halves no longer
+    // line up.
+    function syncSizerWidth() {
+      godotSizer.style.setProperty('--slider-w', sliderContainer.getBoundingClientRect().width + 'px');
+    }
+    syncSizerWidth();
+    window.addEventListener('resize', syncSizerWidth);
+    if (window.ResizeObserver) new ResizeObserver(syncSizerWidth).observe(sliderContainer);
 
     function updateSliderPosition(clientX) {
       const rect = sliderContainer.getBoundingClientRect();
