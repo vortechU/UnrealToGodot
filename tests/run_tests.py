@@ -18,6 +18,7 @@ HARNESS_DIR = os.path.join(TESTS_DIR, "godot_harness")
 PROJECT_DIR = os.path.join(HARNESS_DIR, "_project")
 
 PY_TESTS = ["test_math.py", "test_layout.py", "test_tscn_writer.py", "test_materials.py",
+            "test_texture_export.py",
             # Opens a real Tk window; skips itself when there is no display.
             "test_exporter_gui.py"]
 

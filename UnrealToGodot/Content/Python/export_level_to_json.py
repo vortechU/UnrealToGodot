@@ -824,43 +824,14 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                 textures_dir = os.path.join(parent_dir, "textures")
                 os.makedirs(textures_dir, exist_ok=True)
                 
-                tasks = []
-                skipped_existing = 0
-                for tex in collected_textures:
-                    if not tex or not isinstance(tex, unreal.Texture):
-                        continue
-                    tex_name = tex.get_name()
-                    filename = os.path.join(textures_dir, f"{tex_name}.png")
-
-                    # Already on disk (typically written moments ago by the mesh
-                    # export). Re-encoding a 4K PNG to produce identical bytes is
-                    # the single most expensive thing here.
-                    if skip_existing_textures and os.path.exists(filename):
-                        skipped_existing += 1
-                        exported_textures_count += 1
-                        continue
-
-                    task = unreal.AssetExportTask()
-                    task.object = tex
-                    task.filename = filename
-                    task.automated = True
-                    task.prompt = False
-                    task.replace_identical = True
-                    
-                    if hasattr(unreal, "TextureExporterPNG"):
-                        task.exporter = unreal.TextureExporterPNG()
-                        
-                    tasks.append(task)
-                    
-                if skipped_existing:
-                    unreal.log(f"Reusing {skipped_existing} texture(s) already exported to: {textures_dir}")
-                if tasks:
-                    unreal.log(f"Exporting {len(tasks)} level textures to: {textures_dir}")
-                    unreal.Exporter.run_asset_export_tasks(tasks)
-                    # Verify on disk
-                    for task in tasks:
-                        if os.path.exists(task.filename):
-                            exported_textures_count += 1
+                # skip_existing_textures reuses PNGs the mesh export wrote moments
+                # ago -- re-encoding a 4K PNG to produce identical bytes is the
+                # single most expensive thing here.
+                result = ue2g_common.export_textures_to_png(
+                    collected_textures, textures_dir, skip_existing=skip_existing_textures
+                )
+                ue2g_common.log_texture_export_result(result, textures_dir)
+                exported_textures_count = len(result["exported"]) + len(result["reused"])
             except Exception as tex_err:
                 unreal.log_warning(f"Failed to export level textures: {str(tex_err)}")
 

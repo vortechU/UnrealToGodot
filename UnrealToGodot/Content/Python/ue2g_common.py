@@ -20,6 +20,8 @@ the conversion, so every transform in the layout JSON stays consistent.
 """
 
 import hashlib
+import os
+
 import unreal
 
 CM_TO_M = 0.01
@@ -350,6 +352,88 @@ def iter_base_material_textures(material):
                 except Exception:
                     name = ""
             yield name, tex
+
+
+def export_textures_to_png(textures, textures_dir, skip_existing=False):
+    """Writes each texture's SOURCE art to <textures_dir>/<name>.png.
+
+    Returns {"exported": [names], "reused": [names], "unsupported": [names]}.
+    Callers should report "unsupported" -- those materials arrive in Godot
+    without that map, and ue2g_diagnose flags the dangling .gltf image URIs.
+
+    NEVER assign AssetExportTask.exporter here. Forcing
+    unreal.TextureExporterPNG() skips the engine's own compatibility check:
+    RunAssetExportTask only verifies the exporter's SupportedClass, so a
+    Texture2D whose SOURCE art is float (imported from .exr/.hdr) passes the
+    class check and reaches UTextureExporterGeneric::ExportBinary, which does
+    check(SupportsTexture(Texture)) -- an assert that takes the whole editor
+    down with no catchable exception. Three .exr-sourced normal maps in the
+    TreatmentStation pack (T_Concrete_2_N, T_Concrete_3_N, T_Damage_Concrete_N)
+    killed every "Export Everything" run this way.
+
+    Leaving the exporter unset makes the engine pick one via SupportsObject().
+    For a supported texture that is TextureExporterPNG and the bytes are
+    identical (verified byte-for-byte on UE 5.7.4); for an unsupported one it
+    logs a warning and moves on to the next task instead of asserting.
+    """
+    result = {"exported": [], "reused": [], "unsupported": []}
+    tasks = []
+
+    for tex in textures:
+        if tex is None:
+            continue
+        # Only 2D textures have PNG-writable source art. Cubemaps, render
+        # targets, arrays and volume textures have no single-image form, so
+        # drop them here rather than let the engine warn once per task.
+        if not isinstance(tex, unreal.Texture2D):
+            result["unsupported"].append(safe_get_name(tex))
+            continue
+
+        name = safe_get_name(tex)
+        filename = os.path.join(textures_dir, "%s.png" % name)
+
+        if skip_existing and os.path.exists(filename):
+            result["reused"].append(name)
+            continue
+
+        task = unreal.AssetExportTask()
+        task.object = tex
+        task.filename = filename
+        task.automated = True
+        task.prompt = False
+        task.replace_identical = True
+        # task.exporter is deliberately left unset -- see the docstring.
+        tasks.append((name, filename, task))
+
+    if tasks:
+        unreal.Exporter.run_asset_export_tasks([t[2] for t in tasks])
+        # The batch keeps going past a failure, so the file on disk is the only
+        # reliable per-texture verdict.
+        for name, filename, _task in tasks:
+            if os.path.isfile(filename):
+                result["exported"].append(name)
+            else:
+                result["unsupported"].append(name)
+
+    return result
+
+
+def log_texture_export_result(result, textures_dir):
+    """Logs the counts from export_textures_to_png, naming anything skipped."""
+    if result["reused"]:
+        unreal.log("Reusing %d texture(s) already exported to: %s"
+                   % (len(result["reused"]), textures_dir))
+    if result["exported"]:
+        unreal.log("Exported %d texture(s) to: %s" % (len(result["exported"]), textures_dir))
+    if result["unsupported"]:
+        unreal.log_warning(
+            "%d texture(s) could not be written as PNG and were skipped: %s. "
+            "Unreal's PNG exporter only handles 8/16-bit source art, so textures "
+            "imported from .exr/.hdr (and cubemaps) have no PNG form. Materials "
+            "using them import into Godot without that map -- re-import the "
+            "texture in Unreal from an 8/16-bit source to include it."
+            % (len(result["unsupported"]), ", ".join(sorted(result["unsupported"])))
+        )
 
 
 def safe_get_name(obj):

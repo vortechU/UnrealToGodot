@@ -497,6 +497,8 @@ def export_textures_for_meshes(meshes, export_dir, separate_textures=True):
     maps read back with a constant 0 blue channel. The Godot importer dock caps
     textures instead, and can shrink these files on disk. See
     docs/texture-sizing.md.
+
+    Returns the ue2g_common.export_textures_to_png result dict.
     """
     collected_textures = set()
     for mesh in meshes:
@@ -512,8 +514,8 @@ def export_textures_for_meshes(meshes, export_dir, separate_textures=True):
                 collect_textures_from_material(mat_interface, collected_textures)
                 
     if not collected_textures:
-        return
-        
+        return {"exported": [], "reused": [], "unsupported": []}
+
     export_dir = os.path.normpath(export_dir)
     if separate_textures:
         parent_dir = os.path.dirname(export_dir)
@@ -522,26 +524,10 @@ def export_textures_for_meshes(meshes, export_dir, separate_textures=True):
         textures_dir = export_dir
     os.makedirs(textures_dir, exist_ok=True)
     
-    tasks = []
-    for tex in collected_textures:
-        tex_name = tex.get_name()
-        filename = os.path.join(textures_dir, f"{tex_name}.png")
-
-        task = unreal.AssetExportTask()
-        task.object = tex
-        task.filename = filename
-        task.automated = True
-        task.prompt = False
-        task.replace_identical = True
-
-        if hasattr(unreal, "TextureExporterPNG"):
-            task.exporter = unreal.TextureExporterPNG()
-
-        tasks.append(task)
-
-    if tasks:
-        unreal.log(f"Exporting {len(tasks)} referenced textures to: {textures_dir}")
-        unreal.Exporter.run_asset_export_tasks(tasks)
+    unreal.log(f"Exporting {len(collected_textures)} referenced textures to: {textures_dir}")
+    result = ue2g_common.export_textures_to_png(collected_textures, textures_dir)
+    ue2g_common.log_texture_export_result(result, textures_dir)
+    return result
 
 def copy_exports_to_godot(export_dir, meshes_exported, separate_textures, godot_project_dir, export_names=None):
     if not godot_project_dir or not os.path.isdir(godot_project_dir):
