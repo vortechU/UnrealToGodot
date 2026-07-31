@@ -89,6 +89,14 @@ def main():
         if not report_godot_results(code):
             failed.append("godot_headless_import")
 
+        # Environment/exposure mapping. A plain SceneTree script, so unlike the
+        # layout harness it does not need -e; it exercises import_environment.gd
+        # against real Godot Environment/CameraAttributes objects, which the
+        # Python-side tests cannot reach.
+        if run([args.godot, "--headless", "--path", PROJECT_DIR,
+                "--script", "res://env_test.gd"]) != 0:
+            failed.append("godot_environment_mapping")
+
         # Skips itself when there are no real exports to work on, so it costs
         # nothing on a machine that has never run the Unreal probe.
         if run([sys.executable, os.path.join(TESTS_DIR, "test_texture_shrink.py"),

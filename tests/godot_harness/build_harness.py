@@ -345,4 +345,10 @@ func _dump(n: Node, depth: int) -> void:
 with open(os.path.join(HARNESS, "test_import.gd"), "w", encoding="utf-8") as f:
     f.write(TEST_GD)
 
+# The environment/exposure checks are a standalone SceneTree script (they need no
+# EditorScript and no imported assets), kept as a real file rather than a string
+# so it stays editable. run_tests.py runs it as its own Godot invocation.
+shutil.copy(os.path.join(os.path.dirname(os.path.abspath(__file__)), "env_test.gd"),
+            os.path.join(HARNESS, "env_test.gd"))
+
 print("harness built at:", HARNESS)

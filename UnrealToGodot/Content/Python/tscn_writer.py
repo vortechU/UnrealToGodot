@@ -113,6 +113,61 @@ def _num(value, default=0.0):
         return default
 
 
+def _clamp(value, low, high):
+    """Clamps to [low, high]; the .tscn twin of GDScript's clampf()."""
+    return low if value < low else (high if value > high else value)
+
+
+# ---------------------------------------------------------------------------
+# Environment constants. These MIRROR addons/unreal_importer/import_environment.gd
+# -- the .tscn writer and the runtime addon build the same WorldEnvironment from
+# the same layout, and they are only consistent because these agree. Change one,
+# change the other; tests/test_tscn_writer.py checks them against each other.
+# ---------------------------------------------------------------------------
+_TONEMAP_ACES = 3               # Environment.TONE_MAPPER_ACES
+_UE_DEFAULT_EXPOSURE_BIAS = 1.0
+_MIDDLE_GREY = 0.18
+_ISO_REFERENCE = 100.0
+_EXPOSURE_SPEED_SCALE = 0.5 / 3.0
+
+
+def _exposure_for_settings(settings):
+    """Maps a volume's exposure settings to (tonemap_exposure | None, camera-attr lines).
+
+    The Python twin of import_environment.gd::_apply_exposure -- see that function
+    for why locked / ranged / bias-only are three different shapes. The second
+    element is non-empty only for a real adaptation range, since Godot models auto
+    exposure on CameraAttributes rather than on Environment.
+    """
+    has_bias = settings.get("exposure_bias") is not None
+    bias = _num(settings.get("exposure_bias"), _UE_DEFAULT_EXPOSURE_BIAS)
+    bias_scale = 2.0 ** bias
+
+    min_raw = settings.get("exposure_min_brightness")
+    max_raw = settings.get("exposure_max_brightness")
+    if min_raw is None or max_raw is None:
+        return (bias_scale if has_bias else None), []
+
+    min_lum = max(_num(min_raw, 1.0), 0.0001)
+    max_lum = max(_num(max_raw, 1.0), 0.0001)
+
+    if abs(min_lum - max_lum) <= 1e-6 * max(1.0, abs(min_lum), abs(max_lum)):
+        # Locked exposure ("manual"): no auto exposure, just the fixed multiplier.
+        return _clamp(_MIDDLE_GREY / min_lum * bias_scale, 0.0, 64.0), []
+
+    # Sensitivity is inverse to target luminance, so min/max swap sides.
+    lines = [
+        "auto_exposure_enabled = true",
+        "auto_exposure_min_sensitivity = " + _f(_clamp(_ISO_REFERENCE / max_lum, 0.0, 64000.0)),
+        "auto_exposure_max_sensitivity = " + _f(_clamp(_ISO_REFERENCE / min_lum, 0.0, 64000.0)),
+    ]
+    if settings.get("exposure_speed_up") is not None:
+        lines.append("auto_exposure_speed = "
+                     + _f(max(_num(settings.get("exposure_speed_up"), 3.0)
+                              * _EXPOSURE_SPEED_SCALE, 0.01)))
+    return bias_scale, lines
+
+
 def _f(value, default=0.0):
     """Format a float compactly but precisely (shortest round-trip repr). Godot accepts
     plain decimals and scientific notation."""
@@ -790,14 +845,23 @@ class _TscnWriter(object):
                 if sky_light.get("color") is not None:
                     env_lines.append("ambient_light_color = " + _color_literal(sky_light.get("color")))
                 env_lines.append("ambient_light_energy = "
-                                 + _f(_num(sky_light.get("intensity"), 1.0)))
+                                 + _f(_clamp(_num(sky_light.get("intensity"), 1.0), 0.0, 16.0)))
         else:
             env_lines.append("background_mode = 1")
             env_lines.append("background_color = Color(0, 0, 0, 1)")
 
-        # Tonemap exposure = 2^exposure_bias
-        if settings.get("exposure_bias") is not None:
-            env_lines.append("tonemap_exposure = " + _f(2.0 ** _num(settings.get("exposure_bias"))))
+        # Tonemapper: unconditional, because Unreal never renders linear. Mirrors
+        # import_environment.gd's UNREAL_TONEMAP (Environment.TONE_MAPPER_ACES == 3).
+        env_lines.append("tonemap_mode = %d" % _TONEMAP_ACES)
+
+        # Exposure. Mirrors import_environment.gd::_apply_exposure -- see the
+        # constants there for why each branch does what it does.
+        cam_attr_id = None
+        exposure, cam_attr_lines = _exposure_for_settings(settings)
+        if exposure is not None:
+            env_lines.append("tonemap_exposure = " + _f(exposure))
+        if cam_attr_lines:
+            cam_attr_id = self._register_sub("CameraAttributesPractical", cam_attr_lines)
 
         # Glow (bloom)
         if settings.get("bloom_intensity") is not None:
@@ -807,12 +871,16 @@ class _TscnWriter(object):
             if bt is not None and _num(bt) >= 0.0:
                 env_lines.append("glow_hdr_threshold = " + _f(_num(bt)))
 
-        # SSAO
+        # SSAO. The *2.0 and the 0.01 m floor match import_environment.gd; this
+        # path used to write the raw UE intensity, so the same level came out
+        # half as occluded through the .tscn exporter as through the addon.
         if settings.get("ao_intensity") is not None:
             env_lines.append("ssao_enabled = true")
-            env_lines.append("ssao_intensity = " + _f(_num(settings.get("ao_intensity"), 1.0)))
+            env_lines.append("ssao_intensity = "
+                             + _f(_clamp(_num(settings.get("ao_intensity"), 0.5) * 2.0, 0.0, 16.0)))
             if settings.get("ao_radius") is not None:
-                env_lines.append("ssao_radius = " + _f(_num(settings.get("ao_radius")) * 0.01))
+                env_lines.append("ssao_radius = "
+                                 + _f(max(0.01, _num(settings.get("ao_radius"), 200.0) * 0.01)))
 
         # Color adjustments (saturation / contrast are stored as [r,g,b,a]; Godot wants scalars)
         sat = settings.get("saturation")
@@ -824,16 +892,24 @@ class _TscnWriter(object):
             if isinstance(con, (list, tuple)) and con:
                 env_lines.append("adjustment_contrast = " + _f(_avg3(con)))
 
-        # Height fog -> Godot depth fog (density heuristic * 5.0, documented in SCHEMA_V2)
+        # Height fog -> Godot depth fog. The heuristic is `fog_density * 0.5`, so
+        # UE's default 0.02 lands on Godot's default 0.01 (SCHEMA_V2.md). This
+        # path had *5.0, making every .tscn export TEN TIMES foggier than the
+        # same layout imported through the addon.
         if isinstance(height_fog, dict):
             env_lines.append("fog_enabled = true")
-            env_lines.append("fog_density = " + _f(_num(height_fog.get("fog_density"), 0.01) * 5.0))
+            env_lines.append("fog_density = "
+                             + _f(_clamp(_num(height_fog.get("fog_density"), 0.02) * 0.5, 0.0, 1.0)))
             if height_fog.get("color") is not None:
                 env_lines.append("fog_light_color = " + _color_literal(height_fog.get("color")))
+            env_lines.append("fog_height_density = "
+                             + _f(_clamp(_num(height_fog.get("fog_height_falloff"), 0.2), 0.0, 1.0)))
 
         env_id = self._register_sub("Environment", env_lines)
-        self._add_node("WorldEnvironment", "WorldEnvironment", root_path,
-                       props=['environment = SubResource("%s")' % env_id])
+        env_props = ['environment = SubResource("%s")' % env_id]
+        if cam_attr_id is not None:
+            env_props.append('camera_attributes = SubResource("%s")' % cam_attr_id)
+        self._add_node("WorldEnvironment", "WorldEnvironment", root_path, props=env_props)
 
     # --- decals ------------------------------------------------------------------------------
     def _build_decals(self, root_path):

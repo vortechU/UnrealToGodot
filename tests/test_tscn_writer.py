@@ -1,4 +1,5 @@
 """Synthetic end-to-end test for tscn_writer.py (runs without Unreal)."""
+import io
 import os
 import re
 import sys
@@ -221,6 +222,70 @@ assert near([inst0[0], inst0[1], inst0[2]], [0.0, 0.0, 1.0]) \
 assert near([inst0[3], inst0[7], inst0[11]], [1.0, 0.0, 1.0]), \
     f"foliage instance 0 origin must be preserved at (1,0,1), got {inst0}"
 print("axis fix OK: Rock_1 basis Ry(135), CrateB basis Ry(180), foliage inst0 Ry(90)")
+
+# ---------------------------------------------------------------------------
+# Environment: the .tscn writer and the runtime addon are SEPARATE
+# implementations of the same mapping. They drifted apart once (fog was 10x
+# denser here than in the addon, and this path wrote the raw UE AO intensity),
+# so pin the shared constants against the GDScript source and check the three
+# exposure shapes.
+# ---------------------------------------------------------------------------
+GD_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "addons", "unreal_importer", "import_environment.gd")
+gd = io.open(GD_PATH, encoding="utf-8").read() if os.path.exists(GD_PATH) else ""
+assert gd, "import_environment.gd not found; cannot cross-check the environment mapping"
+
+def gd_const(name):
+    m = re.search(r"^const\s+%s\s*:?=\s*([^\n#]+)" % re.escape(name), gd, re.M)
+    assert m, "constant %s missing from import_environment.gd" % name
+    return m.group(1).strip()
+
+def gd_num(name):
+    return eval(gd_const(name), {"__builtins__": {}}, {})
+
+assert gd_const("UNREAL_TONEMAP") == "Environment.TONE_MAPPER_ACES",     "addon tonemapper changed to %s but tscn_writer still writes ACES(%d)" % (
+        gd_const("UNREAL_TONEMAP"), tscn_writer._TONEMAP_ACES)
+for gd_name, py_value in (("UE_DEFAULT_EXPOSURE_BIAS", tscn_writer._UE_DEFAULT_EXPOSURE_BIAS),
+                          ("MIDDLE_GREY", tscn_writer._MIDDLE_GREY),
+                          ("ISO_REFERENCE", tscn_writer._ISO_REFERENCE),
+                          ("EXPOSURE_SPEED_SCALE", tscn_writer._EXPOSURE_SPEED_SCALE)):
+    assert abs(gd_num(gd_name) - py_value) < 1e-9,         "%s: addon says %s, tscn_writer says %s" % (gd_name, gd_num(gd_name), py_value)
+# The two scalar heuristics that actually diverged, read straight out of the addon.
+assert 'Common.get_num(fog, "fog_density", 0.02) * 0.5' in gd,     "addon fog density heuristic changed; tscn_writer's *0.5 no longer matches"
+assert 'Common.get_num(settings, "ao_intensity", 0.5) * 2.0' in gd,     "addon ssao intensity heuristic changed; tscn_writer's *2.0 no longer matches"
+print("environment constants agree with import_environment.gd")
+
+# Exposure mapping, all four shapes.
+def exposure(**kw):
+    return tscn_writer._exposure_for_settings(kw)
+
+exp, attrs = exposure()
+assert exp is None and attrs == [], f"no exposure settings -> no overrides, got {exp} {attrs}"
+exp, attrs = exposure(exposure_bias=0.5)
+assert abs(exp - 2.0 ** 0.5) < 1e-9 and attrs == [], f"bias-only must stay 2^bias, got {exp}"
+# The TreatmentStation case: locked at 3.0 cd/m^2 with no bias override.
+exp, attrs = exposure(exposure_min_brightness=3.0, exposure_max_brightness=3.0)
+assert attrs == [], "a locked exposure must NOT enable Godot auto exposure"
+assert abs(exp - (0.18 / 3.0 * 2.0)) < 1e-9, f"locked exposure must be 0.18/L*2^bias, got {exp}"
+# A real adaptation range -> auto exposure, with the sensitivities swapped.
+exp, attrs = exposure(exposure_min_brightness=0.5, exposure_max_brightness=4.0,
+                      exposure_bias=0.0, exposure_speed_up=3.0)
+joined = " ".join(attrs)
+assert "auto_exposure_enabled = true" in joined, joined
+assert "auto_exposure_min_sensitivity = 25.0" in joined, f"100/max_lum expected, got {joined}"
+assert "auto_exposure_max_sensitivity = 200.0" in joined, f"100/min_lum expected, got {joined}"
+assert "auto_exposure_speed = 0.5" in joined, f"UE default speed must land on Godot's, got {joined}"
+assert abs(exp - 1.0) < 1e-9, f"ranged exposure keeps 2^bias, got {exp}"
+print("exposure mapping OK: bias-only, locked, and ranged all map distinctly")
+
+# And the values actually reach the written scene.
+env_blk = re.search(r'\[sub_resource type="Environment"[^\]]*\](.*?)(?=\n\[)', text, re.S).group(1)
+assert "tonemap_mode = 3" in env_blk, "ACES tonemapper must always be written:\n" + env_blk
+fog_written = float(re.search(r"fog_density = ([0-9.eE+-]+)", env_blk).group(1))
+assert abs(fog_written - 0.01) < 1e-9,     f"UE default fog 0.02 must land on Godot's default 0.01, got {fog_written}"
+ssao_written = float(re.search(r"ssao_intensity = ([0-9.eE+-]+)", env_blk).group(1))
+assert abs(ssao_written - 1.0) < 1e-9, f"ao_intensity 0.5 must double to 1.0, got {ssao_written}"
+print("environment block OK: tonemap ACES, fog 0.02->0.01, ssao 0.5->1.0")
 
 print(f"OK: {ext_count} ext_resources, {sub_count} sub_resources, {len(nodes)} nodes, load_steps={load_steps}")
 print("--- excerpt ---")

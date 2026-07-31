@@ -11,10 +11,44 @@ extends RefCounted
 # - light_energy = godot_energy (pre-converted by the exporter) * light_energy_scale
 # - UE exponential height fog density (~0.02 default) -> Godot fog_density * 0.5
 # - UE AO radius is exported in cm -> * 0.01 m; UE AO intensity (0..1) -> ssao_intensity * 2.0
-# - Exposure bias (EV) -> tonemap_exposure = 2^bias
+# - Exposure: see _apply_exposure below.
+#
+# These heuristics are duplicated in tscn_writer.py (_build_environment), which
+# produces the same WorldEnvironment for the .tscn export path. The two drifted
+# apart once already -- fog was 10x denser on the .tscn side -- so any change
+# here must be mirrored there, and tests/test_tscn_writer.py pins the shared
+# constants below against it.
 # ==============================================================================
 
 const Common = preload("res://addons/unreal_importer/import_common.gd")
+
+# Godot renders linear by default; Unreal never does. Without this every import
+# arrived flat and washed out no matter what the grade said -- and the old code
+# only set a tonemapper when an exposure BIAS happened to be overridden, which
+# most volumes do not do. ACES rather than AGX: UE5's default film curve is
+# ACES-derived, so it is the closer match (AGX is noticeably more desaturating).
+const UNREAL_TONEMAP := Environment.TONE_MAPPER_ACES
+
+# UE's PostProcessSettings default for auto_exposure_bias, applied when a volume
+# locks its exposure without also overriding the bias.
+const UE_DEFAULT_EXPOSURE_BIAS := 1.0
+
+# Scene-referred middle grey. UE's auto exposure drives the average scene
+# luminance to this, so a volume locked at L cd/m^2 is asking for an exposure
+# multiplier of MIDDLE_GREY / L. With no lock the baseline is 1.0 (auto exposure
+# normalises for itself) and only the bias applies -- which is what the previous
+# `2^bias` behaviour assumed, so bias-only volumes are unchanged by this.
+const MIDDLE_GREY := 0.18
+
+# Luminance (cd/m^2) that maps to ISO 100 when handing UE's adaptation RANGE to
+# Godot's auto exposure. Sensitivity is inversely proportional to the target
+# luminance, so UE's MIN brightness becomes Godot's MAX sensitivity.
+const ISO_REFERENCE := 100.0
+
+# UE's auto_exposure_speed_up/down default to 3.0 and Godot's auto_exposure_speed
+# to 0.5; this factor lines the two defaults up so an unremarkable UE setup
+# adapts at Godot's normal rate.
+const EXPOSURE_SPEED_SCALE := 0.5 / 3.0
 
 
 func apply(data: Dictionary, root: Node, scene_owner: Node, options: Dictionary) -> Dictionary:
@@ -117,6 +151,10 @@ func _apply_environment(data: Dictionary, root: Node, scene_owner: Node, warning
 		return 0
 
 	var env := Environment.new()
+	# Unconditional: Unreal never renders with a linear tonemapper, so matching it
+	# is not something only a graded level needs.
+	env.tonemap_mode = UNREAL_TONEMAP
+	var camera_attributes: CameraAttributes = null
 
 	# Sky / ambient
 	if (sky_light is Dictionary) or has_atmosphere:
@@ -126,7 +164,14 @@ func _apply_environment(data: Dictionary, root: Node, scene_owner: Node, warning
 		env.sky = sky
 		env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
 		if sky_light is Dictionary:
+			if sky_light.get("color") != null:
+				env.ambient_light_color = Common.color_from_array(sky_light.get("color"), Color.WHITE)
 			env.ambient_light_energy = clampf(Common.get_num(sky_light, "intensity", 1.0), 0.0, 16.0)
+	else:
+		# No sky: an explicit black background rather than whatever clear colour the
+		# project happens to carry. Matches tscn_writer.py's else-branch.
+		env.background_mode = Environment.BG_COLOR
+		env.background_color = Color(0, 0, 0, 1)
 
 	# Post-process settings from the winning unbound volume
 	if not best.is_empty():
@@ -142,9 +187,7 @@ func _apply_environment(data: Dictionary, root: Node, scene_owner: Node, warning
 			env.ssao_intensity = clampf(Common.get_num(settings, "ao_intensity", 0.5) * 2.0, 0.0, 16.0)
 			if settings.get("ao_radius") != null:
 				env.ssao_radius = maxf(0.01, Common.get_num(settings, "ao_radius", 200.0) * 0.01)
-		if settings.get("exposure_bias") != null:
-			env.tonemap_mode = Environment.TONE_MAPPER_FILMIC
-			env.tonemap_exposure = pow(2.0, Common.get_num(settings, "exposure_bias", 0.0))
+		camera_attributes = _apply_exposure(settings, env)
 		var saturation = settings.get("saturation")
 		var contrast = settings.get("contrast")
 		if saturation != null or contrast != null:
@@ -166,8 +209,52 @@ func _apply_environment(data: Dictionary, root: Node, scene_owner: Node, warning
 	var world_env := WorldEnvironment.new()
 	world_env.name = "UnrealEnvironment"
 	world_env.environment = env
+	if camera_attributes != null:
+		world_env.camera_attributes = camera_attributes
 	Common.add_owned_child(root, world_env, scene_owner)
 	return 1
+
+
+func _apply_exposure(settings: Dictionary, env: Environment) -> CameraAttributes:
+	# Unreal expresses exposure three ways and they compose:
+	#   bias                        an EV offset, always in play
+	#   min/max brightness equal    exposure LOCKED to that luminance (manual)
+	#   min/max brightness differ   auto exposure clamped to that range
+	# Returns a CameraAttributes for the third case (Godot models auto exposure
+	# there, not on Environment) and null otherwise, since Godot applies no auto
+	# exposure at all unless one is attached -- which is exactly what a locked or
+	# unspecified UE exposure means.
+	var has_bias: bool = settings.get("exposure_bias") != null
+	var bias := Common.get_num(settings, "exposure_bias", UE_DEFAULT_EXPOSURE_BIAS)
+	var bias_scale := pow(2.0, bias)
+
+	var min_raw = settings.get("exposure_min_brightness")
+	var max_raw = settings.get("exposure_max_brightness")
+	if min_raw == null or max_raw == null:
+		# Bias-only (or nothing): the pre-existing behaviour, deliberately kept.
+		if has_bias:
+			env.tonemap_exposure = bias_scale
+		return null
+
+	var min_lum := maxf(Common.get_num(settings, "exposure_min_brightness", 1.0), 0.0001)
+	var max_lum := maxf(Common.get_num(settings, "exposure_max_brightness", 1.0), 0.0001)
+
+	if is_equal_approx(min_lum, max_lum):
+		# Locked. This is the case that used to vanish entirely.
+		env.tonemap_exposure = clampf(MIDDLE_GREY / min_lum * bias_scale, 0.0, 64.0)
+		return null
+
+	# A real adaptation range -> Godot's auto exposure. Sensitivity is inverse to
+	# target luminance, so the min/max swap sides here.
+	env.tonemap_exposure = bias_scale
+	var attrs := CameraAttributesPractical.new()
+	attrs.auto_exposure_enabled = true
+	attrs.auto_exposure_min_sensitivity = clampf(ISO_REFERENCE / max_lum, 0.0, 64000.0)
+	attrs.auto_exposure_max_sensitivity = clampf(ISO_REFERENCE / min_lum, 0.0, 64000.0)
+	if settings.get("exposure_speed_up") != null:
+		attrs.auto_exposure_speed = maxf(
+			Common.get_num(settings, "exposure_speed_up", 3.0) * EXPOSURE_SPEED_SCALE, 0.01)
+	return attrs
 
 
 func _apply_decals(decals, root: Node, scene_owner: Node, options: Dictionary, warnings: PackedStringArray) -> int:

@@ -228,6 +228,10 @@ the importer/user can re-derive.
         "ao_radius": 200.0 | null,          // UE cm
         "exposure_bias": 1.0 | null,
         "exposure_method": "auto" | "manual" | null,
+        "exposure_min_brightness": 3.0 | null,   // UE cd/m^2 adaptation range
+        "exposure_max_brightness": 3.0 | null,   // min == max means LOCKED exposure
+        "exposure_speed_up": 3.0 | null,
+        "exposure_speed_down": 3.0 | null,
         "white_temp": 6500.0 | null,
         "saturation": [r,g,b,a] | null,
         "contrast": [r,g,b,a] | null,
@@ -240,6 +244,29 @@ Only settings whose `override_*` flag is set in Unreal are non-null.
 Godot: one `WorldEnvironment` from the highest-priority unbound volume
 (glow, ssao, tonemap exposure, adjustments). Bound volumes: skipped for
 WorldEnvironment but still listed.
+
+`tonemap_mode` is **always** set to `TONE_MAPPER_ACES`, graded volume or not:
+Unreal never renders with a linear tonemapper, so Godot's linear default is
+wrong for every import, not just graded ones. ACES over AGX because UE5's
+default film curve is ACES-derived.
+
+Exposure composes from three things, and they map to different Godot objects:
+
+| UE | Godot |
+| --- | --- |
+| `exposure_bias` only | `tonemap_exposure = 2^bias` |
+| `min_brightness == max_brightness` (locked/manual) | `tonemap_exposure = 0.18 / L * 2^bias`, no auto exposure |
+| `min_brightness < max_brightness` (range) | `CameraAttributesPractical` with `auto_exposure_enabled`, `tonemap_exposure = 2^bias` |
+
+0.18 is scene-referred middle grey, the average luminance UE's auto exposure
+drives towards. In the range case sensitivity is **inverse** to target luminance,
+so UE's *min* brightness becomes Godot's *max* sensitivity (`100.0 / L`), and
+`speed_up` is scaled by `0.5/3.0` to line the two engines' defaults up.
+
+Both consumers -- `addons/unreal_importer/import_environment.gd` and
+`tscn_writer.py::_build_environment` -- must produce the same environment from the
+same layout. They are separate implementations, so the constants are pinned
+against each other by `tests/test_tscn_writer.py`.
 
 ## height_fog / sky_light / has_sky_atmosphere
 

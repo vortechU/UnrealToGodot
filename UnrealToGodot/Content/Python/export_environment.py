@@ -328,6 +328,20 @@ def _build_post_process_entry(actor):
         "exposure_method": _pp_field(
             settings, "override_auto_exposure_method", "auto_exposure_method", _map_exposure_method
         ),
+        # The auto-exposure adaptation range, in UE's cd/m^2. Shipping only the
+        # BIAS was not enough: a volume that locks exposure by setting
+        # min_brightness == max_brightness (the standard "manual exposure"
+        # idiom, and the single most visually dominant setting a grade can
+        # carry) overrides NEITHER the bias nor the method, so the whole grade
+        # exported as null and Godot fell back to a linear tonemapper.
+        "exposure_min_brightness": _pp_field(
+            settings, "override_auto_exposure_min_brightness", "auto_exposure_min_brightness"),
+        "exposure_max_brightness": _pp_field(
+            settings, "override_auto_exposure_max_brightness", "auto_exposure_max_brightness"),
+        "exposure_speed_up": _pp_field(
+            settings, "override_auto_exposure_speed_up", "auto_exposure_speed_up"),
+        "exposure_speed_down": _pp_field(
+            settings, "override_auto_exposure_speed_down", "auto_exposure_speed_down"),
         "white_temp": _pp_field(settings, "override_white_temp", "white_temp"),
         "saturation": _pp_field(settings, "override_color_saturation", "color_saturation", _vec4_to_list),
         "contrast": _pp_field(settings, "override_color_contrast", "color_contrast", _vec4_to_list),
