@@ -386,6 +386,30 @@ func _on_texture_limit_changed(_index: int) -> void:
 	status_label.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6))
 
 
+func _texture_search_folders() -> PackedStringArray:
+	## Every folder the material binder resolves textures from, deduplicated.
+	##
+	## Capping only the Textures Folder left 4K art in the models folder and in the
+	## textures/ folder beside the layout JSON -- both of which the binder happily
+	## loads, so the import-time out-of-memory this guards against still happened.
+	var folders := PackedStringArray()
+	var seen := {}
+	var candidates := [textures_edit.text, models_edit.text,
+		json_edit.text.get_base_dir().path_join("textures")]
+	for folder in candidates:
+		var clean := str(folder).strip_edges().simplify_path()
+		if clean == "" or not DirAccess.dir_exists_absolute(clean):
+			continue
+		# "res://textures" and "res://textures/" are the same folder; shrinking it
+		# twice would resample already-resampled art.
+		var key := clean.trim_suffix("/") if clean != "res://" else clean
+		if seen.has(key):
+			continue
+		seen[key] = true
+		folders.append(clean)
+	return folders
+
+
 func _on_import_pressed() -> void:
 	# 1. Get the current active scene root
 	var scene_root: Node = EditorInterface.get_edited_scene_root()
@@ -402,20 +426,29 @@ func _on_import_pressed() -> void:
 	await get_tree().process_frame
 
 	var tex_limit := _selected_texture_limit()
+	var tex_folders := _texture_search_folders()
 
 	# Shrink the exported PNGs first, so the reimport below reads the small ones
 	# rather than importing 4K art and then throwing most of it away.
 	if tex_limit > 0 and shrink_files_check and shrink_files_check.button_pressed:
 		status_label.text = "Status: shrinking texture files to %dpx..." % tex_limit
 		await get_tree().process_frame
-		var shrunk: Dictionary = TextureLimit.shrink_source_files(textures_edit.text, tex_limit)
-		if int(shrunk.get("shrunk", 0)) > 0:
-			var saved_mb := float(int(shrunk["bytes_before"]) - int(shrunk["bytes_after"])) / 1048576.0
+		var total_shrunk := 0
+		var total_seen := 0
+		var total_failed := 0
+		var saved_bytes := 0
+		for folder in tex_folders:
+			var shrunk: Dictionary = TextureLimit.shrink_source_files(folder, tex_limit)
+			total_shrunk += int(shrunk.get("shrunk", 0))
+			total_seen += int(shrunk.get("total", 0))
+			total_failed += int(shrunk.get("failed", 0))
+			saved_bytes += int(shrunk.get("bytes_before", 0)) - int(shrunk.get("bytes_after", 0))
+		if total_shrunk > 0:
 			print("Unreal Importer: shrank %d/%d texture file(s) to %dpx, freeing %.1f MB on disk"
-				% [shrunk["shrunk"], shrunk["total"], tex_limit, saved_mb])
-		if int(shrunk.get("failed", 0)) > 0:
+				% [total_shrunk, total_seen, tex_limit, float(saved_bytes) / 1048576.0])
+		if total_failed > 0:
 			push_warning("Unreal Importer: %d texture file(s) could not be shrunk; see warnings above"
-				% shrunk["failed"])
+				% total_failed)
 		var shrink_fs := EditorInterface.get_resource_filesystem()
 		while shrink_fs and shrink_fs.is_scanning():
 			await get_tree().process_frame
@@ -424,16 +457,21 @@ func _on_import_pressed() -> void:
 	# default only affects future imports, so anything transferred in before
 	# the limit was chosen is still sitting there at full 4K.
 	if tex_limit > 0:
-		var capped: Dictionary = TextureLimit.apply_to_folder(textures_edit.text, tex_limit)
-		if int(capped.get("changed", 0)) > 0:
-			status_label.text = "Status: capping %d texture(s) to %dpx..." % [capped["changed"], tex_limit]
+		var total_capped := 0
+		var total_textures := 0
+		for folder in tex_folders:
+			var capped: Dictionary = TextureLimit.apply_to_folder(folder, tex_limit)
+			total_capped += int(capped.get("changed", 0))
+			total_textures += int(capped.get("total", 0))
+		if total_capped > 0:
+			status_label.text = "Status: capping %d texture(s) to %dpx..." % [total_capped, tex_limit]
 			await get_tree().process_frame
 			# Let the queued reimports finish before materials load the textures.
 			var fs := EditorInterface.get_resource_filesystem()
 			while fs and fs.is_scanning():
 				await get_tree().process_frame
 			print("Unreal Importer: capped %d/%d texture(s) to %dpx"
-				% [capped["changed"], capped["total"], tex_limit])
+				% [total_capped, total_textures, tex_limit])
 
 	# Instantiate our importer class. Note that since we invoke do_import() directly
 	# and pass the scene root, we bypass the need for EditorScript's get_scene() context.

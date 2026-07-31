@@ -70,7 +70,15 @@ def configure_gltf_export_options(export_options, export_animations):
     )
 
 
-def inject_texture_references(gltf_path, params_by_material, textures_rel="../textures"):
+def _clamp01(value, default):
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def inject_texture_references(gltf_path, params_by_material, textures_rel="../textures",
+                              texture_names_by_path=None):
     """Points a .gltf's materials at the separately exported source textures.
 
     With baking disabled the exporter emits materials by name but no images, so a
@@ -83,11 +91,21 @@ def inject_texture_references(gltf_path, params_by_material, textures_rel="../te
     filename only ever resolves as a sibling -- which is exactly how the earlier
     baked-then-relocated PNGs ended up orphaned.
 
+    texture_names_by_path maps texture asset path -> exported filename stem, so a
+    name shared by two different texture assets still resolves to the file that
+    actually holds its art (see ue2g_common.build_export_name_map).
+
     Only base color and normal are wired. The packed roughness/metallic/AO map
     cannot go in as-is: glTF's metallicRoughness expects G=roughness/B=metallic,
     and Unreal's RMA is R=roughness/G=metallic, so a direct reference would render
     with the channels swapped. The layout importer handles that map properly via
     Godot's per-channel selectors; this is preview dressing only.
+
+    The PBR *factors* are written even when no texture is: glTF's spec defaults
+    are metallicFactor 1.0 / roughnessFactor 1.0, so a material the exporter
+    emitted without a pbrMetallicRoughness block renders fully metallic -- every
+    mesh chrome, both in a standalone preview and anywhere the .gltf is instanced
+    directly (the .tscn path, which does no material rebuild of its own).
 
     Returns the number of materials it touched.
     """
@@ -125,26 +143,55 @@ def inject_texture_references(gltf_path, params_by_material, textures_rel="../te
         uri_to_texture[uri] = len(textures) - 1
         return len(textures) - 1
 
+    def final_name(params, slot):
+        """The exported filename stem for one texture slot, or "" when unset."""
+        name = params.get(slot)
+        if not name:
+            return ""
+        if texture_names_by_path:
+            path = (params.get("texture_paths") or {}).get(slot)
+            if path:
+                return texture_names_by_path.get(path, name)
+        return name
+
     touched = 0
     for mat in materials:
         params = params_by_material.get(mat.get("name"))
         if not params:
             continue
-        changed = False
 
-        albedo = params.get("albedo_texture")
+        pbr = mat.setdefault("pbrMetallicRoughness", {})
+
+        albedo = final_name(params, "albedo_texture")
         if albedo:
-            pbr = mat.setdefault("pbrMetallicRoughness", {})
             pbr["baseColorTexture"] = {"index": texture_index(albedo)}
-            changed = True
 
-        normal = params.get("normal_texture")
+        normal = final_name(params, "normal_texture")
         if normal:
             mat["normalTexture"] = {"index": texture_index(normal)}
-            changed = True
 
-        if changed:
-            touched += 1
+        color = params.get("albedo_color")
+        if isinstance(color, (list, tuple)) and len(color) >= 3:
+            alpha = color[3] if len(color) > 3 else 1.0
+            pbr["baseColorFactor"] = [_clamp01(color[0], 1.0), _clamp01(color[1], 1.0),
+                                      _clamp01(color[2], 1.0), _clamp01(alpha, 1.0)]
+
+        # With a packed map present the scalars are pass-through multipliers for a
+        # texture that cannot be injected here (channel order), so writing them
+        # would say "fully metallic" rather than "driven by a map". Fall back to
+        # neutral dielectric values for the preview instead.
+        roughness = params.get("roughness")
+        metallic = params.get("metallic")
+        channels = params.get("packed_channels") or {}
+        if params.get("packed_texture"):
+            if "roughness" in channels:
+                roughness = 1.0
+            if "metallic" in channels:
+                metallic = 0.0
+        pbr["roughnessFactor"] = _clamp01(roughness, 0.5)
+        pbr["metallicFactor"] = _clamp01(metallic, 0.0)
+
+        touched += 1
 
     if touched == 0:
         return 0
@@ -186,7 +233,8 @@ def material_params_for_mesh(mesh):
     return out
 
 
-def inject_textures_for_exported_mesh(mesh, export_dir, mesh_name, separate_textures):
+def inject_textures_for_exported_mesh(mesh, export_dir, mesh_name, separate_textures,
+                                      texture_names_by_path=None):
     """Injects source-texture references into every .gltf just exported for a mesh."""
     params_by_material = material_params_for_mesh(mesh)
     if not params_by_material:
@@ -201,7 +249,8 @@ def inject_textures_for_exported_mesh(mesh, export_dir, mesh_name, separate_text
             continue
         try:
             n = inject_texture_references(os.path.join(export_dir, filename),
-                                          params_by_material, textures_rel)
+                                          params_by_material, textures_rel,
+                                          texture_names_by_path)
             if n:
                 unreal.log(f"Wired source textures into {filename} ({n} material(s))")
         except Exception as e:
@@ -487,7 +536,39 @@ def get_mesh_lod_count(mesh):
             pass
     return 1
 
-def export_textures_for_meshes(meshes, export_dir, separate_textures=True):
+def collect_textures_for_meshes(meshes):
+    """Returns the set of every texture the given meshes' materials reference."""
+    collected_textures = set()
+    for mesh in meshes:
+        if isinstance(mesh, unreal.StaticMesh):
+            slots = mesh.get_editor_property("static_materials") or []
+        elif hasattr(unreal, "SkeletalMesh") and isinstance(mesh, unreal.SkeletalMesh):
+            slots = mesh.get_editor_property("materials") or []
+        else:
+            continue
+        for slot in slots:
+            collect_textures_from_material(slot.material_interface, collected_textures)
+    return collected_textures
+
+
+def build_texture_name_map(meshes):
+    """Collision-safe export filenames for a mesh batch's textures.
+
+    Returns ({texture: name}, {asset_path: name}); the second is what the .gltf
+    injection needs, since a material's parameters only remember the asset NAME.
+    """
+    textures = collect_textures_for_meshes(meshes)
+    by_asset = ue2g_common.build_export_name_map(textures, kind="texture")
+    by_path = {}
+    for tex, name in by_asset.items():
+        try:
+            by_path[tex.get_path_name()] = name
+        except Exception:
+            continue
+    return by_asset, by_path
+
+
+def export_textures_for_meshes(meshes, export_dir, separate_textures=True, name_map=None):
     """Writes every texture the given meshes reference, at its source size.
 
     There is no resolution cap here on purpose. This used to set each texture's
@@ -500,19 +581,7 @@ def export_textures_for_meshes(meshes, export_dir, separate_textures=True):
 
     Returns the ue2g_common.export_textures_to_png result dict.
     """
-    collected_textures = set()
-    for mesh in meshes:
-        if isinstance(mesh, unreal.StaticMesh):
-            static_materials = mesh.get_editor_property("static_materials")
-            for static_mat in static_materials:
-                mat_interface = static_mat.material_interface
-                collect_textures_from_material(mat_interface, collected_textures)
-        elif hasattr(unreal, "SkeletalMesh") and isinstance(mesh, unreal.SkeletalMesh):
-            skeletal_materials = mesh.get_editor_property("materials")
-            for skel_mat in skeletal_materials:
-                mat_interface = skel_mat.material_interface
-                collect_textures_from_material(mat_interface, collected_textures)
-                
+    collected_textures = collect_textures_for_meshes(meshes)
     if not collected_textures:
         return {"exported": [], "reused": [], "unsupported": []}
 
@@ -525,11 +594,13 @@ def export_textures_for_meshes(meshes, export_dir, separate_textures=True):
     os.makedirs(textures_dir, exist_ok=True)
     
     unreal.log(f"Exporting {len(collected_textures)} referenced textures to: {textures_dir}")
-    result = ue2g_common.export_textures_to_png(collected_textures, textures_dir)
+    result = ue2g_common.export_textures_to_png(collected_textures, textures_dir,
+                                                name_map=name_map)
     ue2g_common.log_texture_export_result(result, textures_dir)
     return result
 
-def copy_exports_to_godot(export_dir, meshes_exported, separate_textures, godot_project_dir, export_names=None):
+def copy_exports_to_godot(export_dir, meshes_exported, separate_textures, godot_project_dir,
+                          export_names=None, texture_names=None):
     if not godot_project_dir or not os.path.isdir(godot_project_dir):
         return
     if export_names is None:
@@ -583,18 +654,15 @@ def copy_exports_to_godot(export_dir, meshes_exported, separate_textures, godot_
         textures_dir = export_dir
         
     if os.path.exists(textures_dir):
-        collected_textures = set()
-        for mesh in meshes_exported:
-            if isinstance(mesh, unreal.StaticMesh):
-                static_materials = mesh.get_editor_property("static_materials")
-                for static_mat in static_materials:
-                    collect_textures_from_material(static_mat.material_interface, collected_textures)
-            elif hasattr(unreal, "SkeletalMesh") and isinstance(mesh, unreal.SkeletalMesh):
-                skeletal_materials = mesh.get_editor_property("materials")
-                for skel_mat in skeletal_materials:
-                    collect_textures_from_material(skel_mat.material_interface, collected_textures)
-                    
-        tex_names = {t.get_name() for t in collected_textures if isinstance(t, unreal.Texture)}
+        collected_textures = collect_textures_for_meshes(meshes_exported)
+        # Match the files that were actually written, which for a colliding asset
+        # name is "<name>_<path-hash>.png" rather than the bare asset name.
+        tex_names = set()
+        for t in collected_textures:
+            if not isinstance(t, unreal.Texture):
+                continue
+            name = (texture_names or {}).get(t)
+            tex_names.add(name or ue2g_common.sanitize_name(t.get_name()))
         
         for filename in os.listdir(textures_dir):
             base_name, ext = os.path.splitext(filename)
@@ -730,7 +798,11 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
     failed_exports = []
     exported_meshes = []
     # Deterministic collision-safe export filenames (asset packs often reuse mesh names)
-    export_names = ue2g_common.build_export_name_map(meshes_to_export)
+    export_names = ue2g_common.build_export_name_map(meshes_to_export, kind="mesh")
+    # Texture filenames are disambiguated the same way, and the map has to exist
+    # BEFORE the first .gltf is written: the uris injected into it must name the
+    # files the texture export is going to produce.
+    texture_names, texture_names_by_path = build_texture_name_map(meshes_to_export)
     
     selected_actors = set() # Empty set because we are exporting static mesh assets, not world actors
     
@@ -808,12 +880,14 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
             
             if mesh_has_exported:
                 exported_meshes.append(mesh)
-                inject_textures_for_exported_mesh(mesh, export_dir, mesh_name, separate_textures)
+                inject_textures_for_exported_mesh(mesh, export_dir, mesh_name,
+                                                  separate_textures, texture_names_by_path)
 
     # Automatically export referenced textures
     if exported_count > 0:
         try:
-            export_textures_for_meshes(meshes_to_export, export_dir, separate_textures)
+            export_textures_for_meshes(meshes_to_export, export_dir, separate_textures,
+                                       name_map=texture_names)
         except Exception as tex_err:
             unreal.log_warning(f"Failed to export textures for meshes: {str(tex_err)}")
 
@@ -831,7 +905,8 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
 
         if godot_project_dir:
             try:
-                copy_exports_to_godot(export_dir, exported_meshes, separate_textures, godot_project_dir, export_names)
+                copy_exports_to_godot(export_dir, exported_meshes, separate_textures,
+                                      godot_project_dir, export_names, texture_names)
             except Exception as copy_err:
                 unreal.log_warning(f"Failed to auto-transfer exports to Godot: {str(copy_err)}")
 
@@ -949,7 +1024,11 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
     failed_exports = []
     exported_meshes = []
     # Deterministic collision-safe export filenames (asset packs often reuse mesh names)
-    export_names = ue2g_common.build_export_name_map(meshes_to_export)
+    export_names = ue2g_common.build_export_name_map(meshes_to_export, kind="mesh")
+    # Texture filenames are disambiguated the same way, and the map has to exist
+    # BEFORE the first .gltf is written: the uris injected into it must name the
+    # files the texture export is going to produce.
+    texture_names, texture_names_by_path = build_texture_name_map(meshes_to_export)
     selected_actors = set()
     
     with unreal.ScopedSlowTask(len(meshes_to_export), "Batch Exporting Level Meshes to glTF...") as slow_task:
@@ -1021,12 +1100,14 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
             
             if mesh_has_exported:
                 exported_meshes.append(mesh)
-                inject_textures_for_exported_mesh(mesh, export_dir, mesh_name, separate_textures)
+                inject_textures_for_exported_mesh(mesh, export_dir, mesh_name,
+                                                  separate_textures, texture_names_by_path)
 
     # Automatically export referenced textures
     if exported_count > 0:
         try:
-            export_textures_for_meshes(meshes_to_export, export_dir, separate_textures)
+            export_textures_for_meshes(meshes_to_export, export_dir, separate_textures,
+                                       name_map=texture_names)
         except Exception as tex_err:
             unreal.log_warning(f"Failed to export textures for meshes: {str(tex_err)}")
 
@@ -1044,7 +1125,8 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
 
         if godot_project_dir:
             try:
-                copy_exports_to_godot(export_dir, exported_meshes, separate_textures, godot_project_dir, export_names)
+                copy_exports_to_godot(export_dir, exported_meshes, separate_textures,
+                                      godot_project_dir, export_names, texture_names)
             except Exception as copy_err:
                 unreal.log_warning(f"Failed to auto-transfer exports to Godot: {str(copy_err)}")
 

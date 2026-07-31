@@ -354,8 +354,62 @@ def iter_base_material_textures(material):
             yield name, tex
 
 
-def export_textures_to_png(textures, textures_dir, skip_existing=False):
-    """Writes each texture's SOURCE art to <textures_dir>/<name>.png.
+def _iter_base_material_parameters(material, names_getter, value_getter):
+    """Yields (parameter_name, default_value) for one base-material parameter kind.
+
+    Both getters are MaterialEditingLibrary method names. Everything is guarded:
+    an engine that does not expose them simply yields nothing, exactly as the
+    texture walk above degrades.
+    """
+    if not material:
+        return
+    mel = getattr(unreal, "MaterialEditingLibrary", None)
+    if mel is None or not hasattr(mel, names_getter) or not hasattr(mel, value_getter):
+        return
+    try:
+        names = getattr(mel, names_getter)(material) or []
+    except Exception as e:
+        unreal.log_warning(
+            "Could not read %s from base material %s: %s"
+            % (names_getter, safe_get_name(material), str(e))
+        )
+        return
+    for pname in names:
+        try:
+            value = getattr(mel, value_getter)(material, pname)
+        except Exception:
+            continue
+        if value is not None:
+            yield str(pname), value
+
+
+def iter_base_material_scalars(material):
+    """Yields (parameter_name, float) for a *base* Material's scalar parameter defaults.
+
+    A base material has no scalar_parameter_values array -- that only exists on a
+    MaterialInstance, and holds its OVERRIDES. Without this, a mesh whose slot
+    points straight at a base material exported with the schema defaults
+    (roughness 0.5 / metallic 0.0) no matter what the material actually says.
+    """
+    return _iter_base_material_parameters(
+        material, "get_scalar_parameter_names", "get_material_default_scalar_parameter_value")
+
+
+def iter_base_material_vectors(material):
+    """Yields (parameter_name, LinearColor) for a *base* Material's vector defaults."""
+    return _iter_base_material_parameters(
+        material, "get_vector_parameter_names", "get_material_default_vector_parameter_value")
+
+
+def export_textures_to_png(textures, textures_dir, skip_existing=False, name_map=None):
+    """Writes each texture's SOURCE art to <textures_dir>/<export name>.png.
+
+    name_map is the {texture: export_name} dict from build_export_name_map. Pass
+    it whenever the filenames end up referenced from somewhere else (a layout
+    JSON, a .gltf uri): two different textures sharing an asset name would
+    otherwise write to the same file, and every material naming that texture
+    would bind whichever art was written last. Without a map the bare asset name
+    is used, which is only safe for a throwaway one-off export.
 
     Returns {"exported": [names], "reused": [names], "unsupported": [names]}.
     Callers should report "unsupported" -- those materials arrive in Godot
@@ -389,7 +443,11 @@ def export_textures_to_png(textures, textures_dir, skip_existing=False):
             result["unsupported"].append(safe_get_name(tex))
             continue
 
-        name = safe_get_name(tex)
+        name = None
+        if name_map:
+            name = name_map.get(tex)
+        if not name:
+            name = sanitize_name(safe_get_name(tex))
         filename = os.path.join(textures_dir, "%s.png" % name)
 
         if skip_existing and os.path.exists(filename):
@@ -458,33 +516,46 @@ def sanitize_name(name):
     return result if result else "Unnamed"
 
 
-def build_export_name_map(meshes):
+def build_export_name_map(assets, kind="asset"):
     """
-    Returns {mesh_asset: export_name} for a batch of mesh assets.
+    Returns {asset: export_name} for a batch of assets (meshes or textures).
 
     Unique names are kept as-is; when several different assets share a name
     (common in large asset packs), EVERY colliding asset gets a deterministic
     "<name>_<8-char-path-hash>" suffix so exported files never overwrite each
     other, regardless of iteration order.
+
+    kind only names the assets in the collision warning. That warning matters:
+    a silent collision is invisible downstream -- every reference still resolves,
+    just to the wrong art -- so the log is the only place it ever surfaces.
     """
     groups = {}
-    for mesh in meshes:
-        if not mesh:
+    for asset in assets:
+        if not asset:
             continue
         try:
-            name = sanitize_name(mesh.get_name())
+            name = sanitize_name(asset.get_name())
         except Exception:
             continue
-        groups.setdefault(name, []).append(mesh)
+        groups.setdefault(name, []).append(asset)
 
     result = {}
+    collisions = []
     for name, group in groups.items():
         if len(group) == 1:
             result[group[0]] = name
         else:
-            for mesh in group:
+            collisions.append(name)
+            for asset in group:
                 try:
-                    result[mesh] = "%s_%s" % (name, short_path_hash(mesh.get_path_name()))
+                    result[asset] = "%s_%s" % (name, short_path_hash(asset.get_path_name()))
                 except Exception:
-                    result[mesh] = name
+                    result[asset] = name
+
+    if collisions:
+        unreal.log_warning(
+            "%d %s name(s) are used by more than one asset and were exported with a "
+            "path-hash suffix so they do not overwrite each other: %s"
+            % (len(collisions), kind, ", ".join(sorted(collisions)))
+        )
     return result

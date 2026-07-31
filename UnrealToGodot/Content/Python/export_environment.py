@@ -487,6 +487,11 @@ def _decal_transform(actor):
     return std
 
 
+# Godot's Decal.TEXTURE_ORM channel order. Matches _PACKED_LAYOUTS["orm"]/["arm"]
+# in export_level_to_json; any other packing (RMA, MRA) cannot be bound to a Decal.
+_GODOT_DECAL_ORM_CHANNELS = {"ao": 0, "roughness": 1, "metallic": 2}
+
+
 def _build_decal_entry(actor, collected_textures):
     try:
         comp = actor.get_component_by_class(unreal.DecalComponent)
@@ -513,7 +518,8 @@ def _build_decal_entry(actor, collected_textures):
     material = ue2g_common.safe_get_prop(comp, "decal_material", None)
     material_name = "None"
     material_path = "None"
-    textures = {"albedo": None, "normal": None, "orm": None, "emission": None}
+    textures = {"albedo": None, "normal": None, "orm": None, "emission": None,
+                "texture_paths": {}}
 
     if material is not None:
         try:
@@ -525,15 +531,34 @@ def _build_decal_entry(actor, collected_textures):
         try:
             params = extract_material_parameters(material, collected_textures)
             if params:
+                paths = params.get("texture_paths") or {}
                 textures["albedo"] = params.get("albedo_texture")
                 textures["normal"] = params.get("normal_texture")
-                # extract_material_parameters (reused from export_level_to_json.py)
-                # has no combined ORM extraction path; approximate using the
-                # roughness texture (falling back to metallic), since decal
-                # materials commonly pack ORM channels into that slot.
-                # extract_material_parameters also has no emissive extraction
-                # path at all, so "emission" is deliberately left null.
-                textures["orm"] = params.get("roughness_texture") or params.get("metallic_texture")
+                for key, slot in (("albedo", "albedo_texture"), ("normal", "normal_texture")):
+                    if paths.get(slot):
+                        textures["texture_paths"][key] = paths[slot]
+
+                # Godot's Decal.TEXTURE_ORM slot is hard-wired to R=AO,
+                # G=roughness, B=metallic and exposes no per-channel selectors
+                # (unlike BaseMaterial3D), so ONLY a map already in that order
+                # can be bound. A standalone greyscale roughness map has the
+                # roughness value in all three channels, which would read back
+                # as AO=roughness (backwards -- rougher gets less occlusion) and
+                # metallic=roughness (a 0.9-rough concrete decal renders as
+                # chrome). Binding nothing is strictly better than that.
+                # extract_material_parameters has no emissive extraction path at
+                # all, so "emission" is deliberately left null.
+                packed = params.get("packed_texture")
+                if packed and params.get("packed_channels") == _GODOT_DECAL_ORM_CHANNELS:
+                    textures["orm"] = packed
+                    if paths.get("packed_texture"):
+                        textures["texture_paths"]["orm"] = paths["packed_texture"]
+                elif packed:
+                    _log_actor_warning(
+                        actor, "decal ORM map skipped",
+                        "'{}' is packed as {} but Godot decals require ORM order "
+                        "(R=AO, G=roughness, B=metallic)".format(
+                            packed, params.get("packed_channels")))
         except Exception as e:
             _log_actor_warning(actor, "failed to extract decal material parameters", e)
 

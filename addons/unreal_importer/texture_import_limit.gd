@@ -25,6 +25,8 @@ extends RefCounted
 ##      disk stays 4K, so the project keeps carrying gigabytes it never uses --
 ##      shrink_source_files() is what actually reclaims the disk space.
 
+const Common = preload("res://addons/unreal_importer/import_common.gd")
+
 const IMPORTER_DEFAULTS := "importer_defaults/texture"
 
 
@@ -50,10 +52,14 @@ static func find_textures(folder: String) -> PackedStringArray:
 		return out
 	for f in dir.get_files():
 		# .import is Godot's own metadata; the source image is what we reimport.
+		# The list is Common.IMAGE_EXTENSIONS deliberately: anything the material
+		# binder can resolve must also be cappable, or a 4K .dds slips through and
+		# the import-time OOM this class exists to prevent comes straight back.
 		var lower := f.to_lower()
-		if lower.ends_with(".png") or lower.ends_with(".jpg") or lower.ends_with(".jpeg") \
-				or lower.ends_with(".tga") or lower.ends_with(".webp") or lower.ends_with(".bmp"):
-			out.append(folder.path_join(f))
+		for ext in Common.IMAGE_EXTENSIONS:
+			if lower.ends_with(ext):
+				out.append(folder.path_join(f))
+				break
 	return out
 
 

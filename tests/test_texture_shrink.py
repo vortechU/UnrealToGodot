@@ -70,6 +70,13 @@ func _run() -> void:
 	var limit: int = dock._selected_texture_limit()
 	lines.append("CHECK selected_limit=%d" % limit)
 
+	# The cap has to cover every folder the material binder resolves from, not
+	# just the Textures Folder -- 4K art left in models/ still blows the importer
+	# up. res://models/ does not exist here, and the layout JSON sits at the
+	# project root so its textures/ IS res://textures/: one entry, deduplicated
+	# (simplify_path drops the trailing slash).
+	lines.append("CHECK search_folders=%s" % ",".join(dock._texture_search_folders()))
+
 	var TextureLimit = load("res://addons/unreal_importer/texture_import_limit.gd")
 
 	# Assert the fixture really is oversized before shrinking it. Without this,
@@ -148,7 +155,11 @@ def build_project(root, textures, limit, whole_addon=False):
             if f.endswith((".gd", ".cfg")):
                 shutil.copy(os.path.join(os.path.dirname(LIMIT_GD), f), os.path.join(addon, f))
     else:
-        shutil.copy(LIMIT_GD, os.path.join(addon, "texture_import_limit.gd"))
+        # texture_import_limit preloads import_common for the shared image
+        # extension list, and a failed preload takes the whole script with it.
+        for name in ("texture_import_limit.gd", "import_common.gd"):
+            shutil.copy(os.path.join(os.path.dirname(LIMIT_GD), name),
+                        os.path.join(addon, name))
     with open(os.path.join(root, "test_shrink.gd"), "w") as f:
         f.write(TEST_GD.replace("__LIMIT__", str(limit)))
     for src in textures:
@@ -201,6 +212,8 @@ def run_dock_leg(godot, textures, limit):
             "shrink_checkbox_exists=true",
             "shrink_default_on=true",
             "selected_limit=%d" % limit,
+            # Existing folders only, and no folder listed twice.
+            "search_folders=res://textures",
             # Guards against a false pass: if something already shrank the
             # fixture, shrunk=0 below would otherwise look like a broken feature.
             "fixture_oversized=%d of %d" % (n, n),

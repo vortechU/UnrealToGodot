@@ -323,9 +323,68 @@ def audit_models(rep, models_dir, layout, strict=True):
             rep.ok("every mesh referenced by the layout has a .gltf")
 
 
-def audit_textures(rep, tex_dir):
+IMAGE_EXTENSIONS = (".png", ".tga", ".jpg", ".jpeg", ".dds", ".exr", ".webp")
+
+
+def layout_texture_names(layout):
+    """Every texture filename stem the layout references, from all three places."""
+    names = set()
+
+    def _add(params, keys):
+        if not isinstance(params, dict):
+            return
+        for key in keys:
+            value = params.get(key)
+            if isinstance(value, str) and value:
+                names.add(value)
+
+    slots = ("albedo_texture", "normal_texture", "roughness_texture",
+             "metallic_texture", "packed_texture")
+    for mesh in (layout.get("meshes") or {}).values():
+        for mat in mesh.get("materials", []) or []:
+            _add(mat.get("parameters"), slots)
+    for actor in layout.get("actors") or []:
+        for comp in actor.get("components", []) or []:
+            for override in comp.get("material_overrides", []) or []:
+                _add(override.get("parameters"), slots)
+    for decal in layout.get("decals") or []:
+        _add(decal.get("textures"), ("albedo", "normal", "orm", "emission"))
+    return names
+
+
+def audit_texture_references(rep, tex_dir, layout):
+    """Checks that every texture the layout names actually exists on disk.
+
+    Texture filenames are disambiguated per export run (a name shared by two
+    assets gets a path-hash suffix), so a layout exported after a mesh export
+    that saw a different set of textures can name a file that was never written.
+    The material then imports without that map and nothing else notices.
+    """
+    if not layout:
+        return
+    wanted = layout_texture_names(layout)
+    if not wanted:
+        return
+    present = set()
+    if os.path.isdir(tex_dir):
+        for f in os.listdir(tex_dir):
+            stem, ext = os.path.splitext(f)
+            if ext.lower() in IMAGE_EXTENSIONS:
+                present.add(stem.lower())
+    missing = sorted(n for n in wanted if n.lower() not in present)
+    if missing:
+        rep.warn("%d texture(s) named by the layout are not in %s (e.g. %s). "
+                 "Those materials import without that map. Re-run the texture "
+                 "export, or re-export the layout so the two agree."
+                 % (len(missing), tex_dir, ", ".join(missing[:5])))
+    else:
+        rep.ok("every texture the layout names is present (%d)" % len(wanted))
+
+
+def audit_textures(rep, tex_dir, layout=None):
     """Sizes and dimensions -- predicts the Godot import segfault before it happens."""
     rep.section("Textures")
+    audit_texture_references(rep, tex_dir, layout)
     if not os.path.isdir(tex_dir):
         rep.warn("no textures folder at %s -- models will import untextured." % tex_dir)
         return
@@ -504,7 +563,7 @@ def diagnose(export_dir, godot_project=None, strict=True, out_path=None):
 
     layout = audit_layout(rep, layout_path, strict=strict)
     audit_models(rep, models, layout, strict=strict)
-    audit_textures(rep, textures)
+    audit_textures(rep, textures, layout)
     if godot_project:
         audit_godot_project(rep, godot_project)
 

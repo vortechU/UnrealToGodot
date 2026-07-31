@@ -82,6 +82,7 @@ been tried; the flag is only known to work for the texture probe.
 | `godot_harness/` | Builds a throwaway Godot project (minimal glTF, fixture `level_layout.json`) and runs `import_unreal_layout.gd` for real, asserting where nodes land. |
 | `test_texture_shrink.py` | Drives `texture_import_limit.shrink_source_files` in headless Godot against real 4K exports, then checks the pixels with PIL: capped dimensions, and no channel collapsed to a constant. The normal map's blue channel is the case that matters — see `docs/texture-sizing.md`. |
 | `probe_unreal_api.py` | Run *inside* Unreal to confirm `GLTFExportOptions` property names exist on your engine version. |
+| `probe_material_params.py` | Run *inside* Unreal to confirm the `MaterialEditingLibrary` getters that read a **base** material's scalar/vector/texture parameter defaults exist, and to dump what they return for a real master material. Verified on 5.7.4. |
 | `probe_texture_export_routes.py` | Run *inside* Unreal (needs `-AllowCommandletRendering`) to re-check why no Unreal route resizes textures. Pair with `compare_texture_exports.py`, which does the pixel verdict on the host. |
 
 ## Driving the engines headlessly

@@ -243,14 +243,116 @@ def resolve_texture_role(param_name, tex_name):
     return None, None
 
 
+# UV tiling is spelled a dozen ways across packs, and arrives as either a scalar
+# (uniform) or a Vector2/LinearColor (per-axis). Reading only the scalar form left
+# every pack using the very common Vector2 "Tiling" parameter at [1, 1].
+_TILING_TOKENS = ("tiling", "uvscale", "uv_scale", "uvtiling", "texturescale")
+
+# Vector parameters whose name contains "color" but which are NOT the base colour
+# tint. Without this, a material instance that only overrides "EmissiveColor"
+# (or SpecularColor, or "SSS Color") has that colour applied as the albedo tint of
+# every mesh using it -- the mesh comes into Godot stained with its glow colour.
+_NON_ALBEDO_VECTOR_TOKENS = ("emissive", "emission", "specular", "subsurface",
+                             "sss", "fresnel", "refraction", "rim")
+
+
+def classify_scalar_parameter(name):
+    """Maps a scalar parameter name to its parameters[] key, else None."""
+    lowered = str(name or "").lower()
+    if "roughness" in lowered or lowered == "rough":
+        return "roughness"
+    if "metallic" in lowered or lowered == "metal":
+        return "metallic"
+    for token in _TILING_TOKENS:
+        if token in lowered:
+            return "tiling"
+    return None
+
+
+def classify_vector_parameter(name):
+    """Maps a vector parameter name to its parameters[] key, else None.
+
+    Tiling is checked before colour: "UV Tiling Color" style names exist, and a
+    tiling parameter read as a tint is the more damaging misread of the two.
+    """
+    lowered = str(name or "").lower()
+    for token in _TILING_TOKENS:
+        if token in lowered:
+            return "tiling"
+    for token in _NON_ALBEDO_VECTOR_TOKENS:
+        if token in lowered:
+            return None
+    if ("color" in lowered or "colour" in lowered
+            or "albedo" in lowered or "diffuse" in lowered):
+        return "albedo_color"
+    return None
+
+
+def _path_of(asset):
+    """Asset path name, or "" when unreadable. Used as the texture identity key."""
+    try:
+        return asset.get_path_name()
+    except Exception:
+        return ""
+
+
+def build_texture_export_names(textures):
+    """Returns ({texture: export_name}, {asset_path: export_name}) for a texture batch."""
+    by_asset = ue2g_common.build_export_name_map(textures, kind="texture")
+    by_path = {}
+    for tex, name in by_asset.items():
+        path = _path_of(tex)
+        if path:
+            by_path[path] = name
+    return by_asset, by_path
+
+
+def apply_texture_export_names(slots, name_by_path):
+    """Rewrites a dict's texture-name values to the filenames actually exported.
+
+    `slots` is either a parameters dict from extract_material_parameters or a
+    decal "textures" dict; both carry a "texture_paths" sub-dict keyed by the same
+    slot names. The recorded asset path is the only thing that survives a name
+    collision, so this is what keeps two same-named textures bound to their own art.
+    """
+    if not isinstance(slots, dict):
+        return
+    paths = slots.get("texture_paths")
+    if not isinstance(paths, dict):
+        return
+    for slot, path in paths.items():
+        final = name_by_path.get(path)
+        if final and slots.get(slot):
+            slots[slot] = final
+
+
+def finalize_layout_texture_names(layout_data, name_by_path):
+    """Applies apply_texture_export_names to every texture reference in the layout."""
+    for mesh_entry in (layout_data.get("meshes") or {}).values():
+        for mat in (mesh_entry.get("materials") or []):
+            apply_texture_export_names(mat.get("parameters"), name_by_path)
+    for actor in (layout_data.get("actors") or []):
+        for comp in (actor.get("components") or []):
+            for override in (comp.get("material_overrides") or []):
+                apply_texture_export_names(override.get("parameters"), name_by_path)
+    for decal in (layout_data.get("decals") or []):
+        apply_texture_export_names(decal.get("textures"), name_by_path)
+
+
 def extract_material_parameters(material, collected_textures=None):
     """
     Safely queries a Material Interface for PBR parameter values (scalars, vectors, textures).
-    Works on MaterialInstance assets by parsing overridden parameters.
+    Works on MaterialInstance assets by parsing overridden parameters, and on base
+    Materials by reading their parameter defaults through MaterialEditingLibrary.
+
+    Texture slots hold the texture's ASSET name at this point. The final export
+    filename is only known once the whole level has been scanned (colliding names
+    get a path-hash suffix), so "texture_paths" records which asset each slot came
+    from and apply_texture_export_names() rewrites the slots afterwards.
     """
     if not material:
         return None
-        
+
     parameters = {
         "albedo_color": [1.0, 1.0, 1.0, 1.0],
         "roughness": 0.5,
@@ -261,7 +363,8 @@ def extract_material_parameters(material, collected_textures=None):
         "metallic_texture": None,
         "packed_texture": None,
         "packed_channels": None,
-        "tiling": [1.0, 1.0]
+        "tiling": [1.0, 1.0],
+        "texture_paths": {}
     }
 
     visited = set()
@@ -271,15 +374,37 @@ def extract_material_parameters(material, collected_textures=None):
     # use a None sentinel below and need no tracking here.
     assigned = set()
 
+    def _assign_texture(param_name, tex):
+        """Classifies one sampled texture and records its slot plus its asset path."""
+        tex_name = tex.get_name()
+        role, packed = resolve_texture_role(str(param_name).lower(), tex_name)
+        if role == "packed":
+            if parameters["packed_texture"] is None:
+                parameters["packed_texture"] = tex_name
+                parameters["packed_channels"] = packed
+                parameters["texture_paths"]["packed_texture"] = _path_of(tex)
+        elif role is not None and parameters[role] is None:
+            parameters[role] = tex_name
+            parameters["texture_paths"][role] = _path_of(tex)
+
+    def _assign_scalar(key, value):
+        if key is None or key in assigned:
+            return
+        if key == "tiling":
+            parameters["tiling"] = [value, value]
+        else:
+            parameters[key] = value
+        assigned.add(key)
+
     def _extract_recursive(mat):
         if not mat or mat in visited:
             return
         visited.add(mat)
-        
+
         is_instance = isinstance(mat, unreal.MaterialInstance)
         if not is_instance and hasattr(unreal, "MaterialInstanceConstant"):
             is_instance = isinstance(mat, unreal.MaterialInstanceConstant)
-            
+
         if not is_instance:
             # Base material: extract textures from its texture parameters. UE 5.7
             # made Material.expressions unreadable from Python, so the old
@@ -288,18 +413,33 @@ def extract_material_parameters(material, collected_textures=None):
             # to the expression walk on older engines). Parameter names classify
             # by role exactly as the MaterialInstance branch below does.
             for pname, tex in ue2g_common.iter_base_material_textures(mat):
-                tex_name = tex.get_name()
                 if collected_textures is not None:
                     collected_textures.add(tex)
+                _assign_texture(pname, tex)
 
-                name = str(pname).lower()
-                role, packed = resolve_texture_role(name, tex_name)
-                if role == "packed":
-                    if parameters["packed_texture"] is None:
-                        parameters["packed_texture"] = tex_name
-                        parameters["packed_channels"] = packed
-                elif role is not None and parameters[role] is None:
-                    parameters[role] = tex_name
+            # A base material's scalars/vectors live in its parameter DEFAULTS,
+            # not in the *_parameter_values arrays a MaterialInstance carries.
+            # Reading only those arrays meant a mesh slot pointing straight at a
+            # base material imported at roughness 0.5 / metallic 0 / white,
+            # whatever the material said.
+            for pname, value in ue2g_common.iter_base_material_scalars(mat):
+                try:
+                    _assign_scalar(classify_scalar_parameter(pname), float(value))
+                except Exception:
+                    continue
+            for pname, value in ue2g_common.iter_base_material_vectors(mat):
+                key = classify_vector_parameter(pname)
+                if key is None or key in assigned:
+                    continue
+                try:
+                    if key == "tiling":
+                        parameters["tiling"] = [float(value.r), float(value.g)]
+                    else:
+                        parameters["albedo_color"] = [float(value.r), float(value.g),
+                                                      float(value.b), float(value.a)]
+                except Exception:
+                    continue
+                assigned.add(key)
             return
 
         # Material Instance: Parse overridden parameters
@@ -308,22 +448,9 @@ def extract_material_parameters(material, collected_textures=None):
             scalars = mat.get_editor_property("scalar_parameter_values")
             if scalars:
                 for s in scalars:
-                    name = str(s.parameter_info.name).lower()
-                    val = s.parameter_value
-                    
-                    if "roughness" in name or name == "rough":
-                        # Child instances are visited before parents; first explicit value wins.
-                        if "roughness" not in assigned:
-                            parameters["roughness"] = val
-                            assigned.add("roughness")
-                    elif "metallic" in name or name == "metal":
-                        if "metallic" not in assigned:
-                            parameters["metallic"] = val
-                            assigned.add("metallic")
-                    elif "tiling" in name or "uvscale" in name or "uv_scale" in name:
-                        if "tiling" not in assigned:
-                            parameters["tiling"] = [val, val]
-                            assigned.add("tiling")
+                    # Child instances are visited before parents; first explicit value wins.
+                    _assign_scalar(classify_scalar_parameter(s.parameter_info.name),
+                                   s.parameter_value)
         except Exception:
             pass
 
@@ -332,13 +459,17 @@ def extract_material_parameters(material, collected_textures=None):
             vectors = mat.get_editor_property("vector_parameter_values")
             if vectors:
                 for v in vectors:
-                    name = str(v.parameter_info.name).lower()
+                    key = classify_vector_parameter(v.parameter_info.name)
+                    if key is None or key in assigned:
+                        continue
                     val = v.parameter_value
-                    
-                    if "color" in name or "colour" in name or "albedo" in name or "diffuse" in name:
-                        if "albedo_color" not in assigned:
-                            parameters["albedo_color"] = [val.r, val.g, val.b, val.a]
-                            assigned.add("albedo_color")
+                    # A Vector2 material parameter arrives as a LinearColor with
+                    # the pair in .r/.g.
+                    if key == "tiling":
+                        parameters["tiling"] = [val.r, val.g]
+                    else:
+                        parameters["albedo_color"] = [val.r, val.g, val.b, val.a]
+                    assigned.add(key)
         except Exception:
             pass
 
@@ -347,27 +478,17 @@ def extract_material_parameters(material, collected_textures=None):
             textures = mat.get_editor_property("texture_parameter_values")
             if textures:
                 for t in textures:
-                    name = str(t.parameter_info.name).lower()
                     tex = t.parameter_value
-                    
                     if not tex:
                         continue
-                        
-                    tex_name = tex.get_name()
-                    
+
                     if collected_textures is not None and isinstance(tex, unreal.Texture):
                         collected_textures.add(tex)
-                    
+
                     # Packed maps take precedence inside the resolver: a
                     # parameter named "RMA" matches no role substring, so
                     # without that the roughness/metallic/AO set is dropped.
-                    role, packed = resolve_texture_role(name, tex_name)
-                    if role == "packed":
-                        if parameters["packed_texture"] is None:
-                            parameters["packed_texture"] = tex_name
-                            parameters["packed_channels"] = packed
-                    elif role is not None and parameters[role] is None:
-                        parameters[role] = tex_name
+                    _assign_texture(t.parameter_info.name, tex)
         except Exception:
             pass
 
@@ -641,7 +762,7 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                         unique_meshes.add(m)
         except Exception:
             continue
-    export_names = ue2g_common.build_export_name_map(unique_meshes)
+    export_names = ue2g_common.build_export_name_map(unique_meshes, kind="mesh")
 
     def register_mesh(mesh):
         """Registers a mesh in the library under its collision-safe key; returns the key."""
@@ -808,7 +929,13 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
         "foliage": foliage_data,
         "navigation": navigation_data
     }
- 
+
+    # Every texture reference above still holds a bare ASSET name. Now that the
+    # whole level has been scanned, the collision-safe export filenames are known,
+    # so rewrite the references to match the files that are about to be written.
+    texture_names, texture_names_by_path = build_texture_export_names(collected_textures)
+    finalize_layout_texture_names(layout_data, texture_names_by_path)
+
     # Write to JSON file
     try:
         with open(save_path, "w", encoding="utf-8") as f:
@@ -828,7 +955,8 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                 # ago -- re-encoding a 4K PNG to produce identical bytes is the
                 # single most expensive thing here.
                 result = ue2g_common.export_textures_to_png(
-                    collected_textures, textures_dir, skip_existing=skip_existing_textures
+                    collected_textures, textures_dir,
+                    skip_existing=skip_existing_textures, name_map=texture_names
                 )
                 ue2g_common.log_texture_export_result(result, textures_dir)
                 exported_textures_count = len(result["exported"]) + len(result["reused"])
@@ -856,7 +984,7 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                         for tex in collected_textures:
                             if not tex or not isinstance(tex, unreal.Texture):
                                 continue
-                            tex_name = tex.get_name()
+                            tex_name = texture_names.get(tex) or ue2g_common.sanitize_name(tex.get_name())
                             src_tex = os.path.join(local_textures_dir, f"{tex_name}.png")
                             if os.path.exists(src_tex):
                                 dest_tex = os.path.join(godot_textures_dir, f"{tex_name}.png")

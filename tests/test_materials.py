@@ -40,11 +40,30 @@ u.MaterialInstance = type("MaterialInstance", (), {})
 class _FakeMEL:
     @staticmethod
     def get_texture_parameter_names(material):
-        return list(material._texparams.keys())
+        return list(getattr(material, "_texparams", {}).keys())
 
     @staticmethod
     def get_material_default_texture_parameter_value(material, name):
-        return material._texparams.get(str(name))
+        return getattr(material, "_texparams", {}).get(str(name))
+
+    # Scalar/vector defaults come from the same library. A base Material has no
+    # *_parameter_values arrays (those hold a MaterialInstance's overrides), so
+    # without these its roughness/metallic/tint never reach the layout JSON.
+    @staticmethod
+    def get_scalar_parameter_names(material):
+        return list(getattr(material, "_scalarparams", {}).keys())
+
+    @staticmethod
+    def get_material_default_scalar_parameter_value(material, name):
+        return getattr(material, "_scalarparams", {}).get(str(name))
+
+    @staticmethod
+    def get_vector_parameter_names(material):
+        return list(getattr(material, "_vectorparams", {}).keys())
+
+    @staticmethod
+    def get_material_default_vector_parameter_value(material, name):
+        return getattr(material, "_vectorparams", {}).get(str(name))
 
 
 u.MaterialEditingLibrary = _FakeMEL
@@ -143,11 +162,15 @@ class _TexParam:
 
 
 class _Tex(u.Texture):
-    def __init__(self, name):
+    def __init__(self, name, path=None):
         self._n = name
+        self._p = path or ("/Game/Textures/%s.%s" % (name, name))
 
     def get_name(self):
         return self._n
+
+    def get_path_name(self):
+        return self._p
 
 
 class _MI(u.MaterialInstance):
@@ -363,6 +386,272 @@ no_images = os.path.join(tmp, "noimg.gltf")
 with open(no_images, "w", encoding="utf-8") as f:
     json.dump({"asset": {"version": "2.0"}}, f)
 check("gltf with no images returns 0", EX.retarget_gltf_textures(no_images) == 0)
+
+print("\n=== 3. Texture name collisions must not bind the wrong art ===")
+# Two asset packs shipping a texture called T_Concrete_D used to write the same
+# T_Concrete_D.png -- last write won, and BOTH packs' materials then bound
+# whichever art landed there. Nothing downstream noticed: the uri resolved fine.
+tex_a = _Tex("T_Concrete_D", "/Game/PackA/T_Concrete_D.T_Concrete_D")
+tex_b = _Tex("T_Concrete_D", "/Game/PackB/T_Concrete_D.T_Concrete_D")
+tex_solo = _Tex("T_Unique_D", "/Game/PackA/T_Unique_D.T_Unique_D")
+
+by_asset, by_path = EL.build_texture_export_names([tex_a, tex_b, tex_solo])
+check("colliding textures get different filenames",
+      by_asset[tex_a] != by_asset[tex_b], by_asset)
+check("both colliding names keep the original as a prefix",
+      by_asset[tex_a].startswith("T_Concrete_D_") and by_asset[tex_b].startswith("T_Concrete_D_"),
+      by_asset)
+check("a unique texture name is left alone", by_asset[tex_solo] == "T_Unique_D")
+check("the path map agrees with the asset map",
+      by_path["/Game/PackA/T_Concrete_D.T_Concrete_D"] == by_asset[tex_a], by_path)
+
+
+def _albedo_mi(tex):
+    return _MI({"texture_parameter_values": [_TexParam("Diff", tex)],
+                "scalar_parameter_values": [], "vector_parameter_values": [], "parent": None})
+
+
+p_a = EL.extract_material_parameters(_albedo_mi(tex_a))
+p_b = EL.extract_material_parameters(_albedo_mi(tex_b))
+check("extraction records which asset each slot came from",
+      p_a["texture_paths"]["albedo_texture"] == "/Game/PackA/T_Concrete_D.T_Concrete_D",
+      p_a["texture_paths"])
+
+EL.apply_texture_export_names(p_a, by_path)
+EL.apply_texture_export_names(p_b, by_path)
+check("each material now names its OWN file",
+      p_a["albedo_texture"] != p_b["albedo_texture"],
+      (p_a["albedo_texture"], p_b["albedo_texture"]))
+check("pack A binds pack A's art", p_a["albedo_texture"] == by_asset[tex_a])
+check("pack B binds pack B's art", p_b["albedo_texture"] == by_asset[tex_b])
+
+# The whole-layout walk has to reach mesh materials, component overrides and decals.
+layout = {
+    "meshes": {"SM_Wall": {"materials": [
+        {"parameters": EL.extract_material_parameters(_albedo_mi(tex_a))}]}},
+    "actors": [{"components": [{"material_overrides": [
+        {"parameters": EL.extract_material_parameters(_albedo_mi(tex_b))}]}]}],
+    "decals": [{"textures": {"albedo": "T_Concrete_D", "normal": None, "orm": None,
+                             "emission": None,
+                             "texture_paths": {"albedo": tex_b.get_path_name()}}}],
+}
+EL.finalize_layout_texture_names(layout, by_path)
+check("mesh material references are finalized",
+      layout["meshes"]["SM_Wall"]["materials"][0]["parameters"]["albedo_texture"] == by_asset[tex_a],
+      layout["meshes"]["SM_Wall"])
+check("component material overrides are finalized",
+      layout["actors"][0]["components"][0]["material_overrides"][0]["parameters"]["albedo_texture"]
+      == by_asset[tex_b])
+check("decal textures are finalized",
+      layout["decals"][0]["textures"]["albedo"] == by_asset[tex_b], layout["decals"][0])
+
+untouched = EL.extract_material_parameters(_albedo_mi(tex_a))
+EL.apply_texture_export_names(untouched, {})
+check("an unknown path leaves the asset name in place (no data loss)",
+      untouched["albedo_texture"] == "T_Concrete_D")
+check("empty/None input does not raise",
+      EL.apply_texture_export_names(None, by_path) is None
+      and EL.apply_texture_export_names({}, by_path) is None)
+
+
+print("\n=== 4. Scalar/vector parameter classification ===")
+
+
+class _LC:
+    def __init__(self, r, g, b=0.0, a=1.0):
+        self.r, self.g, self.b, self.a = r, g, b, a
+
+
+class _ValueParam:
+    def __init__(self, name, value):
+        self.parameter_info = types.SimpleNamespace(name=name)
+        self.parameter_value = value
+
+
+check("'EmissiveColor' is NOT the albedo tint",
+      EL.classify_vector_parameter("EmissiveColor") is None)
+check("'SpecularColor' is NOT the albedo tint",
+      EL.classify_vector_parameter("SpecularColor") is None)
+check("'SSS Color' is NOT the albedo tint",
+      EL.classify_vector_parameter("SSS Color") is None)
+check("'BaseColor' still is the albedo tint",
+      EL.classify_vector_parameter("BaseColor") == "albedo_color")
+check("'Tint Colour' still is the albedo tint",
+      EL.classify_vector_parameter("Tint Colour") == "albedo_color")
+check("vector 'Tiling' is tiling", EL.classify_vector_parameter("Tiling") == "tiling")
+check("scalar 'UVScale' is tiling", EL.classify_scalar_parameter("UVScale") == "tiling")
+check("scalar 'Roughness' is roughness",
+      EL.classify_scalar_parameter("Roughness") == "roughness")
+
+emissive_mi = _MI({
+    "texture_parameter_values": [],
+    "scalar_parameter_values": [],
+    "vector_parameter_values": [_ValueParam("EmissiveColor", _LC(3.0, 0.1, 0.1, 1.0))],
+    "parent": None,
+})
+ep = EL.extract_material_parameters(emissive_mi)
+check("an emissive-only override leaves albedo white",
+      ep["albedo_color"] == [1.0, 1.0, 1.0, 1.0], ep["albedo_color"])
+
+tiling_mi = _MI({
+    "texture_parameter_values": [],
+    "scalar_parameter_values": [],
+    "vector_parameter_values": [_ValueParam("Tiling", _LC(4.0, 2.0))],
+    "parent": None,
+})
+tp = EL.extract_material_parameters(tiling_mi)
+check("a Vector2 'Tiling' parameter is read per-axis",
+      tp["tiling"] == [4.0, 2.0], tp["tiling"])
+
+
+print("\n=== 4b. Base materials keep their own scalar/vector defaults ===")
+
+
+class _BaseMat2(_BaseMat):
+    def __init__(self, texparams, scalars=None, vectors=None):
+        _BaseMat.__init__(self, texparams)
+        self._scalarparams = scalars or {}
+        self._vectorparams = vectors or {}
+
+
+bm = _BaseMat2(
+    {"Diff": _Tex("T_Base_D")},
+    scalars={"Roughness": 0.2, "Metallic": 0.9, "Tiling": 3.0},
+    vectors={"BaseColor": _LC(0.5, 0.25, 0.1, 1.0), "EmissiveColor": _LC(9.0, 0.0, 0.0, 1.0)},
+)
+bp = EL.extract_material_parameters(bm)
+check("base-material roughness default is read (was always 0.5)",
+      abs(bp["roughness"] - 0.2) < 1e-9, bp["roughness"])
+check("base-material metallic default is read (was always 0.0)",
+      abs(bp["metallic"] - 0.9) < 1e-9, bp["metallic"])
+check("base-material tiling default is read", bp["tiling"] == [3.0, 3.0], bp["tiling"])
+check("base-material tint is read",
+      [round(c, 4) for c in bp["albedo_color"]] == [0.5, 0.25, 0.1, 1.0], bp["albedo_color"])
+check("base-material emissive is still not mistaken for the tint",
+      bp["albedo_color"][0] < 1.001, bp["albedo_color"])
+check("base-material textures still resolve", bp["albedo_texture"] == "T_Base_D")
+
+
+print("\n=== 5. glTF PBR factors ===")
+# UE's exporter may emit a material with no pbrMetallicRoughness block at all.
+# glTF's spec default is metallicFactor 1.0 -- i.e. every mesh renders chrome,
+# in a standalone preview and in the direct .tscn path, which does no material
+# rebuild of its own.
+fac_path = os.path.join(tmp, "factors.gltf")
+with open(fac_path, "w", encoding="utf-8") as f:
+    json.dump({"asset": {"version": "2.0"},
+               "materials": [{"name": "M_Plain"}, {"name": "M_Packed"}]}, f)
+
+fac_params = {
+    "M_Plain": {"albedo_color": [0.5, 0.25, 0.125, 1.0], "roughness": 0.3, "metallic": 0.0},
+    "M_Packed": {"albedo_color": [1.0, 1.0, 1.0, 1.0], "roughness": 1.0, "metallic": 1.0,
+                 "packed_texture": "T_Foo_ORM",
+                 "packed_channels": {"ao": 0, "roughness": 1, "metallic": 2}},
+}
+EX.inject_texture_references(fac_path, fac_params, "../textures")
+with open(fac_path, encoding="utf-8") as f:
+    fdoc = json.load(f)
+plain = fdoc["materials"][0]["pbrMetallicRoughness"]
+packed = fdoc["materials"][1]["pbrMetallicRoughness"]
+check("baseColorFactor written from albedo_color",
+      plain["baseColorFactor"] == [0.5, 0.25, 0.125, 1.0], plain)
+check("roughnessFactor written", abs(plain["roughnessFactor"] - 0.3) < 1e-9, plain)
+check("metallicFactor written as 0, not the glTF default 1 (the chrome bug)",
+      plain["metallicFactor"] == 0.0, plain)
+check("a packed-map material does not preview as chrome",
+      packed["metallicFactor"] == 0.0, packed)
+check("a packed-map material previews fully rough rather than mirror",
+      packed["roughnessFactor"] == 1.0, packed)
+
+# Out-of-range values from a material must not produce an invalid glTF.
+wild_path = os.path.join(tmp, "wild.gltf")
+with open(wild_path, "w", encoding="utf-8") as f:
+    json.dump({"asset": {"version": "2.0"}, "materials": [{"name": "M"}]}, f)
+EX.inject_texture_references(wild_path, {"M": {"albedo_color": [4.0, -1.0, 0.5, 1.0],
+                                               "roughness": 7.0, "metallic": -3.0}})
+with open(wild_path, encoding="utf-8") as f:
+    wpbr = json.load(f)["materials"][0]["pbrMetallicRoughness"]
+check("HDR/negative factors are clamped into glTF's valid range",
+      wpbr["baseColorFactor"] == [1.0, 0.0, 0.5, 1.0]
+      and wpbr["roughnessFactor"] == 1.0 and wpbr["metallicFactor"] == 0.0, wpbr)
+
+# The injected uri must name the file that was actually written.
+coll_path = os.path.join(tmp, "collide.gltf")
+with open(coll_path, "w", encoding="utf-8") as f:
+    json.dump({"asset": {"version": "2.0"}, "materials": [{"name": "M_A"}]}, f)
+coll_params = {"M_A": {"albedo_texture": "T_Concrete_D",
+                       "texture_paths": {"albedo_texture": tex_b.get_path_name()}}}
+EX.inject_texture_references(coll_path, coll_params, "../textures", by_path)
+with open(coll_path, encoding="utf-8") as f:
+    curis = [i["uri"] for i in json.load(f)["images"]]
+check("a colliding texture's uri points at its own exported file",
+      curis == ["../textures/%s.png" % by_asset[tex_b]], curis)
+
+
+print("\n=== 6. Decal ORM binding ===")
+u.DecalComponent = type("DecalComponent", (), {})
+import export_environment as EE
+
+check("Godot's decal ORM order matches the ORM/ARM layout",
+      EE._GODOT_DECAL_ORM_CHANNELS == EL._PACKED_LAYOUTS["orm"],
+      EE._GODOT_DECAL_ORM_CHANNELS)
+
+
+class _FakeTransform:
+    def __init__(self):
+        self.translation = _Vec(0.0, 0.0, 0.0)
+        self.rotation = _Quat(0.0, 0.0, 0.0, 1.0)
+        self.scale3d = _Vec(1.0, 1.0, 1.0)
+
+
+class _FakeDecalComp:
+    def __init__(self, material):
+        self._props = {"decal_material": material, "sort_order": 0, "decal_size": None}
+
+    def get_editor_property(self, key):
+        return self._props.get(key)
+
+
+class _FakeDecalActor:
+    def __init__(self, material):
+        self._c = _FakeDecalComp(material)
+
+    def get_component_by_class(self, cls):
+        return self._c
+
+    def get_actor_label(self):
+        return "Decal_0"
+
+    def get_actor_transform(self):
+        return _FakeTransform()
+
+
+def _decal_textures(material):
+    return EE._build_decal_entry(_FakeDecalActor(material), set())["textures"]
+
+
+def _packed_mi(albedo_name, packed_param, packed_name):
+    return _MI({"texture_parameter_values": [
+        _TexParam("Diff", _Tex(albedo_name)),
+        _TexParam(packed_param, _Tex(packed_name)),
+    ], "scalar_parameter_values": [], "vector_parameter_values": [], "parent": None})
+
+
+dt = _decal_textures(_packed_mi("T_Splat_D", "ORM", "T_Splat_ORM"))
+check("a real ORM-ordered packed map IS bound (it never was before)",
+      dt["orm"] == "T_Splat_ORM", dt)
+check("the decal records the ORM texture's asset path for renaming",
+      dt["texture_paths"].get("orm") is not None, dt["texture_paths"])
+check("decal albedo still resolves", dt["albedo"] == "T_Splat_D")
+
+rma = _decal_textures(_packed_mi("T_Splat2_D", "RMA", "T_Splat2_RMA"))
+check("an RMA-ordered map is NOT bound to a decal (channels would be swapped)",
+      rma["orm"] is None, rma)
+
+rough = _decal_textures(_packed_mi("T_Splat3_D", "Roughness", "T_Splat3_R"))
+check("a greyscale roughness map is NOT bound as ORM (would read 90% metallic)",
+      rough["orm"] is None, rough)
+check("but its albedo still binds", rough["albedo"] == "T_Splat3_D")
 
 print("\n" + "=" * 60)
 if FAIL:

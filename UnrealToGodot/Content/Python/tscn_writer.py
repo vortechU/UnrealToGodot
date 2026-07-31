@@ -21,6 +21,16 @@ Entry point:
 The module is importable and unit-testable WITHOUT `unreal` (the import is guarded); it never
 raises out of write_tscn (all failures are logged and return False).
 
+MATERIALS: this writer instances the exported .gltf scenes as-is and applies NO material
+overrides of its own. Whatever the .gltf carries is what renders. That is why the glTF
+export writes baseColorFactor/roughnessFactor/metallicFactor and the base-colour and normal
+uris into each material (export_static_meshes_to_gltf.inject_texture_references) rather than
+leaving glTF's spec defaults in place -- metallicFactor defaults to 1.0, which would render
+every mesh in a .tscn chrome. The packed roughness/metallic/AO map still cannot travel this
+way (glTF fixes the channel order and Unreal's packing varies), nor can UV tiling, so a
+scene that needs those must go through the Godot-side layout importer, which rebuilds
+materials from the layout JSON.
+
 ------------------------------------------------------------------------------------------------
 Godot 4 .tscn format decisions (verified against godotengine/godot-docs tscn.rst and the
 RenderingServer / Transform3D / MultiMesh source semantics):

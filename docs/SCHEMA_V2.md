@@ -94,9 +94,19 @@ for v1 files).
     "metallic_texture": null,
     "packed_texture": "TX_Foo_RMA" | null,   // one texture holding 3 channels
     "packed_channels": { "roughness": 0, "metallic": 1, "ao": 2 } | null,
-    "tiling": [u, v]
+    "tiling": [u, v],
+    "texture_paths": { "albedo_texture": "/Game/Pack/T_Foo.T_Foo", ... }
 }
 ```
+
+**Texture names are exported FILENAMES, not asset names.** Two different texture
+assets can share a name (two packs both shipping a `T_Concrete_D`); such names are
+exported as `<name>_<8-char-path-hash>.png`, exactly like colliding mesh names, so
+each material still binds its own art. Importers must treat the string as a
+filename stem and nothing more. `texture_paths` records the Unreal asset path each
+slot came from — the exporter needs it because the final filename is only known
+once the whole level has been scanned, and it is left in the JSON for diagnostics.
+Importers should ignore it.
 
 **Packed PBR maps.** Unreal packs roughness/metallic/AO into one texture's RGB
 channels, and the channel order is a naming convention, not a standard:
@@ -256,9 +266,18 @@ ambient light energy.
     "size_m": [x, y, z],           // Godot Decal.size: x=width, y=projection depth, z=height
     "sort_order": 0,
     "material_name": "...", "material_path": "...",
-    "textures": { "albedo": "T_Blood" | null, "normal": null, "orm": null, "emission": null }
+    "textures": { "albedo": "T_Blood" | null, "normal": null, "orm": null, "emission": null,
+                  "texture_paths": { "albedo": "/Game/Pack/T_Blood.T_Blood", ... } }
 }
 ```
+
+**`orm` is only ever set when the source map is genuinely ORM-ordered**
+(R=AO, G=roughness, B=metallic — the `ORM`/`ARM` row of the packed-map table
+above). Godot's `Decal.TEXTURE_ORM` has no per-channel selectors, unlike
+`BaseMaterial3D`, so an `RMA`-ordered map or a standalone greyscale roughness map
+cannot be bound at all: the latter would read back as AO=roughness (backwards) and
+metallic=roughness, rendering a rough concrete decal as chrome. Anything else is
+left `null` and the exporter logs which decal it skipped.
 
 UE `decal_size` is half-size cm in (X=projection depth, Y=width, Z=height); UE decals
 project along **-X** (local). The exporter must fold whatever axis fix-up is needed into

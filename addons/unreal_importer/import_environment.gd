@@ -173,7 +173,14 @@ func _apply_environment(data: Dictionary, root: Node, scene_owner: Node, warning
 func _apply_decals(decals, root: Node, scene_owner: Node, options: Dictionary, warnings: PackedStringArray) -> int:
 	if decals == null or not (decals is Array) or decals.is_empty():
 		return 0
+	# Same ordered search the material binder uses (import_unreal_layout.
+	# find_texture_path). Without the third entry, decal textures sitting in a
+	# textures/ folder next to the layout JSON -- i.e. any export that was not
+	# auto-transferred into the project -- resolve for meshes but not for decals.
 	var folders := [options.get("textures_folder", ""), options.get("models_folder", "")]
+	var json_dir := str(options.get("json_dir", ""))
+	if json_dir != "":
+		folders.append(json_dir.path_join("textures"))
 	var container := Node3D.new()
 	container.name = "UnrealDecals"
 	Common.add_owned_child(root, container, scene_owner)

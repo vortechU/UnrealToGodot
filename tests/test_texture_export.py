@@ -175,6 +175,26 @@ del WARNINGS[:]
 C.log_texture_export_result({"exported": ["T_Ok"], "reused": [], "unsupported": []}, tmp)
 check("no warning when everything exported", WARNINGS == [], WARNINGS)
 
+print("\n=== 6b. A name map keeps colliding texture names apart ===")
+# Two packs shipping a T_Concrete_D both wrote T_Concrete_D.png: last write won,
+# and every material naming that texture then bound whichever art survived.
+name_tmp = tempfile.mkdtemp(prefix="ue2g_texnames_")
+tex_a = _Texture2D("T_Concrete_D")
+tex_b = _Texture2D("T_Concrete_D")
+res = C.export_textures_to_png([tex_a, tex_b], name_tmp,
+                               name_map={tex_a: "T_Concrete_D_aaaa1111",
+                                         tex_b: "T_Concrete_D_bbbb2222"})
+check("both colliding textures were written",
+      sorted(res["exported"]) == ["T_Concrete_D_aaaa1111", "T_Concrete_D_bbbb2222"], res)
+check("two separate files exist on disk",
+      os.path.isfile(os.path.join(name_tmp, "T_Concrete_D_aaaa1111.png"))
+      and os.path.isfile(os.path.join(name_tmp, "T_Concrete_D_bbbb2222.png")))
+
+unmapped = _Texture2D("T_Un mapped!")
+res = C.export_textures_to_png([unmapped], name_tmp, name_map={})
+check("a texture missing from the map falls back to its sanitized asset name",
+      res["exported"] == ["T_Un_mapped"], res)
+
 print("\n=== 7. Empty input is a no-op ===")
 res = C.export_textures_to_png([], tmp)
 check("empty texture list returns empty buckets",
