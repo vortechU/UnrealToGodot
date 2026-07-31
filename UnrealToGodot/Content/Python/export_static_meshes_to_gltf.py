@@ -356,7 +356,7 @@ def collect_textures_from_material(material, collected_textures):
         
     visited = set()
     
-    def _collect_recursive(mat):
+    def _collect_recursive(mat, is_parent=False):
         if not mat or mat in visited:
             return
         visited.add(mat)
@@ -379,7 +379,7 @@ def collect_textures_from_material(material, collected_textures):
             try:
                 parent = mat.get_editor_property("parent")
                 if parent:
-                    _collect_recursive(parent)
+                    _collect_recursive(parent, is_parent=True)
             except Exception:
                 pass
         else:
@@ -388,7 +388,8 @@ def collect_textures_from_material(material, collected_textures):
             # here raised and silently collected nothing; the shared helper uses
             # MaterialEditingLibrary instead (falling back to the expression walk
             # on older engines). See ue2g_common.iter_base_material_textures.
-            for _name, tex in ue2g_common.iter_base_material_textures(mat):
+            for _name, tex in ue2g_common.iter_base_material_textures(
+                    mat, include_dependencies=not is_parent):
                 collected_textures.add(tex)
                 
     _collect_recursive(material)

@@ -276,8 +276,15 @@ def safe_get_prop(obj, prop_name, default=None):
         return default
 
 
-def iter_base_material_textures(material):
+def iter_base_material_textures(material, include_dependencies=True):
     """Yields (parameter_name, texture) for every texture a *base* Material references.
+
+    include_dependencies enables the AssetRegistry dependency crawl described at the
+    bottom of this function. Callers pass False when the material was reached as the
+    PARENT of a MaterialInstance rather than being assigned to the mesh directly: a
+    master material's dependencies include the textures of every instance-facing
+    default, and the instance has usually overridden them, so crawling there exports
+    PNGs nothing samples. A directly assigned base material has no such indirection.
 
     UE 5.7 made unreal.Material's 'expressions' property protected: reading it from
     Python now raises ("Expressions ... is protected and cannot be read"), so the
@@ -352,6 +359,74 @@ def iter_base_material_textures(material):
                 except Exception:
                     name = ""
             yield name, tex
+
+    # Last resort: the material's package dependencies from the AssetRegistry.
+    #
+    # Both passes above find NOTHING for a base material that wires its maps
+    # through plain TextureSample nodes instead of texture PARAMETERS -- it has no
+    # parameters to enumerate, and on 5.7 the expression graph cannot be read. That
+    # is not a rare shape: hand-authored per-prop materials in marketplace packs
+    # look exactly like this (TreatmentStation's M_Cardboard_2, M_Air_Compressor_1,
+    # ...), and every mesh using one arrived in Godot untextured white while the
+    # MI_-based meshes beside it came through fine.
+    #
+    # A material's package dependencies include every texture its graph samples, no
+    # matter how it is wired, and the AssetRegistry answers without compiling the
+    # material (MaterialEditingLibrary.get_used_textures does not -- it returns an
+    # empty array in the pythonscript commandlet). The cost is that dependencies are
+    # not roles: there is no parameter name to classify by, so "" is yielded and the
+    # caller falls back to classifying by the TEXTURE's own name (T_Foo_B / _N /
+    # _ORM), which is exactly what resolve_texture_role's second candidate is for.
+    #
+    # Only runs when the material yielded nothing at all, so it can never displace a
+    # properly named parameter -- it fills a slot that was otherwise empty.
+    if seen or not include_dependencies:
+        return
+    for tex in iter_material_dependency_textures(material):
+        if tex not in seen:
+            seen.add(tex)
+            yield "", tex
+
+
+def iter_material_dependency_textures(material):
+    """Yields every Texture the AssetRegistry lists as a dependency of `material`.
+
+    Package-level, so it sees textures wired through non-parameter nodes that the
+    Python material API cannot reach. Non-recursive by design: one hop finds the
+    material's own samplers without dragging in a whole MaterialFunction library.
+    """
+    try:
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+    except Exception:
+        return
+    # get_dependencies takes a PACKAGE name -- "/Game/Foo/M_Bar", not the object
+    # path "/Game/Foo/M_Bar.M_Bar" that get_path_name() hands back.
+    try:
+        package = material.get_path_name().split(".")[0]
+    except Exception:
+        return
+    try:
+        options = unreal.AssetRegistryDependencyOptions()
+    except Exception:
+        return
+    try:
+        dependencies = registry.get_dependencies(unreal.Name(package), options) or []
+    except Exception as e:
+        unreal.log_warning("Could not read dependencies of material %s: %s"
+                           % (safe_get_name(material), str(e)))
+        return
+    for dep in dependencies:
+        dep = str(dep)
+        # Skip engine content and anything obviously not a texture package before
+        # paying to load it.
+        if not dep.startswith("/Game/"):
+            continue
+        try:
+            asset = unreal.EditorAssetLibrary.load_asset(dep)
+        except Exception:
+            continue
+        if asset and isinstance(asset, unreal.Texture):
+            yield asset
 
 
 def _iter_base_material_parameters(material, names_getter, value_getter):

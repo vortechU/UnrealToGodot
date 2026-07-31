@@ -158,6 +158,10 @@ _PACKED_LAYOUTS = {
     "arm":  {"ao": 0, "roughness": 1, "metallic": 2},
     "mra":  {"metallic": 0, "roughness": 1, "ao": 2},
     "mrao": {"metallic": 0, "roughness": 1, "ao": 2},
+    # "O" for occlusion rather than "A" for ambient occlusion -- same packing as
+    # rma/mra, different spelling. TreatmentStation ships its packed maps as _RMO.
+    "rmo":  {"roughness": 0, "metallic": 1, "ao": 2},
+    "mro":  {"metallic": 0, "roughness": 1, "ao": 2},
 }
 
 
@@ -199,9 +203,25 @@ _ROLE_LAST_TOKENS = (
     ("metallic_texture", ("m",)),
 )
 
+# Trailing tokens that only mean something on a TEXTURE ASSET's name, never on a
+# parameter name. "_B" for base colour is the dominant suffix in some packs
+# (TreatmentStation ships 41 of them) and must classify, but a material PARAMETER
+# called "Tex B" is a generic slot letter and means nothing -- the same trap the
+# bare-"c" note above records. Splitting the two candidate kinds lets the texture
+# name carry the convention without the parameter name inheriting the false
+# positive. ("bump" is caught by the substring pass before any of this runs.)
+_ROLE_LAST_TOKENS_TEXTURE_ONLY = (
+    ("albedo_texture", ("b",)),
+)
 
-def classify_texture_role(name):
-    """Maps a parameter or texture name to its parameters[] slot key, else None."""
+
+def classify_texture_role(name, is_texture_name=False):
+    """Maps a parameter or texture name to its parameters[] slot key, else None.
+
+    is_texture_name says the string is a texture ASSET name rather than a material
+    parameter name, which unlocks the suffix conventions that are only meaningful
+    there (see _ROLE_LAST_TOKENS_TEXTURE_ONLY).
+    """
     if not name:
         return None
     lowered = str(name).lower()
@@ -214,7 +234,10 @@ def classify_texture_role(name):
     while tokens and tokens[-1].isdigit():
         tokens.pop()
     if tokens:
-        for key, suffixes in _ROLE_LAST_TOKENS:
+        tables = _ROLE_LAST_TOKENS
+        if is_texture_name:
+            tables = tables + _ROLE_LAST_TOKENS_TEXTURE_ONLY
+        for key, suffixes in tables:
             if tokens[-1] in suffixes:
                 return key
     return None
@@ -231,13 +254,13 @@ def resolve_texture_role(param_name, tex_name):
 
     Returns (slot_key or "packed" or None, packed_channels or None).
     """
-    for candidate in (param_name, tex_name):
+    for candidate, is_texture_name in ((param_name, False), (tex_name, True)):
         if not candidate:
             continue
         packed = classify_packed_texture(candidate)
         if packed:
             return "packed", packed
-        role = classify_texture_role(candidate)
+        role = classify_texture_role(candidate, is_texture_name=is_texture_name)
         if role:
             return role, None
     return None, None
@@ -396,7 +419,7 @@ def extract_material_parameters(material, collected_textures=None):
             parameters[key] = value
         assigned.add(key)
 
-    def _extract_recursive(mat):
+    def _extract_recursive(mat, is_parent=False):
         if not mat or mat in visited:
             return
         visited.add(mat)
@@ -412,7 +435,8 @@ def extract_material_parameters(material, collected_textures=None):
             # the shared helper uses MaterialEditingLibrary instead (falling back
             # to the expression walk on older engines). Parameter names classify
             # by role exactly as the MaterialInstance branch below does.
-            for pname, tex in ue2g_common.iter_base_material_textures(mat):
+            for pname, tex in ue2g_common.iter_base_material_textures(
+                    mat, include_dependencies=not is_parent):
                 if collected_textures is not None:
                     collected_textures.add(tex)
                 _assign_texture(pname, tex)
@@ -496,7 +520,7 @@ def extract_material_parameters(material, collected_textures=None):
         try:
             parent = mat.get_editor_property("parent")
             if parent:
-                _extract_recursive(parent)
+                _extract_recursive(parent, is_parent=True)
         except Exception:
             pass
 

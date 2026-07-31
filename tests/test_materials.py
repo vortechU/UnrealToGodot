@@ -149,6 +149,25 @@ check("nothing classifiable returns (None, None)",
 check("generic 'Tex C' alone is NOT albedo (no bare-letter C rule)",
       EL.classify_texture_role("Tex C") is None)
 
+# The "_B" base-colour suffix (TreatmentStation's convention) must classify on a
+# TEXTURE name but must not leak into parameter names, where "Tex B" is a generic
+# slot letter -- the two candidates go through the same classifier.
+check("'T_Cardboard_Box_1_B' is albedo as a texture name",
+      EL.classify_texture_role("T_Cardboard_Box_1_B", is_texture_name=True) == "albedo_texture",
+      EL.classify_texture_role("T_Cardboard_Box_1_B", is_texture_name=True))
+check("bare 'Tex B' is still NOT albedo as a parameter name",
+      EL.classify_texture_role("Tex B") is None)
+check("no param name at all falls through to a '_B' texture name",
+      EL.resolve_texture_role("", "T_Air_Compressor_1_B") == ("albedo_texture", None),
+      EL.resolve_texture_role("", "T_Air_Compressor_1_B"))
+check("'_RMO' packs as roughness/metallic/occlusion",
+      EL.classify_packed_texture("T_Cardboard_Box_1_RMO") == {"roughness": 0, "metallic": 1, "ao": 2},
+      EL.classify_packed_texture("T_Cardboard_Box_1_RMO"))
+check("a '_RMO' set resolves with no param name",
+      EL.resolve_texture_role("", "T_Cardboard_Box_1_RMO")[0] == "packed")
+check("'_N' still normal with no param name",
+      EL.resolve_texture_role("", "T_Cardboard_Box_1_N") == ("normal_texture", None))
+
 print("\n=== 1c. extract_material_parameters on a CH-style instance ===")
 # Reproduces the real MI_CH_* materials: parameters named Diff/Normal/ORM.
 # "Diff" matched no albedo needle before this test's fix, so every mesh in the
