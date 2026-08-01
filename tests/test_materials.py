@@ -624,19 +624,33 @@ class _FakeTransform:
 
 
 class _FakeDecalComp:
-    def __init__(self, material):
-        self._props = {"decal_material": material, "sort_order": 0, "decal_size": None}
+    """A DecalComponent with the CDO defaults probed off UE 5.7."""
+
+    def __init__(self, material, name="NewDecalComponent", **overrides):
+        self.name = name
+        self._props = {"decal_material": material, "sort_order": 0, "decal_size": None,
+                       "decal_color": None, "fade_screen_size": 0.0,
+                       "visible": True, "hidden_in_game": False}
+        self._props.update(overrides)
 
     def get_editor_property(self, key):
-        return self._props.get(key)
+        if key not in self._props:
+            raise Exception("no property %r" % key)
+        return self._props[key]
+
+    def get_name(self):
+        return self.name
+
+    def get_world_transform(self):
+        return _FakeTransform()
 
 
 class _FakeDecalActor:
-    def __init__(self, material):
-        self._c = _FakeDecalComp(material)
+    def __init__(self, material, comps=None):
+        self._comps = comps if comps is not None else [_FakeDecalComp(material)]
 
-    def get_component_by_class(self, cls):
-        return self._c
+    def get_components_by_class(self, cls):
+        return self._comps
 
     def get_actor_label(self):
         return "Decal_0"
@@ -645,8 +659,13 @@ class _FakeDecalActor:
         return _FakeTransform()
 
 
+def _decal_entry(material, **comp_kwargs):
+    comp = _FakeDecalComp(material, **comp_kwargs)
+    return EE._build_decal_entries(_FakeDecalActor(material, [comp]), set())[0]
+
+
 def _decal_textures(material):
-    return EE._build_decal_entry(_FakeDecalActor(material), set())["textures"]
+    return _decal_entry(material)["textures"]
 
 
 def _packed_mi(albedo_name, packed_param, packed_name):
@@ -671,6 +690,78 @@ rough = _decal_textures(_packed_mi("T_Splat3_D", "Roughness", "T_Splat3_R"))
 check("a greyscale roughness map is NOT bound as ORM (would read 90% metallic)",
       rough["orm"] is None, rough)
 check("but its albedo still binds", rough["albedo"] == "T_Splat3_D")
+
+
+print("\n=== 7. Decal modulate, visibility and distance fade ===")
+
+
+class _ScalarParam:
+    def __init__(self, name, value):
+        self.parameter_info = types.SimpleNamespace(name=name)
+        self.parameter_value = value
+
+
+class _LinColor:
+    def __init__(self, r=1.0, g=1.0, b=1.0, a=1.0):
+        self.r, self.g, self.b, self.a = r, g, b, a
+
+
+def _decal_mi(scalars=(), vectors=(), textures=()):
+    return _MI({"texture_parameter_values": list(textures),
+                "scalar_parameter_values": list(scalars),
+                "vector_parameter_values": list(vectors),
+                "parent": None})
+
+
+def _near(a, b, eps=1e-4):
+    return abs(a - b) < eps
+
+
+plain = _decal_entry(_decal_mi())
+check("a decal with no tint and no DecalColor modulates white",
+      plain["modulate"] == [1.0, 1.0, 1.0, 1.0], plain["modulate"])
+check("a decal defaults to visible", plain["visible"] is True)
+check("FadeScreenSize 0 means no distance fade",
+      plain["distance_fade_begin_m"] is None and plain["distance_fade_length_m"] is None,
+      plain)
+
+tinted = _decal_entry(_decal_mi(vectors=[_ScalarParam("BaseColor", _LinColor(0.5, 0.25, 0.0, 1.0))]),
+                      decal_color=_LinColor(1.0, 1.0, 1.0, 0.5))
+check("the material tint reaches Decal.modulate (it used to be dropped entirely)",
+      [round(c, 4) for c in tinted["modulate"]] == [0.5, 0.25, 0.0, 0.5], tinted["modulate"])
+
+faded = _decal_entry(_decal_mi(scalars=[_ScalarParam("Opacity", 0.25)]))
+check("an Opacity parameter folds into modulate's alpha",
+      _near(faded["modulate"][3], 0.25), faded["modulate"])
+
+not_opacity = _decal_entry(_decal_mi(scalars=[_ScalarParam("Opacity Mask Contrast", 0.25)]))
+check("a contrast control named like opacity does NOT make the decal transparent",
+      _near(not_opacity["modulate"][3], 1.0), not_opacity["modulate"])
+
+hidden = _decal_entry(_decal_mi(), hidden_in_game=True)
+check("a decal hidden in game exports as invisible", hidden["visible"] is False)
+
+# size_m defaults to [1, 1, 1] m with no decal_size, so the lateral radius is
+# 0.5 m: cull distance = 0.5 / (0.1 * tan(37.5 deg)) = 6.516 m, fading in over
+# the last quarter of the way there.
+dfade = _decal_entry(_decal_mi(), fade_screen_size=0.1)
+check("FadeScreenSize converts to a Godot distance fade",
+      _near(dfade["distance_fade_length_m"], 1.62903, 1e-3)
+      and _near(dfade["distance_fade_begin_m"], 4.88709, 1e-3), dfade)
+
+tiny = _decal_entry(_decal_mi(), fade_screen_size=1e-9)
+check("an absurd fade distance is dropped rather than written into the scene",
+      tiny["distance_fade_begin_m"] is None, tiny)
+
+# Two decal components on one actor: both must survive, with unique names.
+multi_actor = _FakeDecalActor(None, [_FakeDecalComp(_decal_mi(), name="DecalA"),
+                                     _FakeDecalComp(_decal_mi(), name="DecalB")])
+multi = EE._build_decal_entries(multi_actor, set())
+check("every DecalComponent on an actor is exported, not just the first",
+      len(multi) == 2, multi)
+check("multiple decals on one actor get unique names",
+      [e["name"] for e in multi] == ["Decal_0_DecalA", "Decal_0_DecalB"],
+      [e["name"] for e in multi])
 
 print("\n" + "=" * 60)
 if FAIL:

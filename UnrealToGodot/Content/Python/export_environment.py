@@ -65,7 +65,14 @@ the decal's local +Z used to be. Because that fix-up re-labels the node's
 local Y and Z axes, the converted **scale** has to be conjugated by it too --
 its Y and Z components are swapped. See `_decal_transform`'s docstring for the
 full worked derivation and a numeric sanity check.
+
+Beyond the transform, a decal carries its colour (`modulate` = DecalColor *
+material tint * opacity), its visibility, and a distance fade converted from
+UE's screen-size fade. Decals are collected per DecalComponent rather than per
+DecalActor, so Blueprint props with decal components export too.
 """
+
+import math
 
 import unreal
 
@@ -432,10 +439,10 @@ def _quat_multiply(q1, q2):
     )
 
 
-def _decal_transform(actor):
+def _decal_transform(u_transform):
     """
-    Returns the Godot transform dict for a decal actor, with the UE -> Godot
-    projection-axis fix-up folded into the rotation.
+    Returns the Godot transform dict for a decal's WORLD transform, with the
+    UE -> Godot projection-axis fix-up folded into the rotation.
 
     Worked derivation:
       Let A = the actor's world rotation matrix (Unreal space) and
@@ -480,8 +487,13 @@ def _decal_transform(actor):
       swaps the decal's projection depth with its height -- a graffiti decal
       1 m tall with a 1.9 m projection depth renders 3.7 m tall and 0.5 m
       deep instead (measured on L_Overview's MI_Graffiti_01).
+
+    Takes the DecalComponent's WORLD transform, not the actor's: on a stock
+    ADecalActor the component *is* the root and the two agree, but a Blueprint
+    decal actor (or a decal component parented under a prop) carries a relative
+    offset the actor transform knows nothing about.
     """
-    std = ue2g_common.unreal_to_godot_transform(actor.get_actor_transform())
+    std = ue2g_common.unreal_to_godot_transform(u_transform)
     q_std = tuple(std.get("rotation_quat", [0.0, 0.0, 0.0, 1.0]))
     q_final = _quat_multiply(q_std, _DECAL_FIXUP_QUAT)
 
@@ -505,13 +517,191 @@ def _decal_transform(actor):
 # in export_level_to_json; any other packing (RMA, MRA) cannot be bound to a Decal.
 _GODOT_DECAL_ORM_CHANNELS = {"ao": 0, "roughness": 1, "metallic": 2}
 
+# UE fades a decal out once its projected size drops below FadeScreenSize (a
+# fraction of the view's half-height; default 0.01). Godot has no screen-size
+# fade, only a distance one, so the exporter converts: an object of world radius
+# r covers a screen fraction of r / (d * tan(fov/2)), which inverts to the
+# distance at which UE would have dropped the decal. The FOV has to be assumed --
+# Godot's Camera3D default (75 degrees vertical) is the only sane reference
+# point, and the result is a soft fade rather than a hard cull, so being a few
+# degrees off just moves the fade slightly.
+_GODOT_DEFAULT_FOV_DEG = 75.0
+_TAN_HALF_FOV = math.tan(math.radians(_GODOT_DEFAULT_FOV_DEG * 0.5))
 
-def _build_decal_entry(actor, collected_textures):
+# A tiny FadeScreenSize inverts to an absurd distance ("never fades"). Past this
+# the fade is emitted as null rather than writing 10^6 into every scene.
+_MAX_FADE_DISTANCE_M = 100000.0
+
+# Scalar parameter names taken to mean "the decal's overall opacity", folded into
+# Godot's Decal.modulate alpha. Deliberately an EXACT-match whitelist rather than
+# a substring test like classify_scalar_parameter uses: a false positive here
+# makes a decal transparent, and names such as "Opacity Mask Contrast" or
+# "Alpha Threshold" are contrast controls, not opacity.
+_DECAL_OPACITY_PARAM_NAMES = frozenset((
+    "opacity", "decalopacity", "globalopacity", "overallopacity",
+    "opacityscale", "opacitymultiplier", "opacitystrength", "opacityamount",
+    "alpha", "decalalpha",
+))
+
+
+def _is_opacity_param(name):
+    lowered = str(name or "").lower().replace(" ", "").replace("_", "")
+    return lowered in _DECAL_OPACITY_PARAM_NAMES
+
+
+def _decal_opacity(material):
+    """
+    Returns an explicit overall-opacity scalar from a decal material, or None.
+
+    Godot's Decal has no opacity property of its own, but modulate's alpha
+    multiplies the whole projection, so an `Opacity` parameter -- the standard
+    way decal material instances are dialled back in UE -- can be carried
+    across. Walks the instance chain child-first, matching
+    extract_material_parameters' "first explicit value wins" rule.
+    """
+    visited = set()
+
+    def _scan(mat):
+        if mat is None or mat in visited:
+            return None
+        visited.add(mat)
+
+        is_instance = isinstance(mat, unreal.MaterialInstance)
+        if not is_instance and hasattr(unreal, "MaterialInstanceConstant"):
+            is_instance = isinstance(mat, unreal.MaterialInstanceConstant)
+
+        if is_instance:
+            try:
+                for s in (mat.get_editor_property("scalar_parameter_values") or []):
+                    if _is_opacity_param(s.parameter_info.name):
+                        return float(s.parameter_value)
+            except Exception:
+                pass
+            return _scan(ue2g_common.safe_get_prop(mat, "parent", None))
+
+        for pname, value in ue2g_common.iter_base_material_scalars(mat):
+            if _is_opacity_param(pname):
+                try:
+                    return float(value)
+                except Exception:
+                    return None
+        return None
+
     try:
-        comp = actor.get_component_by_class(unreal.DecalComponent)
+        return _scan(material)
+    except Exception:
+        return None
+
+
+def _decal_modulate(comp, params, material):
+    """
+    Godot Decal.modulate [r, g, b, a]: the component's DecalColor times the
+    material's albedo tint, with any opacity parameter folded into alpha.
+
+    Without this a decal whose colour lives in a parameter rather than in its
+    albedo texture -- the usual setup for tinted blood/rust/paint instances --
+    imported at full white. Two caveats worth knowing:
+      * UE's DecalColor only reaches the shader when the material samples the
+        Decal Color node. It defaults to white, so it only ever moves the
+        result when someone deliberately set it, and honouring an explicitly
+        authored colour beats dropping it.
+      * The tint can legitimately exceed 1.0 (packs author dark albedo and
+        scale it up), so only the negative side is clamped.
+    """
+    modulate = [1.0, 1.0, 1.0, 1.0]
+
+    decal_color = ue2g_common.safe_get_prop(comp, "decal_color", None)
+    if decal_color is not None:
+        for i, channel in enumerate(("r", "g", "b", "a")):
+            modulate[i] = _f(getattr(decal_color, channel, 1.0), 1.0)
+
+    tint = (params or {}).get("albedo_color")
+    if isinstance(tint, (list, tuple)):
+        for i in range(min(4, len(tint))):
+            modulate[i] *= _f(tint[i], 1.0)
+
+    opacity = _decal_opacity(material)
+    if opacity is not None:
+        modulate[3] *= min(max(opacity, 0.0), 1.0)
+
+    return [max(0.0, c) for c in modulate]
+
+
+def _decal_distance_fade(comp, size_m, scale):
+    """
+    Converts UE's FadeScreenSize into Godot (distance_fade_begin,
+    distance_fade_length) in metres, or (None, None) when UE asked for no fade.
+
+    `size_m` is the decal's local box and `scale` its converted local scale, so
+    the lateral (width/height) world extent is size_m[0]*scale[0] and
+    size_m[2]*scale[2] -- the projection depth (index 1) is not what determines
+    on-screen size. The decal is fully gone at the distance UE would have
+    dropped it, fading in over the last quarter of the way there.
+    """
+    fade_screen_size = _f(ue2g_common.safe_get_prop(comp, "fade_screen_size", 0.0), 0.0)
+    if fade_screen_size <= 0.0:
+        return None, None
+
+    def _axis_scale(index):
+        try:
+            return abs(_f(scale[index], 1.0)) or 1.0
+        except Exception:
+            return 1.0
+
+    radius = 0.5 * max(abs(_f(size_m[0], 1.0)) * _axis_scale(0),
+                       abs(_f(size_m[2], 1.0)) * _axis_scale(2))
+    if radius <= 0.0:
+        return None, None
+
+    cull_m = radius / (fade_screen_size * _TAN_HALF_FOV)
+    if cull_m > _MAX_FADE_DISTANCE_M:
+        return None, None
+
+    length = max(1.0, cull_m * 0.25)
+    return max(0.0, cull_m - length), length
+
+
+def _decal_components(actor):
+    """Every DecalComponent on an actor, in declaration order; never raises."""
+    try:
+        comps = actor.get_components_by_class(unreal.DecalComponent)
     except Exception as e:
-        _log_actor_warning(actor, "failed to get DecalComponent", e)
-        comp = None
+        _log_actor_warning(actor, "failed to list DecalComponents", e)
+        return []
+    return [c for c in (comps or []) if c is not None]
+
+
+def _build_decal_entries(actor, collected_textures):
+    """
+    One schema entry per DecalComponent on `actor`.
+
+    Scanning components rather than keying off unreal.DecalActor is what lets a
+    Blueprint prop with a decal component -- a scorched wall panel, a signed
+    crate -- export at all; those used to vanish silently. Actors carrying more
+    than one decal get the component name appended so the Godot node names stay
+    unique and traceable.
+    """
+    comps = _decal_components(actor)
+    label = _safe_label(actor)
+    entries = []
+    for comp in comps:
+        name = label
+        if len(comps) > 1:
+            name = "{}_{}".format(label, ue2g_common.safe_get_name(comp))
+        # Guarded per component: this runs before the light/volume dispatch in
+        # collect_environment, so an unreadable decal must not cost the actor
+        # its light export too.
+        try:
+            entry = _build_decal_entry(actor, comp, name, collected_textures)
+        except Exception as e:
+            _log_actor_warning(actor, "failed to build decal entry", e)
+            continue
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
+def _build_decal_entry(actor, comp, name, collected_textures):
     if comp is None:
         return None
 
@@ -534,6 +724,7 @@ def _build_decal_entry(actor, collected_textures):
     material_path = "None"
     textures = {"albedo": None, "normal": None, "orm": None, "emission": None,
                 "texture_paths": {}}
+    params = None
 
     if material is not None:
         try:
@@ -576,15 +767,40 @@ def _build_decal_entry(actor, collected_textures):
         except Exception as e:
             _log_actor_warning(actor, "failed to extract decal material parameters", e)
 
+    godot_transform = _decal_transform(_decal_world_transform(actor, comp))
+    fade_begin, fade_length = _decal_distance_fade(
+        comp, size_m, godot_transform.get("scale") or [1.0, 1.0, 1.0])
+
+    # A decal component hidden in game is content the level explicitly turned
+    # off; a Godot node that ignores that arrives visible.
+    visible = (_b(ue2g_common.safe_get_prop(comp, "visible", True), True)
+               and not _b(ue2g_common.safe_get_prop(comp, "hidden_in_game", False), False))
+
     return {
-        "name": _safe_label(actor),
-        "godot_transform": _decal_transform(actor),
+        "name": name,
+        "godot_transform": godot_transform,
         "size_m": size_m,
         "sort_order": sort_order,
+        "visible": visible,
+        "modulate": _decal_modulate(comp, params, material),
+        "fade_screen_size": _f(ue2g_common.safe_get_prop(comp, "fade_screen_size", 0.0), 0.0),
+        "distance_fade_begin_m": fade_begin,
+        "distance_fade_length_m": fade_length,
         "material_name": material_name,
         "material_path": material_path,
         "textures": textures,
     }
+
+
+def _decal_world_transform(actor, comp):
+    """The decal component's world transform, falling back to the actor's."""
+    try:
+        transform = comp.get_world_transform()
+        if transform is not None:
+            return transform
+    except Exception as e:
+        _log_actor_warning(actor, "could not read DecalComponent world transform", e)
+    return actor.get_actor_transform()
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +834,12 @@ def collect_environment(all_actors, collected_textures):
                 if actor is None:
                     continue
 
+                # Decals first and unconditionally: they are components, not an
+                # actor class, so keying off unreal.DecalActor dropped every
+                # decal riding on a Blueprint prop -- and every branch below
+                # continues, which would have kept skipping them.
+                result["decals"].extend(_build_decal_entries(actor, collected_textures))
+
                 light_type = _light_type_of(actor)
                 if light_type is not None:
                     entry = _build_light_entry(actor, light_type)
@@ -645,12 +867,6 @@ def collect_environment(all_actors, collected_textures):
 
                 if _SKY_ATMOSPHERE_CLASS is not None and isinstance(actor, _SKY_ATMOSPHERE_CLASS):
                     result["has_sky_atmosphere"] = True
-                    continue
-
-                if isinstance(actor, unreal.DecalActor):
-                    entry = _build_decal_entry(actor, collected_textures)
-                    if entry is not None:
-                        result["decals"].append(entry)
                     continue
 
             except Exception as actor_err:

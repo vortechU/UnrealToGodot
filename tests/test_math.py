@@ -371,15 +371,6 @@ print("\n=== 11. Decal box: the fix-up rotation must carry the scale with it ===
 # Godot renders (0.5 * size[j] * basis column j) and compare it to the UE decal box.
 import export_environment as EE
 
-
-class FakeDecalActor:
-    def __init__(self, tr):
-        self._tr = tr
-
-    def get_actor_transform(self):
-        return self._tr
-
-
 # UE default decal_size, half-extents cm: (X=projection depth, Y=width, Z=height)
 DS = (128.0, 256.0, 256.0)
 SIZE_M = [DS[1] * 2 * 0.01, DS[0] * 2 * 0.01, DS[2] * 2 * 0.01]   # what _build_decal_entry emits
@@ -388,7 +379,7 @@ worst = 0.0
 for _ in range(300):
     q = rand_quat(rng)
     sc = [rng.choice([-1, 1]) * rng.uniform(0.1, 3.0) for _ in range(3)]
-    d = EE._decal_transform(FakeDecalActor(Transform(Vector(0, 0, 0), Quat(*q), Vector(*sc))))
+    d = EE._decal_transform(Transform(Vector(0, 0, 0), Quat(*q), Vector(*sc)))
     basis = quat_to_mat(tuple(d["rotation_quat"]))
     s = d["scale"]
     basis = [[basis[i][j] * s[j] for j in range(3)] for i in range(3)]   # column scaling

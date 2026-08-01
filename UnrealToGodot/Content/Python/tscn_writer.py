@@ -924,6 +924,20 @@ class _TscnWriter(object):
                 props.append("size = " + _vec3_literal(size))
             if decal.get("sort_order") is not None:
                 props.append("sorting_offset = " + _f(_num(decal.get("sort_order"))))
+            # Mirrors import_environment.gd's _apply_decals -- the two paths must
+            # produce the same Decal or a .tscn export and an addon import of the
+            # same layout disagree.
+            if decal.get("visible") is False:
+                props.append("visible = false")
+            modulate = decal.get("modulate")
+            if isinstance(modulate, (list, tuple)) and modulate:
+                props.append("modulate = " + _color_literal(modulate))
+            fade_begin = decal.get("distance_fade_begin_m")
+            fade_length = decal.get("distance_fade_length_m")
+            if fade_begin is not None and fade_length is not None:
+                props.append("distance_fade_enabled = true")
+                props.append("distance_fade_begin = " + _f(max(_num(fade_begin), 0.0)))
+                props.append("distance_fade_length = " + _f(max(_num(fade_length), 0.01)))
 
             textures = decal.get("textures") or {}
             for tex_key, godot_prop in (("albedo", "texture_albedo"), ("normal", "texture_normal"),

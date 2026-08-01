@@ -144,7 +144,7 @@ func _enter_tree() -> void:
 
 	lights_check = _make_check(features,"Lights", "Create DirectionalLight3D / OmniLight3D / SpotLight3D nodes from exported Unreal lights.")
 	environment_check = _make_check(features,"World Environment (post-fx, fog, sky)", "Create a WorldEnvironment from PostProcessVolume, height fog and sky data (bloom, SSAO, exposure, fog).")
-	decals_check = _make_check(features,"Decals", "Create Decal nodes from Unreal DeferredDecal actors, binding exported textures.")
+	decals_check = _make_check(features,"Decals", "Create Decal nodes from Unreal decal components, binding exported textures, tint, visibility and distance fade.")
 	terrain_check = _make_check(features,"Terrain (Landscapes)", "Rebuild Unreal Landscapes from exported heightmaps. Uses Terrain3D when installed, otherwise a plugin-free mesh fallback with collision.")
 
 	var terrain_mode_row := HBoxContainer.new()

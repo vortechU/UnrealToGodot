@@ -136,6 +136,25 @@ func _run_tests() -> void:
 			near((-db.y).normalized(), Vector3(-1, 0, 0)), str((-db.y).normalized()))
 		check("Decal depth NOT the pre-fix 2.56 m half-extent",
 			not near(dd, Vector3(2.56, 0, 0)), str(dd))
+		# Material tint / DecalColor / opacity all land in modulate, and UE's
+		# screen-size fade arrives as a distance fade. These used to be dropped.
+		check("Decal modulate carries the UE tint and opacity",
+			d.modulate.is_equal_approx(Color(0.8, 0.2, 0.2, 0.5)), str(d.modulate))
+		check("Decal distance fade comes from UE FadeScreenSize",
+			d.distance_fade_enabled and absf(d.distance_fade_begin - 9.0) < 0.001
+			and absf(d.distance_fade_length - 3.0) < 0.001,
+			"%s begin=%s len=%s" % [d.distance_fade_enabled, d.distance_fade_begin,
+				d.distance_fade_length])
+		check("Decal albedo texture is bound", d.get_texture(Decal.TEXTURE_ALBEDO) != null)
+
+	# A decal the level hid must not come back visible, and it must not pick up
+	# a distance fade UE never asked for.
+	var hidden_decal := find_node(root, "Decal_Hidden")
+	check("Decal_Hidden exists", hidden_decal != null)
+	if hidden_decal and hidden_decal is Decal:
+		var hd := hidden_decal as Decal
+		check("a decal hidden in Unreal imports invisible", not hd.visible)
+		check("a decal with no UE fade gets no distance fade", not hd.distance_fade_enabled)
 
 	_test_materials(root)
 

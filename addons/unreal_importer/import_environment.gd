@@ -281,7 +281,21 @@ func _apply_decals(decals, root: Node, scene_owner: Node, options: Dictionary, w
 		decal.transform = Common.get_transform_from_dict(entry.get("godot_transform", {}))
 		var d_size := Common.vec3_from_array(entry.get("size_m"), Vector3.ONE).abs()
 		decal.size = Vector3(maxf(d_size.x, 0.01), maxf(d_size.y, 0.01), maxf(d_size.z, 0.01))
+		# UE SortOrder and Godot sorting_offset agree on direction: higher draws
+		# on top of decals sharing the same spot.
 		decal.sorting_offset = Common.get_num(entry, "sort_order", 0.0)
+		decal.visible = bool(entry.get("visible", true))
+		# UE's DecalColor times the material tint, opacity folded into alpha.
+		# Godot multiplies this into the albedo, so white is a no-op.
+		decal.modulate = Common.color_from_array(entry.get("modulate"), Color.WHITE)
+		# UE fades a decal out by projected screen size; the exporter converted
+		# that to a distance and leaves these null when it asked for no fade.
+		var fade_begin = entry.get("distance_fade_begin_m")
+		var fade_length = entry.get("distance_fade_length_m")
+		if (fade_begin is float or fade_begin is int) and (fade_length is float or fade_length is int):
+			decal.distance_fade_enabled = true
+			decal.distance_fade_begin = maxf(float(fade_begin), 0.0)
+			decal.distance_fade_length = maxf(float(fade_length), 0.01)
 
 		var textures = entry.get("textures")
 		if textures is Dictionary:

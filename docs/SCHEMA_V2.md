@@ -291,12 +291,41 @@ ambient light energy.
     "name": "DecalActor_1",
     "godot_transform": { ... },
     "size_m": [x, y, z],           // Godot Decal.size: x=width, y=projection depth, z=height
-    "sort_order": 0,
+    "sort_order": 0,               // -> Decal.sorting_offset (both engines: higher = on top)
+    "visible": true,               // component visible AND not hidden in game
+    "modulate": [r, g, b, a],      // -> Decal.modulate; DecalColor * material tint, opacity in alpha
+    "fade_screen_size": 0.01,      // raw UE FadeScreenSize, for reference
+    "distance_fade_begin_m": 143.0 | null,   // -> Decal.distance_fade_*; null = no fade
+    "distance_fade_length_m": 47.6 | null,
     "material_name": "...", "material_path": "...",
     "textures": { "albedo": "T_Blood" | null, "normal": null, "orm": null, "emission": null,
                   "texture_paths": { "albedo": "/Game/Pack/T_Blood.T_Blood", ... } }
 }
 ```
+
+One entry per **DecalComponent**, not per `DecalActor`: decal components ride on
+Blueprint props too. Actors carrying more than one get the component name appended to
+`name` so Godot node names stay unique. `godot_transform` is built from the
+**component's world transform**, which is what makes a component-relative offset survive.
+
+`modulate` is where a decal's colour lives when it is not in the albedo texture — the
+usual setup for tinted blood/rust/paint instances. It is the component's `DecalColor`
+times the material's albedo tint, with any `Opacity`-style scalar parameter folded into
+alpha. Channels may legitimately exceed 1.0 (packs author dark albedo and scale it up),
+so only the negative side is clamped. Caveat: UE's `DecalColor` only reaches the shader
+when the material samples the Decal Color node, but it defaults to white, so it only ever
+moves the result when someone set it deliberately.
+
+`distance_fade_*` converts UE's screen-size fade, which Godot has no equivalent for: an
+object of world radius `r` covers a screen fraction `r / (d * tan(fov/2))`, inverted at
+Godot's default 75° camera FOV to the distance UE would have dropped the decal. `r` comes
+from the **lateral** extent (`size_m[0]`/`size_m[2]` times their scale) — projection depth
+does not affect on-screen size. Both fields are `null` when `fade_screen_size <= 0` or the
+result exceeds 100 km (indistinguishable from "never fades").
+
+Deliberately **not** mapped: Godot's `upper_fade`/`lower_fade` are left at their engine
+defaults. UE clips hard at the decal box, so a faithful import would zero them, but the
+soft falloff is what keeps projections onto curved geometry from showing a hard seam.
 
 **`orm` is only ever set when the source map is genuinely ORM-ordered**
 (R=AO, G=roughness, B=metallic — the `ORM`/`ARM` row of the packed-map table

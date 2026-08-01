@@ -97,6 +97,15 @@ layout = {
     "has_sky_atmosphere": True,
     "decals": [
         {"name": "Blood_1", "godot_transform": t(0, 0.1, 0), "size_m": [2.0, 0.5, 2.0], "sort_order": 3,
+         "visible": True, "modulate": [0.8, 0.2, 0.2, 0.5],
+         "fade_screen_size": 0.1, "distance_fade_begin_m": 9.0, "distance_fade_length_m": 3.0,
+         "material_name": "M_Blood", "material_path": "/Game/M_Blood",
+         "textures": {"albedo": "T_Blood", "normal": None, "orm": None, "emission": None}},
+        # No fade, hidden in game: the writer must omit the fade properties
+        # entirely and mark the node invisible.
+        {"name": "Hidden_1", "godot_transform": t(1, 0.1, 0), "size_m": [1.0, 0.5, 1.0], "sort_order": 0,
+         "visible": False, "modulate": [1.0, 1.0, 1.0, 1.0],
+         "fade_screen_size": 0.0, "distance_fade_begin_m": None, "distance_fade_length_m": None,
          "material_name": "M_Blood", "material_path": "/Game/M_Blood",
          "textures": {"albedo": "T_Blood", "normal": None, "orm": None, "emission": None}},
     ],
@@ -254,6 +263,26 @@ for gd_name, py_value in (("UE_DEFAULT_EXPOSURE_BIAS", tscn_writer._UE_DEFAULT_E
 assert 'Common.get_num(fog, "fog_density", 0.02) * 0.5' in gd,     "addon fog density heuristic changed; tscn_writer's *0.5 no longer matches"
 assert 'Common.get_num(settings, "ao_intensity", 0.5) * 2.0' in gd,     "addon ssao intensity heuristic changed; tscn_writer's *2.0 no longer matches"
 print("environment constants agree with import_environment.gd")
+
+# Decals are the other two-implementation feature: _build_decals here and
+# _apply_decals in the addon. Pin every property both are supposed to set.
+blood = node_block("Blood_1")
+assert "size = Vector3(2.0, 0.5, 2.0)" in blood, "decal size missing: %s" % blood
+assert "sorting_offset = 3.0" in blood, "decal sort_order missing: %s" % blood
+assert "modulate = Color(0.8, 0.2, 0.2, 0.5)" in blood, "decal modulate missing: %s" % blood
+assert "distance_fade_enabled = true" in blood and "distance_fade_begin = 9.0" in blood \
+    and "distance_fade_length = 3.0" in blood, "decal distance fade missing: %s" % blood
+assert "texture_albedo = ExtResource(" in blood, "decal albedo not bound: %s" % blood
+assert "visible = false" not in blood, "a visible decal must not be written invisible"
+
+hidden = node_block("Hidden_1")
+assert "visible = false" in hidden, "a hidden decal must import invisible: %s" % hidden
+assert "distance_fade" not in hidden, "a decal with no UE fade must not get one: %s" % hidden
+
+for gd_prop in ("decal.modulate = Common.color_from_array", "decal.visible = bool",
+                "decal.distance_fade_enabled = true", "decal.sorting_offset ="):
+    assert gd_prop in gd, "addon no longer sets %r; tscn_writer would drift" % gd_prop
+print("decal properties agree with import_environment.gd")
 
 # Exposure mapping, all four shapes.
 def exposure(**kw):

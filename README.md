@@ -38,7 +38,7 @@ part-way through an import.
 - 🎨 **PBR Material & Texture Binding**: Translates Unreal material parameters (albedo, roughness, metallic, tiling) and binds exported textures to Godot `StandardMaterial3D` resources (case-insensitive file matching).
 - 🌿 **Blueprint/Complex Actor Support**: Supports multi-mesh/multi-component Blueprint actors by instancing them as a parent `Node3D` with relative component offsets.
 - 💡 **Lighting & Post-Processing**: Converts `DirectionalLight`/`PointLight`/`SpotLight`/`RectLight` into `DirectionalLight3D`/`OmniLight3D`/`SpotLight3D`, and `PostProcessVolume` + height fog + sky into a Godot `WorldEnvironment` (bloom, SSAO, exposure, fog, sky, color temperature).
-- 🩹 **Decals**: Exports `DeferredDecal` actors as Godot `Decal` nodes with matching size, textures and sorting priority.
+- 🩹 **Decals**: Exports every decal component — including those on Blueprint props, not just `DeferredDecal` actors — as Godot `Decal` nodes with matching size, projection axis, textures, tint/opacity, visibility, sorting priority and distance fade.
 - ⛰️ **Landscape / Terrain Migration**: Exports Landscape heightmaps and paint-layer splatmaps as float EXR images and rebuilds them via the Terrain3D plugin (recommended — see [Landscapes](#landscapes-install-terrain3d)). A plugin-free mesh fallback exists for a quick low-detail preview.
 - 🌱 **Foliage as MultiMesh**: Painted foliage, HISM and ISM instances are exported as packed transform arrays and rebuilt as `MultiMeshInstance3D` nodes — thousands of instances stay performant.
 - 🗺️ **Navigation Volumes**: `NavMeshBoundsVolume` actors become `NavigationRegion3D` nodes with matching agent settings (optionally auto-baked on import).
