@@ -466,10 +466,27 @@ func _try_terrain3d(ls: Dictionary, img: Image, root: Node, scene_owner: Node,
 		_discard(terrain, root)
 		return false
 
+	# import_images only populates memory. Terrain3D's own editor plugin writes
+	# the regions out when the user saves the scene, but nothing guarantees that
+	# — and without it the data directory stays EMPTY, so reopening the scene
+	# gives a Terrain3D node with zero regions and a flat, checkered surface.
+	# Persist them here so the import is complete on its own.
+	if data.has_method("save_directory"):
+		data.call("save_directory", data_dir)
+
 	_store_terrain_metadata(terrain, ls)
-	warnings.append(("Landscape '%s' imported via Terrain3D at %.2f m vertex spacing (data in '%s'). "
-		+ "Assign a Terrain3DAssets resource to texture it; the exported weightmaps in terrain/ "
-		+ "carry the Unreal paint layers.") % [ls_name, spacing, data_dir])
+	warnings.append(("Landscape '%s' imported via Terrain3D at %.2f m vertex spacing, %d region(s) "
+		+ "saved to '%s'. It renders as a flat checkerboard until you assign a Terrain3DAssets "
+		+ "resource — that is Terrain3D's untextured default, not a failed import; the exported "
+		+ "weightmaps in terrain/ carry the Unreal paint layers.")
+		% [ls_name, spacing, int(data.call("get_region_count")) if data.has_method("get_region_count") else 0,
+			data_dir])
+	if int(aligned.get("pad_x", 0)) > 0 or int(aligned.get("pad_z", 0)) > 0:
+		warnings.append(("Landscape '%s': Terrain3D snaps imports to its region grid, so %.0f x %.0f m "
+			+ "of flat filler at the landscape's lowest height was added on the -X/-Z sides to keep "
+			+ "the real terrain at its Unreal world position. The Unreal footprint itself starts at "
+			+ "(%.0f, %.0f).") % [ls_name, int(aligned.get("pad_x", 0)) * spacing,
+			int(aligned.get("pad_z", 0)) * spacing, corner.x, corner.z])
 	return true
 
 
@@ -492,7 +509,7 @@ func _align_to_region_grid(img: Image, corner: Vector3, region_extent_m: float, 
 	var pad_x := int(round((corner.x - snapped.x) / spacing))
 	var pad_z := int(round((corner.z - snapped.z) / spacing))
 	if pad_x <= 0 and pad_z <= 0:
-		return {"image": img, "origin": corner}
+		return {"image": img, "origin": corner, "pad_x": 0, "pad_z": 0}
 	pad_x = maxi(pad_x, 0)
 	pad_z = maxi(pad_z, 0)
 	# Padded texels sit outside the Unreal footprint; hold them at the lowest
@@ -501,7 +518,7 @@ func _align_to_region_grid(img: Image, corner: Vector3, region_extent_m: float, 
 	var padded := Image.create(img.get_width() + pad_x, img.get_height() + pad_z, false, img.get_format())
 	padded.fill(Color(lowest, 0.0, 0.0))
 	padded.blit_rect(img, Rect2i(Vector2i.ZERO, img.get_size()), Vector2i(pad_x, pad_z))
-	return {"image": padded, "origin": snapped}
+	return {"image": padded, "origin": snapped, "pad_x": pad_x, "pad_z": pad_z}
 
 
 func _to_terrain3d_image(img: Image, center: Vector3, extent: Vector3) -> Image:
