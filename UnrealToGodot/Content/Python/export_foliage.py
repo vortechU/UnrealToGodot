@@ -202,17 +202,17 @@ def collect_foliage(all_actors, register_mesh, collected_textures=None):
     return entries
 
 
-def _instance_world_transform(comp, index):
+def _instance_transform(comp, index, world_space):
     """
-    Reads one instance's world-space transform defensively. The UE Python wrapper
-    may return the transform directly or a (success, transform) tuple depending
-    on engine version.
+    Reads one instance's transform defensively. The UE Python wrapper may return
+    the transform directly or a (success, transform) tuple depending on engine
+    version.
     """
     try:
-        result = comp.get_instance_transform(index, True)
+        result = comp.get_instance_transform(index, world_space)
     except TypeError:
         try:
-            result = comp.get_instance_transform(index, world_space=True)
+            result = comp.get_instance_transform(index, world_space=world_space)
         except Exception:
             return None
     except Exception:
@@ -225,6 +225,31 @@ def _instance_world_transform(comp, index):
             if isinstance(item, unreal.Transform):
                 return item
     return None
+
+
+def _instance_world_transform(comp, index):
+    """One instance's world-space transform, or None."""
+    return _instance_transform(comp, index, True)
+
+
+def iter_instance_transforms(comp):
+    """
+    Yields (index, world_transform, local_transform) for every readable instance.
+
+    This is the orchestrator's fallback path. When foliage export is switched
+    OFF nothing collects these components here, so rather than dropping the
+    content the layout exporter emits one ordinary component placement per
+    instance -- see export_level_to_json's instanced-component expansion.
+    """
+    try:
+        count = int(comp.get_instance_count())
+    except Exception:
+        return
+    for index in range(count):
+        world = _instance_world_transform(comp, index)
+        if world is None:
+            continue
+        yield index, world, _instance_transform(comp, index, False)
 
 
 def _classify_source(actor, comp, foliage_actor_class):

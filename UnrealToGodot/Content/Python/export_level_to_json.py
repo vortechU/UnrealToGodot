@@ -597,6 +597,56 @@ def extract_mesh_materials(mesh, collected_textures=None):
         
     return materials_data
 
+# Expanding an instanced component into individual placements is exact but
+# unbatched, so a dense painted field turns into tens of thousands of separate
+# mesh placements. Past this many instances on ONE component, say so plainly --
+# re-enabling foliage export rebuilds it as a single MultiMesh instead.
+_INSTANCE_EXPANSION_WARN_THRESHOLD = 1000
+
+
+def _expand_instanced_component(foliage_mod, comp, comp_name, mesh_key, mesh_name,
+                                mesh_path, material_overrides, actor_label):
+    """
+    One schema component entry per instance of an instanced (ISM/HISM/foliage)
+    component, for the path where foliage export is switched off.
+
+    Both importers place a component from its WORLD transform, so that is the
+    one that has to be right. `godot_relative_transform` carries the instance's
+    component-local transform, which is the actor-relative transform whenever
+    the instanced component is the actor root -- the overwhelmingly common case,
+    and only ever used for diagnostics.
+    """
+    if foliage_mod is None or not hasattr(foliage_mod, "iter_instance_transforms"):
+        return []
+
+    placements = []
+    try:
+        for index, world_transform, local_transform in foliage_mod.iter_instance_transforms(comp):
+            if local_transform is None:
+                local_transform = world_transform
+            placements.append({
+                "name": f"{comp_name}_Inst{index}",
+                "mesh_key": mesh_key,
+                "mesh_name": mesh_name,
+                "mesh_path": mesh_path,
+                "unreal_relative_transform": unreal_transform_to_dict(local_transform),
+                "godot_relative_transform": unreal_to_godot_transform(local_transform),
+                "unreal_world_transform": unreal_transform_to_dict(world_transform),
+                "godot_world_transform": unreal_to_godot_transform(world_transform),
+                "material_overrides": material_overrides,
+            })
+    except Exception as e:
+        unreal.log_warning(
+            f"Could not expand instanced component '{comp_name}' on '{actor_label}': {str(e)}")
+
+    if len(placements) >= _INSTANCE_EXPANSION_WARN_THRESHOLD:
+        unreal.log_warning(
+            f"'{actor_label}.{comp_name}' expanded to {len(placements)} individual mesh "
+            f"placements because Foliage & Instances export is off. Enable it to export "
+            f"this as one batched MultiMesh instead.")
+    return placements
+
+
 def extract_component_material_overrides(comp, collected_textures=None):
     """
     Extracts material overrides from a component.
@@ -666,23 +716,32 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
         opts.update(options)
 
     # Optional feature modules (each missing module simply disables its feature).
-    # export_foliage is loaded even when foliage export is OFF: it owns the list of
-    # instanced component classes that must be EXCLUDED from per-component actor
-    # export. Without it, every ISM/HISM/painted-foliage component would be emitted
-    # as a single mesh placement at its component origin instead of being omitted.
+    # export_foliage is loaded even when foliage export is OFF: it owns both the
+    # list of instanced component classes and the per-instance transform reader,
+    # and the fallback path below needs the second even when the first is unused.
     foliage_mod = _try_import("export_foliage")
     environment_mod = _try_import("export_environment") if (opts.get("lights") or opts.get("decals")) else None
     landscape_mod = _try_import("export_landscape") if opts.get("landscape") else None
     gameplay_mod = _try_import("export_gameplay") if (opts.get("navigation") or opts.get("metadata")) else None
 
-    # Instanced-mesh components (foliage/ISM/HISM) are exported as packed instance
-    # arrays, never as single per-component placements.
+    # Instanced-mesh components (foliage/ISM/HISM) are normally exported as packed
+    # instance arrays by the foliage exporter, so they are excluded from the
+    # per-component actor export to avoid emitting them twice.
+    #
+    # That exclusion is conditional on the foliage exporter actually running. It
+    # used to be unconditional, which meant unticking "Foliage & Instances"
+    # deleted the content outright: nothing collected those components and
+    # nothing placed them either. With foliage off they now fall through to the
+    # per-component path, where each INSTANCE becomes its own placement -- one
+    # placement per component would collapse a whole painted field onto a single
+    # mesh at the component origin, which is worse than useless.
     instanced_classes = ()
     if foliage_mod:
         try:
             instanced_classes = foliage_mod.get_instanced_component_classes()
         except Exception as e:
             unreal.log_warning(f"Could not query instanced component classes: {str(e)}")
+    expand_instanced = bool(instanced_classes) and not opts.get("foliage")
 
     # 1. Check requirements
     if not hasattr(unreal, "get_editor_subsystem"):
@@ -828,7 +887,8 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
             valid_components = []
             
             for comp in static_comps:
-                if instanced_classes and isinstance(comp, instanced_classes):
+                if instanced_classes and isinstance(comp, instanced_classes) \
+                        and not expand_instanced:
                     continue  # exported as packed instance arrays by the foliage exporter
                 mesh = comp.static_mesh if hasattr(comp, "static_mesh") else comp.get_editor_property("static_mesh")
                 if mesh:
@@ -867,11 +927,23 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                 mesh_name = mesh.get_name()
                 mesh_path = mesh.get_path_name()
                 mesh_key = register_mesh(mesh)
-                
+
+                # Foliage export is off: emit one placement per instance rather
+                # than one per component, which would put a whole painted field
+                # on a single mesh at the component origin.
+                if expand_instanced and isinstance(comp, instanced_classes):
+                    placements = _expand_instanced_component(
+                        foliage_mod, comp, comp_name, mesh_key, mesh_name, mesh_path,
+                        extract_component_material_overrides(comp, collected_textures),
+                        actor_label)
+                    actor_data["components"].extend(placements)
+                    total_components_count += len(placements)
+                    continue
+
                 # Fetch local relative transform and absolute world transform of the component
                 comp_relative_transform = comp.get_relative_transform()
                 comp_world_transform = comp.get_world_transform()
-                
+
                 comp_data = {
                     "name": comp_name,
                     "mesh_key": mesh_key,

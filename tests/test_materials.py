@@ -1033,13 +1033,26 @@ _ISM_DEFAULTS = {
 }
 
 
+class _Rotator:
+    def __init__(self, roll=0.0, pitch=0.0, yaw=0.0):
+        self.roll, self.pitch, self.yaw = roll, pitch, yaw
+
+
+class _FoliageQuat(_Quat):
+    """The shared _Quat stub returns None from rotator(); unreal_transform_to_dict
+    reads rotator().roll/pitch/yaw, so the fallback path needs a real one."""
+
+    def rotator(self):
+        return _Rotator()
+
+
 class _FoliageTransform(u.Transform):
     """Must actually BE an unreal.Transform: _instance_world_transform
     isinstance-checks the value it gets back before packing it."""
 
     def __init__(self, translation, scale=(1.0, 1.0, 1.0)):
         self.translation = _Vec(*translation)
-        self.rotation = _Quat(0.0, 0.0, 0.0, 1.0)
+        self.rotation = _FoliageQuat(0.0, 0.0, 0.0, 1.0)
         self.scale3d = _Vec(*scale)
 
 
@@ -1211,6 +1224,55 @@ survivors = EF.collect_foliage(
     lambda m: m.get_name(), set())
 check("an unreadable instanced component is skipped, not fatal",
       len(survivors) == 1 and survivors[0]["mesh_name"] == "SM_Fern", survivors)
+
+print("\n=== 10. Instanced-component fallback when foliage export is off ===")
+
+# Unticking "Foliage & Instances" used to DELETE instanced meshes: the exclusion
+# from per-component export was unconditional, but nothing collected them as
+# foliage either. They now fall through and expand to one placement per instance
+# -- one placement per COMPONENT would collapse a painted field onto a single
+# mesh at the component origin.
+fallback_comp = _FakeISM(_FakeMesh("SM_Fence"), instances=[
+    _FoliageTransform((100.0, 200.0, 300.0)),
+    _FoliageTransform((0.0, 0.0, 0.0), (2.0, 2.0, 2.0)),
+])
+placements = EL._expand_instanced_component(
+    EF, fallback_comp, "FenceISM", "SM_Fence", "SM_Fence", "/Game/SM_Fence.SM_Fence",
+    [], "BP_Fence")
+check("every instance becomes its own component placement",
+      len(placements) == 2, len(placements))
+check("expanded placements get unique names",
+      [p["name"] for p in placements] == ["FenceISM_Inst0", "FenceISM_Inst1"],
+      [p["name"] for p in placements])
+check("an expanded placement carries the instance's own world transform",
+      placements[0]["godot_world_transform"]["translation"] == [2.0, 3.0, -1.0],
+      placements[0]["godot_world_transform"]["translation"])
+check("an expanded placement keeps the instance's scale",
+      placements[1]["godot_world_transform"]["scale"] == [2.0, 2.0, 2.0],
+      placements[1]["godot_world_transform"]["scale"])
+check("expanded placements point at the same mesh the foliage path would use",
+      all(p["mesh_key"] == "SM_Fence" for p in placements))
+check("expanded placements emit the world transform both importers actually read",
+      "unreal_world_transform" in placements[0] and "godot_world_transform" in placements[0])
+
+# A component whose instances cannot be read must not take the actor down.
+class _UnreadableISM(_FakeISM):
+    def get_instance_count(self):
+        raise Exception("boom")
+
+
+check("an unreadable instanced component expands to nothing rather than raising",
+      EL._expand_instanced_component(EF, _UnreadableISM(_FakeMesh()), "X", "k", "n", "p",
+                                     [], "Actor") == [])
+check("expansion is a no-op when the foliage module is unavailable",
+      EL._expand_instanced_component(None, fallback_comp, "X", "k", "n", "p",
+                                     [], "Actor") == [])
+
+# The generator the fallback rides on must report both spaces.
+rows = list(EF.iter_instance_transforms(fallback_comp))
+check("iter_instance_transforms yields (index, world, local) per instance",
+      len(rows) == 2 and rows[0][0] == 0 and rows[0][1] is not None and rows[0][2] is not None,
+      rows)
 
 print("\n" + "=" * 60)
 if FAIL:

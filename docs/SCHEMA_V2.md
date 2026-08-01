@@ -454,6 +454,14 @@ routed here (source `"ism"`/`"hism"`), and are excluded from `actors[].component
 Components flagged `bIsEditorOnly` are skipped entirely — they never ship with the
 game and must not ship with the export.
 
+**When foliage export is switched off**, that exclusion is lifted and each
+instanced component expands into `actors[].components` as **one placement per
+instance**, named `"<component>_Inst<n>"`, each carrying its own instance world
+transform. Exporting one placement per *component* instead would collapse an
+entire painted field onto a single mesh at the component origin. The expansion is
+exact but unbatched, so a component past ~1000 instances logs a warning pointing
+back at the foliage option, which rebuilds it as a single MultiMesh.
+
 ### Cull distances
 
 UE's per-instance cull pair maps onto `GeometryInstance3D`'s visibility range:

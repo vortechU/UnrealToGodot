@@ -116,6 +116,7 @@ part-way through an import.
 3. Set both paths: the glTF target folder (defaults to `Saved/Exports/GLTF`) and the layout JSON path.
 4. **Choose Level Export Features** (all optional, all persisted between sessions):
    - **Lights & Post-Process**, **Decals**, **Landscape / Terrain**, **Foliage & Instances**, **Navigation Volumes**, **Tags & Metadata** — untick anything you don't want in the export.
+   - Unticking **Foliage & Instances** does not discard instanced geometry: each instance is exported as an ordinary mesh placement instead, so ISM/HISM detail (railings, window frames) still arrives — just unbatched. Leave it ticked for dense painted foliage, which is far cheaper as a MultiMesh.
    - **Generate Godot .tscn scene directly**: writes a ready-to-open scene file into your Godot project (requires the Godot Project Path in the *Godot Engine Integration* section).
 5. Click **Export Everything (Meshes + Layout)**.
 
