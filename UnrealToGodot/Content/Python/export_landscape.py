@@ -70,10 +70,14 @@ DEFAULT_WEIGHT_GRID_MAX = 129  # CPU weight sampling cap; ~815 samples/s per lay
 EDGE_NUDGE_CM = 1.0            # pull boundary samples inside the last component
 
 
-def collect_landscapes(all_actors, json_dir, options=None):
+def collect_landscapes(all_actors, json_dir, options=None, collected_textures=None):
     """
     Returns a list of schema landscape entries; writes terrain image files under
     <json_dir>/terrain/. Never raises, never shows dialogs.
+
+    collected_textures, when given, receives the landscape material's textures
+    so the level exporter writes them out with everything else -- without it the
+    ground textures never reach Godot and the terrain cannot be textured at all.
 
     options (all optional):
         terrain_height_resolution : int  CPU height-grid cap (default 513)
@@ -149,7 +153,8 @@ def collect_landscapes(all_actors, json_dir, options=None):
     for landscape in parents:
         try:
             related = children_of.get(_actor_key(landscape), [])
-            entry = _export_one_landscape(world, landscape, related, terrain_dir, opts)
+            entry = _export_one_landscape(world, landscape, related, terrain_dir, opts,
+                                           collected_textures)
             if entry:
                 results.append(entry)
         except Exception as e:
@@ -288,7 +293,8 @@ def _build_component_grid(actors, comp_class):
     return _ComponentGrid(entries)
 
 
-def _export_one_landscape(world, landscape, related_proxies, terrain_dir, opts):
+def _export_one_landscape(world, landscape, related_proxies, terrain_dir, opts,
+                          collected_textures=None):
     label = ue2g_common.sanitize_name(landscape.get_actor_label())
     group = [landscape] + list(related_proxies)
     origin, extent = _union_actor_bounds(group)
@@ -343,6 +349,7 @@ def _export_one_landscape(world, landscape, related_proxies, terrain_dir, opts):
             "extent": [extent.x, extent.y, z_extent],
         },
         "layers": layers,
+        "material": _collect_material_textures(landscape, collected_textures),
     }
 
 
@@ -639,6 +646,79 @@ def _layer_debug_color(layer_info):
         return [float(c.r), float(c.g), float(c.b)]
     except Exception:
         return None
+
+
+def _collect_material_textures(landscape, collected_textures):
+    """Harvests the landscape material's textures and describes them in the schema.
+
+    Without this the ground textures never leave Unreal: the level exporter only
+    walks MESH materials and decal materials, and a landscape's material hangs
+    off the actor, referenced by nothing else. Every previous release therefore
+    shipped weightmaps with no textures to blend -- there was physically nothing
+    in the Godot project to assign.
+
+    The layer -> texture mapping is still not derivable (paint layers are
+    routinely named "1", "2", "3" while the textures are named after the
+    material they came from), so the roles here are classified from the texture
+    ASSET names and the user does the final pairing. Returns {} when there is no
+    readable material."""
+    material = ue2g_common.safe_get_prop(landscape, "landscape_material")
+    if material is None:
+        return {}
+
+    role_of = None
+    try:
+        # Deferred: export_level_to_json imports THIS module, so a top-level
+        # import would be circular. By the time a landscape is exported the
+        # parent module is already in sys.modules.
+        import export_level_to_json
+        role_of = export_level_to_json.resolve_texture_role
+    except Exception:
+        pass
+
+    textures = []
+    seen = set()
+    try:
+        for param_name, tex in ue2g_common.iter_base_material_textures(material):
+            if tex is None:
+                continue
+            try:
+                tex_name = tex.get_name()
+            except Exception:
+                continue
+            if tex_name in seen:
+                continue
+            seen.add(tex_name)
+            if collected_textures is not None:
+                collected_textures.add(tex)
+            role = None
+            if role_of is not None:
+                try:
+                    role, _packed = role_of(str(param_name or "").lower(), tex_name.lower())
+                except Exception:
+                    role = None
+            # resolve_texture_role returns material SLOT keys ("albedo_texture",
+            # "normal_texture"). This field names a role, not a slot, so the
+            # suffix comes off -- both consumers match on "albedo".
+            if role and role.endswith("_texture"):
+                role = role[: -len("_texture")]
+            textures.append({
+                "parameter": str(param_name or ""),
+                "texture": tex_name,
+                "role": role or "unknown",
+            })
+    except Exception as e:
+        unreal.log_warning(f"export_landscape: could not read the landscape material's textures: {str(e)}")
+
+    entry = {"textures": textures}
+    try:
+        entry["name"] = material.get_name()
+        entry["path"] = material.get_path_name()
+    except Exception:
+        pass
+    if textures:
+        unreal.log(f"export_landscape: harvested {len(textures)} texture(s) from the landscape material.")
+    return entry
 
 
 def _discover_layers(landscape):

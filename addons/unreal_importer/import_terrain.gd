@@ -272,10 +272,36 @@ func _build_terrain_material(ls: Dictionary, json_dir: String, warnings: PackedS
 		mat.set_shader_parameter("layer%d_tint" % i, tints[i] if i < tints.size() else Color.WHITE)
 
 	var names: Array = packed["names"]
+	var hint := ""
+	var candidates := _albedo_candidates(ls)
+	if not candidates.is_empty():
+		hint = (" The landscape material's ground textures were exported to textures/ — likely "
+			+ "candidates: %s.") % ", ".join(candidates)
 	warnings.append(("Landscape '%s': terrain material splat-blends %d paint layer(s) (%s) using each "
-		+ "layer's Unreal debug colour. Assign layer0..%d_albedo on the TerrainMesh material to texture them.")
-		% [ls_name, used, ", ".join(names), used - 1])
+		+ "layer's Unreal debug colour. Assign layer0..%d_albedo on the TerrainMesh material to texture "
+		+ "them (and set the matching tint to white).%s")
+		% [ls_name, used, ", ".join(names), used - 1, hint])
 	return mat
+
+
+func _albedo_candidates(ls: Dictionary) -> PackedStringArray:
+	"""Base-colour textures harvested from the Unreal landscape material.
+
+	They cannot be matched to paint layers automatically — Unreal's layer-blend
+	graph carries no layer->texture link readable from Python, and paint layers
+	are routinely named "1", "2", "3" — so they are offered as candidates for
+	the user to pair up rather than assigned blindly."""
+	var out := PackedStringArray()
+	var material = ls.get("material")
+	if not (material is Dictionary):
+		return out
+	var textures = material.get("textures")
+	if not (textures is Array):
+		return out
+	for tex in textures:
+		if tex is Dictionary and Common.get_str(tex, "role", "") == "albedo":
+			out.append(Common.get_str(tex, "texture", ""))
+	return out
 
 
 func _pack_splatmap(ls: Dictionary, json_dir: String) -> Dictionary:
@@ -574,6 +600,23 @@ func _store_terrain_metadata(node: Node, ls: Dictionary) -> void:
 		node.set_meta("heightmap_resolution", Vector2i(int(res[0]), int(res[1])))
 	node.set_meta("height_range_m", ls.get("height_range_m", []))
 	node.set_meta("vertex_spacing_m", float(ls.get("vertex_spacing_m", 1.0)))
+	# The landscape material's own textures, so the ground textures are findable
+	# from the node rather than by hunting through textures/ by name.
+	var material = ls.get("material")
+	if material is Dictionary:
+		var albedos := PackedStringArray()
+		var all_tex := PackedStringArray()
+		for tex in (material.get("textures") if material.get("textures") is Array else []):
+			if not (tex is Dictionary):
+				continue
+			all_tex.append(Common.get_str(tex, "texture", ""))
+			if Common.get_str(tex, "role", "") == "albedo":
+				albedos.append(Common.get_str(tex, "texture", ""))
+		if not all_tex.is_empty():
+			node.set_meta("landscape_material", Common.get_str(material, "name", ""))
+			node.set_meta("landscape_textures", all_tex)
+		if not albedos.is_empty():
+			node.set_meta("landscape_albedo_textures", albedos)
 	var layer_files := PackedStringArray()
 	var layer_names := PackedStringArray()
 	var layers = ls.get("layers", [])

@@ -1171,6 +1171,29 @@ class _TscnWriter(object):
             if spacing is not None:
                 metadata.append("metadata/vertex_spacing_m = " + _f(_num(spacing, 1.0)))
 
+            # The landscape material's own textures. Unreal's layer-blend graph
+            # exposes no layer->texture link, so these are recorded as
+            # candidates for the user to pair with the paint layers by hand.
+            material = lscape.get("material")
+            if isinstance(material, dict):
+                all_tex = []
+                albedos = []
+                for tex in (material.get("textures") or []):
+                    if not isinstance(tex, dict):
+                        continue
+                    name_str = str(tex.get("texture", ""))
+                    all_tex.append(name_str)
+                    if tex.get("role") == "albedo":
+                        albedos.append(name_str)
+                if all_tex:
+                    metadata.append('metadata/landscape_material = "%s"'
+                                    % _escape_string(material.get("name", "")))
+                    metadata.append("metadata/landscape_textures = PackedStringArray(%s)"
+                                    % ", ".join('"%s"' % _escape_string(t) for t in all_tex))
+                if albedos:
+                    metadata.append("metadata/landscape_albedo_textures = PackedStringArray(%s)"
+                                    % ", ".join('"%s"' % _escape_string(t) for t in albedos))
+
             layers = lscape.get("layers")
             if isinstance(layers, (list, tuple)) and layers:
                 layer_names = []

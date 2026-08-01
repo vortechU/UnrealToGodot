@@ -130,6 +130,13 @@ layout = {
         {"name": "Landscape_0", "godot_transform": IDENT, "heightmap_file": "terrain/L0_height.exr",
          "heightmap_resolution": [513, 513], "world_size_m": [504, 504], "world_center_m": [0, 25, 0],
          "height_range_m": [0.0, 50.0], "height_encoding": "normalized", "vertex_spacing_m": 0.984375,
+         # Harvested from the landscape material; roles come from the asset
+         # names, and no layer->texture mapping is claimed.
+         "material": {"name": "MI_Ground", "path": "/Game/MI_Ground.MI_Ground", "textures": [
+             {"parameter": "", "texture": "T_grass_basecolor", "role": "albedo"},
+             {"parameter": "", "texture": "T_grass_normal", "role": "normal"},
+             {"parameter": "", "texture": "T_rock_basecolor", "role": "albedo"},
+         ]},
          "layers": [
              {"name": "Grass", "weightmap_file": "terrain/L0_weight_Grass.exr",
               "debug_color": [0.2, 0.8, 0.3]},
@@ -425,6 +432,13 @@ assert 'metadata/weightmap_layers = PackedStringArray("Grass", "Rock")' in land,
     "every discovered paint layer must be listed: %s" % land
 assert 'metadata/weightmap_files = PackedStringArray("res://terrain/L0_weight_Grass.exr", "")' in land, \
     "weightmap paths must be rewritten and hold a slot for unpainted layers: %s" % land
+# The landscape material's textures: every texture listed, albedos called out
+# separately as the candidates to pair with paint layers.
+assert 'metadata/landscape_material = "MI_Ground"' in land, "landscape material name missing: %s" % land
+assert ('metadata/landscape_textures = PackedStringArray("T_grass_basecolor", "T_grass_normal", '
+        '"T_rock_basecolor")') in land, "landscape material textures missing: %s" % land
+assert 'metadata/landscape_albedo_textures = PackedStringArray("T_grass_basecolor", "T_rock_basecolor")' in land, \
+    "albedo candidates must be listed separately: %s" % land
 
 # Every meta key the addon writes must have a counterpart here.
 for meta_key in re.findall(r'set_meta\("([a-z_0-9]+)"', terrain_gd):

@@ -425,9 +425,25 @@ decal's projection depth for its height. Guarded by `test_math.py` section 11 an
             "weightmap_file": "terrain/Landscape_0_weight_Grass.exr",  // omitted when unpainted
             "debug_color": [r, g, b]         // LandscapeLayerInfoObject.layer_usage_debug_color, linear
         }
-    ]
+    ],
+    "material": {                            // the landscape material itself
+        "name": "MI_landscape",
+        "path": "/Game/.../MI_landscape.MI_landscape",
+        "textures": [                        // exported to textures/ like any other
+            { "parameter": "", "texture": "T_ash_01_basecolor", "role": "albedo" }
+        ]
+    }
 }
 ```
+
+`material.textures` exists because the level exporter only walks MESH materials
+and decal materials -- a landscape's material hangs off the actor and is
+referenced by nothing else, so before this the ground textures never left Unreal
+and there was nothing in the Godot project to texture the terrain with. `role` is
+`albedo` / `normal` / `roughness` / `metallic` / `ao` / `emission` / `packed` /
+`unknown`, classified from the parameter name first and the texture ASSET name
+second (`resolve_texture_role`), with the `_texture` slot suffix stripped. There
+is deliberately NO layer -> texture mapping (see below).
 
 ### Height encoding
 
@@ -463,12 +479,15 @@ is actually on disk. Consumers should still decode by content, since older expor
 
 ### Deliberately not mapped
 
-* **The landscape material.** Unreal's terrain look lives in a layer-blend material graph.
-  Which texture belongs to which paint layer is not readable from Python (layers are
-  frequently named `1`, `2`, `3`), so no faithful mapping exists. The exporter ships each
-  layer's weightmap plus its `debug_color`, and the Godot addon blends those tints in a
-  splat shader with one texture slot per layer, so assigning the real ground textures is
-  a drag-and-drop rather than a rebuild.
+* **The layer -> texture mapping.** Unreal's terrain look lives in a layer-blend material
+  graph, and which texture belongs to which paint layer is not readable from Python
+  (layers are frequently named `1`, `2`, `3` while the textures are named after the
+  material). The exporter ships each layer's weightmap plus its `debug_color`, AND every
+  texture the landscape material references (`material.textures`, with the base-colour
+  ones flagged `role: "albedo"` as the candidates). The Godot addon blends the tints in a
+  splat shader with one texture slot per layer and reports the candidate names, so the
+  final pairing is a drag-and-drop rather than a rebuild -- but it is the user's call,
+  not a guess the exporter makes.
 * **Landscape holes / the visibility layer**, **landscape splines**, **grass types**, and
   **per-layer physical materials.** None are exported.
 * **More than four paint layers.** The Godot splat material packs weights into one RGBA

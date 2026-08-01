@@ -412,6 +412,83 @@ class _NoWeightmapAPI(Landscape):
 check(EX._gpu_weightmap_to_file("WORLD", _NoWeightmapAPI(), "1", tmp, "w.exr", 64, 64) is None,
       "a landscape with no weightmap API returns None instead of raising")
 
+# ===========================================================================
+print("9. the landscape material's textures are harvested")
+# ===========================================================================
+# The level exporter only walks MESH materials and decal materials. A
+# landscape's material hangs off the actor and is referenced by nothing else,
+# so without this harvest the ground textures never leave Unreal and there is
+# physically nothing in the Godot project to texture the terrain with.
+# Probed on 5.7.4: iter_base_material_textures(MI_landscape) yields 12 textures
+# (ash / dry_sand / rocky_cliffs x basecolor, height, normal, roughness).
+
+
+class _Tex(object):
+    def __init__(self, name):
+        self._name = name
+
+    def get_name(self):
+        return self._name
+
+
+_LANDSCAPE_TEXTURES = [
+    ("", _Tex("T_ash_01_basecolor")),
+    ("", _Tex("T_ash_01_normal")),
+    ("", _Tex("T_dry_sand_basecolor")),
+    ("", _Tex("T_dry_sand_roughness")),
+    ("", _Tex("T_rocky_cliffs_basecolor")),
+    # A duplicate reference must not produce a duplicate entry.
+    ("", _Tex("T_ash_01_basecolor")),
+]
+
+
+class _Material(object):
+    def get_name(self):
+        return "MI_landscape"
+
+    def get_path_name(self):
+        return "/Game/MI_landscape.MI_landscape"
+
+
+class _Landscaped(Landscape):
+    def get_editor_property(self, name):
+        if name == "landscape_material":
+            return _Material()
+        raise Exception("no %s" % name)
+
+
+ue2g_common = sys.modules["ue2g_common"]
+_real_iter = ue2g_common.iter_base_material_textures
+ue2g_common.iter_base_material_textures = lambda mat, include_dependencies=True: iter(_LANDSCAPE_TEXTURES)
+try:
+    collected = set()
+    mat_entry = EX._collect_material_textures(_Landscaped(), collected)
+    check(mat_entry.get("name") == "MI_landscape", "material name recorded (%r)" % mat_entry.get("name"))
+    names = [t["texture"] for t in mat_entry.get("textures", [])]
+    check(names == ["T_ash_01_basecolor", "T_ash_01_normal", "T_dry_sand_basecolor",
+                    "T_dry_sand_roughness", "T_rocky_cliffs_basecolor"],
+          "every texture recorded once, in order -> %s" % names)
+    check(len(collected) == 5,
+          "all 5 distinct textures queued for export (got %d)" % len(collected))
+    # Roles come from the ASSET name -- these materials have no parameter names.
+    roles = {t["texture"]: t["role"] for t in mat_entry["textures"]}
+    check(roles["T_ash_01_basecolor"] == "albedo",
+          "basecolor classified as albedo (got %r)" % roles["T_ash_01_basecolor"])
+    check(roles["T_ash_01_normal"] == "normal",
+          "normal classified as normal (got %r)" % roles["T_ash_01_normal"])
+    albedos = [t["texture"] for t in mat_entry["textures"] if t["role"] == "albedo"]
+    check(len(albedos) == 3, "3 albedo candidates for the 3 paint layers -> %s" % albedos)
+
+    # A landscape with no material must not crash or invent an entry.
+    check(EX._collect_material_textures(_NoLayers(), set()) == {},
+          "a landscape with no readable material yields {}")
+    # And the harvest must never take the level export down with it.
+    ue2g_common.iter_base_material_textures = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    survived = EX._collect_material_textures(_Landscaped(), set())
+    check(survived.get("textures") == [], "a raising harvest degrades to no textures, not an exception")
+finally:
+    ue2g_common.iter_base_material_textures = _real_iter
+
 print("")
 if FAILS:
     print("FAILED %d check(s):" % len(FAILS))

@@ -367,6 +367,19 @@ def finalize_layout_texture_names(layout_data, name_by_path):
                 apply_texture_export_names(override.get("parameters"), name_by_path)
     for decal in (layout_data.get("decals") or []):
         apply_texture_export_names(decal.get("textures"), name_by_path)
+    # The landscape material's textures are recorded as a list of asset names
+    # rather than a slot dict, so they are rewritten by name, not by path.
+    name_by_asset = {}
+    for path, final in name_by_path.items():
+        name_by_asset[str(path).split(".")[-1]] = final
+    for landscape in (layout_data.get("landscapes") or []):
+        material = landscape.get("material")
+        if not isinstance(material, dict):
+            continue
+        for tex in (material.get("textures") or []):
+            final = name_by_asset.get(tex.get("texture"))
+            if final:
+                tex["texture"] = final
 
 
 def extract_material_parameters(material, collected_textures=None):
@@ -996,7 +1009,7 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
     if landscape_mod:
         try:
             landscapes_data = landscape_mod.collect_landscapes(
-                all_actors, os.path.dirname(save_path), opts) or []
+                all_actors, os.path.dirname(save_path), opts, collected_textures) or []
         except Exception as e:
             unreal.log_warning(f"Landscape export failed: {str(e)}")
 
