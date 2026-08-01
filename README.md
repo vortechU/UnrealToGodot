@@ -22,7 +22,7 @@ This repository contains two main components:
 | | Tested against | Notes |
 |---|---|---|
 | **Unreal Engine** | **5.7** | Earlier versions are **untested** — no claim either way. Version-specific engine APIs are probed at runtime rather than assumed, so older 5.x may well work, but nobody has confirmed it yet. If you try one, [tell us how it went](https://discord.com/invite/HGwkYW2h6Y). Requires the built-in **Python Editor Script**, **Editor Scripting Utilities** and **glTF Exporter** plugins. |
-| **Godot** | **4.6.3** | The addon ships `.uid` resource sidecars, which are a Godot 4.4+ concept, so 4.4 is the practical floor. |
+| **Godot** | **4.7.1** | The addon ships `.uid` resource sidecars, which are a Godot 4.4+ concept, so 4.4 is the practical floor. |
 
 Both halves stamp and check a schema version, so a mismatched plugin/addon pair
 fails immediately with a message naming which side to update, rather than

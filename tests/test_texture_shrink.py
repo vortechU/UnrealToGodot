@@ -7,7 +7,7 @@ went through the cooked, block-compressed pixels -- which flatten a BC5 normal
 map's blue channel to a constant 0. So the normal map is the load-bearing case
 here: its blue channel must survive.
 
-    python tests/test_texture_shrink.py --godot "V:/Apps/Godot_v4.6.3/Godot_v4.6.3.exe"
+    python tests/test_texture_shrink.py --godot "V:/Apps/Godot_v4.7.1/Godot_v4.7.1-stable_win64.exe"
 
 Needs a folder of real exports (default C:/scratch/texquality, written by
 tests/probe_texture_export_routes.py). Skips cleanly if they are absent.
@@ -228,7 +228,7 @@ def run_dock_leg(godot, textures, limit):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--godot", default="V:/Apps/Godot_v4.6.3/Godot_v4.6.3.exe")
+    ap.add_argument("--godot", default="V:/Apps/Godot_v4.7.1/Godot_v4.7.1-stable_win64.exe")
     ap.add_argument("--exports", default="C:/scratch/texquality")
     ap.add_argument("--limit", type=int, default=1024)
     args = ap.parse_args()

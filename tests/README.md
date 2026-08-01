@@ -10,7 +10,7 @@ without opening an editor.
 python tests/run_tests.py
 
 # Also drive the real GDScript importer inside headless Godot
-python tests/run_tests.py --godot "V:/Apps/Godot_v4.6.3/Godot_v4.6.3.exe"
+python tests/run_tests.py --godot "V:/Apps/Godot_v4.7.1/Godot_v4.7.1-stable_win64.exe"
 ```
 
 ## The real-data loop
@@ -27,7 +27,7 @@ UnrealEditor-Cmd.exe <project>.uproject -run=pythonscript \
 
 # FAST (~1s import) -- run after every Godot-side change
 python tests/run_real_check.py C:/scratch/real_export_out \
-  --godot "V:/Apps/Godot_v4.6.3/Godot_v4.6.3.exe"
+  --godot "V:/Apps/Godot_v4.7.1/Godot_v4.7.1-stable_win64.exe"
 ```
 
 `run_real_check.py` builds a throwaway project from the export, imports it, and

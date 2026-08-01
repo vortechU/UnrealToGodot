@@ -50,7 +50,7 @@ your port of it.
 **Godot** (real member names, types and defaults for the installed version):
 
 ```bash
-"V:/Apps/Godot_v4.6.3/Godot_v4.6.3.exe" --headless --doctool "<scratchpad>/gddoc"
+"V:/Apps/Godot_v4.7.1/Godot_v4.7.1-stable_win64.exe" --headless --doctool "<scratchpad>/gddoc"
 ```
 
 then read `<scratchpad>/gddoc/doc/classes/<Class>.xml`. Descriptions come out
@@ -112,7 +112,7 @@ All four layers, not a subset:
 Run:
 
 ```bash
-python tests/run_tests.py --godot "V:/Apps/Godot_v4.6.3/Godot_v4.6.3.exe"
+python tests/run_tests.py --godot "V:/Apps/Godot_v4.7.1/Godot_v4.7.1-stable_win64.exe"
 ```
 
 Treat a test you had to loosen as a finding, not a chore. If a check fails,
