@@ -1128,6 +1128,14 @@ class _TscnWriter(object):
 
     # --- landscapes --------------------------------------------------------------------------
     def _build_landscapes(self, root_path):
+        """Emits a placeholder Node3D per landscape, carrying every field the
+        Godot addon's terrain importer consumes.
+
+        Deliberately geometry-free: rebuilding the terrain means decoding a
+        float EXR and generating a mesh or driving Terrain3D, none of which a
+        text .tscn can express. The Godot addon does that (dock import with
+        Terrain enabled). The metadata here is the complete handover -- keep it
+        in step with import_terrain.gd's _store_terrain_metadata."""
         for lscape in self.layout.get("landscapes") or []:
             if not isinstance(lscape, dict):
                 continue
@@ -1141,21 +1149,46 @@ class _TscnWriter(object):
             hm = lscape.get("heightmap_file")
             if hm:
                 heightmap_res = self.terrain_res + os.path.basename(str(hm).replace("\\", "/"))
-                metadata.append('metadata/heightmap = "%s"' % _escape_string(heightmap_res))
+                # Key name matches import_terrain.gd's set_meta("heightmap_file").
+                metadata.append('metadata/heightmap_file = "%s"' % _escape_string(heightmap_res))
+            res = lscape.get("heightmap_resolution")
+            if isinstance(res, (list, tuple)) and len(res) >= 2:
+                metadata.append("metadata/heightmap_resolution = Vector2i(%d, %d)"
+                                % (int(_num(res[0], 0)), int(_num(res[1], 0))))
             ws = lscape.get("world_size_m")
             if isinstance(ws, (list, tuple)) and ws:
                 metadata.append("metadata/world_size_m = " + _vec2_literal(ws))
+            wc = lscape.get("world_center_m")
+            if isinstance(wc, (list, tuple)) and len(wc) >= 3:
+                metadata.append("metadata/world_center_m = " + _vec3_literal(wc))
             hr = lscape.get("height_range_m")
             if isinstance(hr, (list, tuple)) and hr:
                 metadata.append("metadata/height_range_m = " + _vec2_literal(hr))
             enc = lscape.get("height_encoding")
             if enc:
                 metadata.append('metadata/height_encoding = "%s"' % _escape_string(enc))
+            spacing = lscape.get("vertex_spacing_m")
+            if spacing is not None:
+                metadata.append("metadata/vertex_spacing_m = " + _f(_num(spacing, 1.0)))
+
             layers = lscape.get("layers")
             if isinstance(layers, (list, tuple)) and layers:
-                layer_names = [l.get("name", "") if isinstance(l, dict) else str(l) for l in layers]
-                metadata.append("metadata/layers = [%s]"
+                layer_names = []
+                weight_files = []
+                for l in layers:
+                    if isinstance(l, dict):
+                        layer_names.append(str(l.get("name", "")))
+                        wf = l.get("weightmap_file")
+                        weight_files.append(self.terrain_res + os.path.basename(str(wf).replace("\\", "/"))
+                                            if wf else "")
+                    else:
+                        layer_names.append(str(l))
+                        weight_files.append("")
+                metadata.append("metadata/weightmap_layers = PackedStringArray(%s)"
                                 % ", ".join('"%s"' % _escape_string(n) for n in layer_names))
+                if any(weight_files):
+                    metadata.append("metadata/weightmap_files = PackedStringArray(%s)"
+                                    % ", ".join('"%s"' % _escape_string(p) for p in weight_files))
 
             self._add_node(name, "Node3D", root_path, props=props, metadata=metadata)
 

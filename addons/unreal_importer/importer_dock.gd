@@ -145,7 +145,7 @@ func _enter_tree() -> void:
 	lights_check = _make_check(features,"Lights", "Create DirectionalLight3D / OmniLight3D / SpotLight3D nodes from every exported Unreal light component, with matching intensity, colour, cone, source size, shadows and distance fade.")
 	environment_check = _make_check(features,"World Environment (post-fx, fog, sky)", "Create a WorldEnvironment from PostProcessVolume, height fog and sky data (bloom, SSAO, exposure, fog).")
 	decals_check = _make_check(features,"Decals", "Create Decal nodes from Unreal decal components, binding exported textures, tint, visibility and distance fade.")
-	terrain_check = _make_check(features,"Terrain (Landscapes)", "Rebuild Unreal Landscapes from exported heightmaps. Uses Terrain3D when installed, otherwise a plugin-free mesh fallback with collision.")
+	terrain_check = _make_check(features,"Terrain (Landscapes)", "Rebuild Unreal Landscapes from the exported terrain/ heightmaps. Uses Terrain3D when installed (1.x and 0.9.x), otherwise a plugin-free mesh with collision. Either way the exported paint layers become a splat material tinted with each layer's Unreal debug colour, with a texture slot per layer for you to fill in.")
 
 	var terrain_mode_row := HBoxContainer.new()
 	var terrain_mode_lbl := Label.new()
@@ -157,7 +157,7 @@ func _enter_tree() -> void:
 	terrain_mode_option.add_item("HTerrain")
 	terrain_mode_option.add_item("Mesh fallback")
 	terrain_mode_option.selected = 0
-	terrain_mode_option.tooltip_text = "Which terrain system to build with. Every mode falls back to the plugin-free mesh terrain if the plugin is unavailable."
+	terrain_mode_option.tooltip_text = "Which terrain system to build with. Every mode falls back to the plugin-free mesh terrain if the plugin is unavailable. Terrain3D keeps the full exported heightmap resolution; the mesh fallback caps it at a 257x257 grid."
 	terrain_mode_option.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	terrain_mode_row.add_child(terrain_mode_option)
 	features.add_child(terrain_mode_row)
@@ -493,7 +493,9 @@ func _on_import_pressed() -> void:
 	}
 
 	# Execute
-	var success: bool = importer.do_import(json_edit.text, models_edit.text, textures_edit.text, scene_root, options)
+	# awaited: do_import yields a frame when it hands a landscape to Terrain3D
+	# (the plugin builds its data object one frame after the node enters the tree).
+	var success: bool = await importer.do_import(json_edit.text, models_edit.text, textures_edit.text, scene_root, options)
 	
 	import_btn.disabled = false
 	if success:

@@ -143,31 +143,109 @@ static func find_model_path(folder: String, base_name: String) -> String:
 	return find_file_case_insensitive(folder, base_name, MODEL_EXTENSIONS)
 
 
-static func load_image_file(path: String) -> Image:
+static func load_image_file(path: String, notes = null) -> Image:
 	"""Loads an Image from res:// or an absolute filesystem path.
 
 	Used for heightmaps, where precision matters: Godot's texture importer may
 	VRAM-compress or reformat an .exr, which would quantise the height data and
 	produce terraced terrain. So for res:// paths we read the raw file off disk
 	first (globalize_path is reliable here — this is an editor-only tool) and
-	only fall back to the imported resource if that fails."""
+	only fall back to the imported resource if that fails.
+
+	The file's CONTENT picks the decoder, not its name. Unreal's
+	ExportRenderTarget chooses the output format from the render-target format
+	and keeps whatever filename it was handed, so a "*_height.exr" on disk is
+	frequently PNG bytes; Godot picks its loader by extension and would simply
+	fail on it. `notes` (optional Array) collects human-readable diagnostics
+	about such mismatches and about the precision they cost."""
 	if path == "":
 		return null
+	var raw_path := path
 	if path.begins_with("res://"):
-		var raw_path := ProjectSettings.globalize_path(path)
-		if raw_path != "":
-			var direct := Image.load_from_file(raw_path)
-			if direct != null:
-				return direct
+		raw_path = ProjectSettings.globalize_path(path)
+	if raw_path != "" and FileAccess.file_exists(raw_path):
+		var direct := _load_image_by_content(raw_path, path.get_extension().to_lower(), notes)
+		if direct != null:
+			return direct
+	if path.begins_with("res://"):
 		var tex := load(path)
 		if tex is Texture2D:
 			var img := (tex as Texture2D).get_image()
 			if img != null and img.is_compressed():
 				img.decompress()
 			return img
+	return null
+
+
+static func _image_format_from_magic(header: PackedByteArray) -> String:
+	"""Identifies an image file format from its leading bytes; "" when unknown.
+	TGA has no magic number and stays extension-driven."""
+	if header.size() >= 4 and header[0] == 0x89 and header[1] == 0x50 and header[2] == 0x4E and header[3] == 0x47:
+		return "png"
+	if header.size() >= 4 and header[0] == 0x76 and header[1] == 0x2F and header[2] == 0x31 and header[3] == 0x01:
+		return "exr"
+	if header.size() >= 3 and header[0] == 0xFF and header[1] == 0xD8 and header[2] == 0xFF:
+		return "jpg"
+	if header.size() >= 12 and header[0] == 0x52 and header[1] == 0x49 and header[2] == 0x46 and header[3] == 0x46 \
+			and header[8] == 0x57 and header[9] == 0x45 and header[10] == 0x42 and header[11] == 0x50:
+		return "webp"
+	if header.size() >= 4 and header[0] == 0x44 and header[1] == 0x44 and header[2] == 0x53 and header[3] == 0x20:
+		return "dds"
+	if header.size() >= 2 and header[0] == 0x42 and header[1] == 0x4D:
+		return "bmp"
+	return ""
+
+
+static func _load_image_by_content(raw_path: String, claimed_ext: String, notes) -> Image:
+	"""Loads an image, decoding by the file's actual content when the extension
+	lies about it. raw_path must be a plain filesystem path."""
+	var f := FileAccess.open(raw_path, FileAccess.READ)
+	if f == null:
 		return null
-	var loaded := Image.load_from_file(path)
-	return loaded
+	var header := f.get_buffer(32)
+	f.close()
+
+	var actual := _image_format_from_magic(header)
+	var claimed := "jpg" if claimed_ext == "jpeg" else claimed_ext
+	if actual == "" or actual == claimed:
+		return Image.load_from_file(raw_path)
+
+	if notes is Array:
+		notes.append("'%s' is actually a %s file mislabeled as .%s (Unreal's ExportRenderTarget picks the format itself); loaded by content instead."
+			% [raw_path.get_file(), actual.to_upper(), claimed_ext])
+		# PNG IHDR bit depth lives at byte 24.
+		if actual == "png" and header.size() >= 25 and header[24] == 16:
+			notes.append("16-bit PNG: Godot decodes PNG at 8 bits/channel, so height precision is reduced (terracing possible). Re-export with the updated exporter to get a float EXR.")
+
+	var buf := FileAccess.get_file_as_bytes(raw_path)
+	if buf.is_empty():
+		return null
+	var img := Image.new()
+	var err := ERR_UNAVAILABLE
+	match actual:
+		"png":
+			err = img.load_png_from_buffer(buf)
+		"jpg":
+			err = img.load_jpg_from_buffer(buf)
+		"webp":
+			err = img.load_webp_from_buffer(buf)
+		"bmp":
+			err = img.load_bmp_from_buffer(buf)
+		"dds":
+			err = img.load_dds_from_buffer(buf)
+		"exr":
+			# No buffer API for EXR: route through a correctly-named temp file.
+			var tmp := OS.get_cache_dir().path_join("ue2g_sniffed_image.exr")
+			var out := FileAccess.open(tmp, FileAccess.WRITE)
+			if out != null:
+				out.store_buffer(buf)
+				out.close()
+				var via_tmp := Image.load_from_file(tmp)
+				DirAccess.remove_absolute(tmp)
+				return via_tmp
+	if err != OK:
+		return null
+	return img
 
 
 static func load_texture_file(tex_path: String) -> Texture2D:

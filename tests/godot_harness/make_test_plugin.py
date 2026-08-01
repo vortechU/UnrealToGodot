@@ -54,7 +54,7 @@ func _run_tests() -> void:
 	get_tree().get_root().add_child(root)
 
 	var importer = Importer.new()
-	var ok = importer.do_import("res://level_layout.json", "res://models/",
+	var ok = await importer.do_import("res://level_layout.json", "res://models/",
 		"res://textures/", root, {"apply_metadata": false})
 	check("do_import returned true", ok == true)
 
@@ -159,6 +159,7 @@ func _run_tests() -> void:
 	_test_lights(root)
 	_test_foliage(root)
 	_test_materials(root)
+	_test_terrain(root)
 
 	print("\\n============================================")
 	_write_results()
@@ -186,6 +187,86 @@ func _write_results() -> void:
 	f.store_line("TOTAL %d" % results.size())
 	f.store_line("VERDICT %s" % ("FAIL" if failures.size() > 0 else "PASS"))
 	f.close()
+
+func _test_terrain(root: Node) -> void:
+	"""Only the real engine proves the exported float EXR decodes, that the
+	generated splat shader COMPILES, and that the terrain lands where Unreal
+	had it. The fixture heightmap ramps along image U (Unreal +X), which the
+	schema maps to Godot -Z, so height must rise towards -Z."""
+	var ls := find_node(root, "LS")
+	check("landscape node LS exists", ls != null)
+	if ls == null:
+		return
+	check("landscape carries its Unreal marker", bool(ls.get_meta("unreal_landscape", false)))
+	check("weightmap layers survive as metadata",
+		Array(ls.get_meta("weightmap_layers", PackedStringArray())) == ["Grass", "Rock"],
+		str(ls.get_meta("weightmap_layers", null)))
+
+	var mi := find_node(ls, "TerrainMesh") as MeshInstance3D
+	check("TerrainMesh built", mi != null)
+	if mi == null or mi.mesh == null:
+		return
+	var aabb: AABB = mi.mesh.get_aabb()
+	# 3200 cm of Unreal extent each way -> a 32 x 32 m footprint centred on 0.
+	check("terrain footprint is 32 x 32 m",
+		absf(aabb.size.x - 32.0) < 0.01 and absf(aabb.size.z - 32.0) < 0.01, str(aabb.size))
+	check("terrain is centred on the origin",
+		absf(aabb.position.x + 16.0) < 0.01 and absf(aabb.position.z + 16.0) < 0.01, str(aabb.position))
+	# height_range_m says -5 .. 15 m, and the heightmap spans the full range.
+	check("terrain spans its exported height range (-5 .. 15 m)",
+		absf(aabb.position.y + 5.0) < 0.01 and absf(aabb.size.y - 20.0) < 0.01,
+		"pos.y=%f size.y=%f" % [aabb.position.y, aabb.size.y])
+
+	# Axis check: the exporter's contract is image U (Unreal +X) -> Godot -Z.
+	# The fixture ramps height up with U, so the -Z edge must be the HIGH one.
+	var arrays: Array = (mi.mesh as ArrayMesh).surface_get_arrays(0)
+	var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+	var high_z := 0.0
+	var low_z := 0.0
+	var high_y := -INF
+	var low_y := INF
+	for v in verts:
+		if v.y > high_y:
+			high_y = v.y
+			high_z = v.z
+		if v.y < low_y:
+			low_y = v.y
+			low_z = v.z
+	check("image U maps to Godot -Z (highest ground sits at negative Z)",
+		high_z < low_z, "high at z=%f, low at z=%f" % [high_z, low_z])
+
+	# The splat material must be a real, COMPILED shader — a shader with a
+	# syntax error still assigns fine and only fails at render time.
+	var mat := mi.mesh.surface_get_material(0)
+	check("terrain uses the splat ShaderMaterial", mat is ShaderMaterial,
+		mat.get_class() if mat else "null")
+	if mat is ShaderMaterial:
+		var sm := mat as ShaderMaterial
+		var uniforms: Array = (sm.shader as Shader).get_shader_uniform_list()
+		check("splat shader compiles (has uniforms)", uniforms.size() > 0)
+		var names: Array = []
+		for un in uniforms:
+			names.append(un["name"])
+		for want in ["splatmap", "layer_count", "layer0_tint", "layer0_albedo", "layer_tiling"]:
+			check("splat shader exposes %s" % want, names.has(want), str(names))
+		check("layer_count == 2", int(sm.get_shader_parameter("layer_count")) == 2,
+			str(sm.get_shader_parameter("layer_count")))
+		check("splatmap texture assigned", sm.get_shader_parameter("splatmap") is Texture2D)
+		var tint: Color = sm.get_shader_parameter("layer0_tint")
+		check("layer0 tint is the exported Unreal debug colour",
+			absf(tint.g - 0.8) < 0.01 and absf(tint.r - 0.2) < 0.01, str(tint))
+
+	var col := find_node(ls, "TerrainCollision")
+	check("terrain collision body built", col is StaticBody3D)
+	if col:
+		var shape: CollisionShape3D = null
+		for c in col.get_children():
+			if c is CollisionShape3D:
+				shape = c
+		check("terrain has a concave collision shape",
+			shape != null and shape.shape is ConcavePolygonShape3D,
+			str(shape.shape) if shape else "no shape")
+
 
 func _test_foliage(root: Node) -> void:
 	var grass_node := find_node(root, "Foliage_Grass")

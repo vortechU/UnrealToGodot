@@ -97,7 +97,7 @@ func _run() -> void:
 
 	var importer = Importer.new()
 	var t0 := Time.get_ticks_msec()
-	var ok = importer.do_import("res://level_layout.json", "res://models/",
+	var ok = await importer.do_import("res://level_layout.json", "res://models/",
 		"res://textures/", root, {"apply_metadata": false})
 	log_line("do_import returned %s (%d ms)" % [ok, Time.get_ticks_msec() - t0])
 

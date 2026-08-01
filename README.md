@@ -39,7 +39,7 @@ part-way through an import.
 - 🌿 **Blueprint/Complex Actor Support**: Supports multi-mesh/multi-component Blueprint actors by instancing them as a parent `Node3D` with relative component offsets.
 - 💡 **Lighting & Post-Processing**: Converts every light component — including those on Blueprint props, not just `DirectionalLight`/`PointLight`/`SpotLight`/`RectLight` actors — into `DirectionalLight3D`/`OmniLight3D`/`SpotLight3D`, carrying intensity (normalised through Unreal's own unit conversion, so lumens/candela/unitless/EV/nits all agree), linear colour, cone angles, source size, specular and volumetric scattering, shadow distance, distance fade and visibility. `PostProcessVolume` + height fog + sky become a Godot `WorldEnvironment` (bloom, SSAO, exposure, fog, sky, color temperature).
 - 🩹 **Decals**: Exports every decal component — including those on Blueprint props, not just `DeferredDecal` actors — as Godot `Decal` nodes with matching size, projection axis, textures, tint/opacity, visibility, sorting priority and distance fade.
-- ⛰️ **Landscape / Terrain Migration**: Exports Landscape heightmaps and paint-layer splatmaps as float EXR images and rebuilds them via the Terrain3D plugin (recommended — see [Landscapes](#landscapes-install-terrain3d)). A plugin-free mesh fallback exists for a quick low-detail preview.
+- ⛰️ **Landscape / Terrain Migration**: Exports Landscape heightmaps and paint-layer weightmaps as float EXR images and rebuilds them via the [Terrain3D](https://github.com/TokisanGames/Terrain3D) plugin (recommended — see [Landscapes](#landscapes-install-terrain3d)), with a plugin-free mesh fallback that needs no plugins at all. Unreal's GPU landscape export silently produces nothing on landscapes without edit layers — which is most asset-pack terrain — so the exporter validates what the GPU wrote and falls back to sampling the landscape's own collision heightfield and paint layers on the CPU. Paint layers come across as a splat material tinted with each layer's Unreal debug colour, with a texture slot per layer.
 - 🌱 **Foliage as MultiMesh**: Painted foliage, HISM and ISM instances are exported as packed transform arrays and rebuilt as `MultiMeshInstance3D` nodes — thousands of instances stay performant. Per-component visibility, shadow casting, Unreal's per-instance cull distances (as a Godot visibility range with matching fade) and material overrides all come across.
 - 🗺️ **Navigation Volumes**: `NavMeshBoundsVolume` actors become `NavigationRegion3D` nodes with matching agent settings (optionally auto-baked on import).
 - 🏷️ **Tags & Metadata**: Actor tags, component tags and (best-effort) Blueprint variables land on Godot nodes as metadata, readable via `get_meta()`.
@@ -163,7 +163,7 @@ Heightmaps/splatmaps go to a sibling `terrain/` folder, textures to `textures/`.
 
 If you enabled **Generate Godot .tscn scene directly** on the Unreal side, just open the generated `.tscn` in Godot. Two follow-ups:
 - Click **Bind Foliage Meshes (.tscn scenes)** in the importer dock once — `.tscn` files cannot reference meshes inside glTF scenes, so foliage MultiMeshes are bound in-place from their `source_model` metadata.
-- Landscapes appear as placeholder nodes carrying heightmap metadata; run the dock import with only **Terrain** enabled to build them, or use your terrain plugin's import tools with the exported `terrain/` files.
+- Landscapes appear as placeholder `Node3D`s carrying the full heightmap/weightmap metadata — a text scene cannot decode a float EXR into geometry. Run the dock import with only **Terrain** enabled to build them, or use your terrain plugin's own import tools with the exported `terrain/` files.
 
 ---
 
@@ -223,13 +223,28 @@ glTF via the **Export Animations** toggle; the logic driving them cannot.
 
 ### Landscapes: install Terrain3D
 
-Terrain migration is the least mature part of the toolchain and **effectively
-requires the [Terrain3D](https://github.com/TokisanGames/Terrain3D) plugin** —
-the plugin-free mesh fallback caps out at a 256×256 grid and is a rough preview,
-not a shippable result. Heightmaps and paint-layer splatmaps export as float
-EXRs and the surface is rebuilt, but the layer *material* is not: you wire the
-splatmaps into your Terrain3D shader yourself. Known rough edges here are being
-worked on for later versions — if you hit one, please
+Heightmaps and paint-layer weightmaps export as float EXRs, and the surface,
+its collision and a splat material are all rebuilt for you. For anything beyond
+a preview, install the [Terrain3D](https://github.com/TokisanGames/Terrain3D)
+plugin (1.x and 0.9.x are both supported) and pick **Auto** or **Terrain3D** as
+the terrain mode: it keeps the full exported heightmap resolution, while the
+plugin-free mesh fallback caps out at a 257×257 grid.
+
+What does **not** come across is the layer *material*. Unreal's terrain look
+lives in a layer-blend material graph, and which texture belongs to which paint
+layer is not readable from Python — paint layers are frequently just named `1`,
+`2`, `3`. So the importer blends the layers using each one's Unreal debug colour
+and exposes `layer0..3_albedo` on the terrain material: drop your ground
+textures into those slots (and set the matching tint to white) and you have the
+real surface. Terrain3D users can instead wire the exported `terrain/*.exr`
+weightmaps into a `Terrain3DAssets` set.
+
+Two limits worth knowing: the splat material blends the first **four** paint
+layers (further layers still export), and when Unreal's GPU landscape export
+fails — the normal case on asset-pack landscapes — the heightmap is sampled on
+the CPU at a capped resolution (513² by default, 129² for weightmaps), which you
+can raise in the exporter's options at the cost of export time. If you hit
+something else, please
 [report it](https://github.com/vortechU/UnrealToGodot/issues).
 
 ### Workflow boundaries
@@ -288,7 +303,7 @@ has nothing but the exported files.
 - **Textures aren't loading**: Textures referenced by materials and decals are auto-exported to a `textures/` folder next to your export. File matching is case-insensitive; supported extensions are `.png`, `.tga`, `.jpg`, `.jpeg`, `.dds`, `.exr` and `.webp`.
 - **A few textures are missing, and the log says "could not be written as PNG"**: Unreal's PNG exporter only writes 8/16-bit source art, so a texture imported from a floating-point source (`.exr`, `.hdr`) — plus cubemaps and sky panoramas — has no PNG form and is skipped. The rest of the export is unaffected; materials using those maps import without them, and the export report flags the dangling references. To include one, re-import it in Unreal from an 8/16-bit source. (Before v2.1 these crashed the editor outright: the exporter forced `TextureExporterPNG`, which bypasses the engine's own compatibility check and hits an assert.)
 - **Imported level too dark/bright**: Unreal and Godot use different light intensity models (lumens/candela/lux vs. energy). Adjust **Light energy scale** in the importer dock, or tweak individual lights — the raw Unreal intensity and units are preserved in the JSON.
-- **Terrain looks flat or missing**: Terrain rebuild needs the exported `terrain/*.exr` files next to the layout JSON (or copied into your Godot project by auto-transfer). Without a terrain plugin, the mesh fallback caps detail at a 256×256 grid; install Terrain3D for full resolution.
+- **Terrain looks flat or missing**: Terrain rebuild needs the exported `terrain/*.exr` files next to the layout JSON (or copied into your Godot project by auto-transfer). If the import report says the heightmap has *no height variation*, the Unreal side wrote an empty image — re-export with the current version, which detects that and falls back to CPU sampling. Without a terrain plugin the mesh fallback caps detail at a 257×257 grid; install Terrain3D for full resolution.
 - **Foliage invisible after opening a generated .tscn**: run **Bind Foliage Meshes** from the importer dock (see the direct .tscn workflow above).
 - **Blueprint variables missing from metadata**: the stock Unreal Python API only exposes Blueprint variables on some engine versions; actor/component tags always export.
 

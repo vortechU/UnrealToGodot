@@ -408,21 +408,90 @@ decal's projection depth for its height. Guarded by `test_math.py` section 11 an
 {
     "name": "Landscape_0",
     "godot_transform": { ... },              // landscape actor transform
-    "heightmap_file": "terrain/Landscape_0_height.exr",   // relative to JSON dir; float EXR (or 16-bit PNG)
-    "heightmap_resolution": [513, 513],
+    "heightmap_file": "terrain/Landscape_0_height.exr",   // relative to JSON dir; float EXR (or PNG, see below)
+    "heightmap_resolution": [513, 513],      // the size of the file that was ACTUALLY written
     "world_size_m": [xz_size_x, xz_size_z],  // footprint in Godot meters
+    "world_center_m": [x, y, z],             // same box as ue_bounds, in Godot meters
     "height_range_m": [min_m, max_m],        // world-space height range the heightmap spans
-    "height_encoding": "float_absolute_m" | "normalized",  // how pixel values map to meters
+    "height_encoding": "normalized",         // how pixel values map to meters
+    "vertex_spacing_m": 1.0,                 // Unreal's per-quad scale, in meters
+    "ue_bounds": {                           // the landscape's world bounds, Unreal cm
+        "center": [x, y, z],
+        "extent": [x, y, z]
+    },
     "layers": [
-        { "name": "Grass", "weightmap_file": "terrain/Landscape_0_weight_Grass.exr" }
+        {
+            "name": "Grass",
+            "weightmap_file": "terrain/Landscape_0_weight_Grass.exr",  // omitted when unpainted
+            "debug_color": [r, g, b]         // LandscapeLayerInfoObject.layer_usage_debug_color, linear
+        }
     ]
 }
 ```
 
-Godot: prefer `Terrain3D` if `ClassDB.class_exists("Terrain3D")`, else HTerrain if
-present, else built-in fallback: `MeshInstance3D` with an ArrayMesh generated from the
-heightmap + `StaticBody3D`/`HeightMapShape3D` collision. The fallback MUST exist so the
-tool works with no third-party plugins.
+### Height encoding
+
+`height_encoding` is always `"normalized"`: **pixel values are relative**. The consumer
+normalizes the image by its own min/max and rescales the result into `height_range_m`.
+The reason is that the three sources the exporter can draw a heightmap from all encode
+differently (an engine-internal packing that varies by UE version, versus absolute world
+centimetres from the CPU fallback), and normalizing makes all of them correct. The
+exporter's contract is therefore that `height_range_m` describes the *image it wrote* —
+on the CPU path it is set from the heights actually measured, not from the actor bounds,
+which are padded.
+
+`ue_bounds` is the placement contract, and it is what both consumers use: vertices are
+reconstructed in Unreal world space from it and converted per-vertex, so the axis mapping
+is right by construction rather than by an extra transform:
+
+```
+image U (+X) follows Unreal +X  ->  Godot -Z
+image V (+Y) follows Unreal +Y  ->  Godot +X
+```
+
+`godot_transform` is the landscape *actor's* transform. It is informational: `ue_bounds`
+is already in world space, so the rebuilt terrain must NOT be placed at it as well.
+
+### Why the heightmap may not be an EXR
+
+`RenderingLibrary.export_render_target` picks the file format from the render-target
+format and ignores the requested extension — an RGBA32F target asked for `.exr` comes out
+as PNG bytes (measured, UE 5.7.4). The exporter prefers a real float EXR through
+`ImageWriteBlueprintLibrary` and, when it has to fall back, sniffs the magic number and
+renames the file to match its true content. `heightmap_file` always names the file that
+is actually on disk. Consumers should still decode by content, since older exports exist.
+
+### Deliberately not mapped
+
+* **The landscape material.** Unreal's terrain look lives in a layer-blend material graph.
+  Which texture belongs to which paint layer is not readable from Python (layers are
+  frequently named `1`, `2`, `3`), so no faithful mapping exists. The exporter ships each
+  layer's weightmap plus its `debug_color`, and the Godot addon blends those tints in a
+  splat shader with one texture slot per layer, so assigning the real ground textures is
+  a drag-and-drop rather than a rebuild.
+* **Landscape holes / the visibility layer**, **landscape splines**, **grass types**, and
+  **per-layer physical materials.** None are exported.
+* **More than four paint layers.** The Godot splat material packs weights into one RGBA
+  texture; layers beyond the fourth are listed in the schema and written to `terrain/`
+  but not blended.
+
+### Godot side
+
+Prefer `Terrain3D` when `ClassDB.class_exists("Terrain3D")` (Terrain3D 1.x's
+`Terrain3D.data` and 0.9.x's `Terrain3DStorage` are both handled), otherwise the
+plugin-free fallback: a `MeshInstance3D` with an ArrayMesh generated from the heightmap,
+a splat `ShaderMaterial`, and `StaticBody3D` + `ConcavePolygonShape3D` collision. The
+fallback MUST exist so the tool works with no third-party plugins.
+
+Note for Terrain3D: `vertex_spacing` has to be derived from the loaded image
+(`world_size_m / (heightmap_resolution - 1)`), NOT from `vertex_spacing_m`. The exported
+heightmap is routinely coarser than the landscape, and using the raw Unreal quad size
+shrinks a 4032 m landscape to 257 m.
+
+The `.tscn` writer emits a placeholder `Node3D` per landscape carrying all of the above as
+`metadata/*`, and builds no geometry — decoding a float EXR and generating a mesh is not
+something a text scene can express. Run the addon's dock import with **Terrain** enabled
+to build the real terrain.
 
 ## foliage
 

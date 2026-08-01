@@ -29,6 +29,13 @@ DEFAULT_EXPORT_OPTIONS = {
     "metadata": True,
     "write_tscn": False,
     "tscn_scene_name": "",
+    # Landscape CPU-sampling grid caps. They only bite when Unreal's GPU
+    # landscape export produces nothing (the usual case on asset-pack
+    # landscapes -- see export_landscape's module docstring); both trade export
+    # time for terrain detail. Weight sampling is ~40x slower per texel than
+    # height tracing, hence the much smaller cap.
+    "terrain_height_resolution": 513,
+    "terrain_weight_resolution": 129,
 }
 
 
@@ -988,7 +995,8 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
     landscapes_data = []
     if landscape_mod:
         try:
-            landscapes_data = landscape_mod.collect_landscapes(all_actors, os.path.dirname(save_path)) or []
+            landscapes_data = landscape_mod.collect_landscapes(
+                all_actors, os.path.dirname(save_path), opts) or []
         except Exception as e:
             unreal.log_warning(f"Landscape export failed: {str(e)}")
 

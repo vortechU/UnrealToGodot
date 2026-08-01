@@ -24,6 +24,23 @@ _command_queue = queue.Queue()
 _state_queue = queue.Queue()
 
 
+# Landscape CPU-sampling grid caps, mirrored from
+# export_level_to_json.DEFAULT_EXPORT_OPTIONS so the GUI shows the real defaults.
+_EXPORT_DEFAULTS = getattr(export_level_to_json, "DEFAULT_EXPORT_OPTIONS", {})
+DEFAULT_TERRAIN_HEIGHT_RES = _EXPORT_DEFAULTS.get("terrain_height_resolution", 513)
+DEFAULT_TERRAIN_WEIGHT_RES = _EXPORT_DEFAULTS.get("terrain_weight_resolution", 129)
+
+
+def _positive_int(value, default):
+    """Reads a user-typed grid size. 0 is meaningful (disables the CPU weightmap
+    fallback); anything unparseable or negative falls back to the default."""
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def _run_diagnostic(export_dir, godot_project=None, strict=False):
     """Audits an export and leaves a report beside it.
 
@@ -547,6 +564,53 @@ class UnrealToGodotApp:
         features_grid.grid_columnconfigure(0, weight=1)
         features_grid.grid_columnconfigure(1, weight=1)
 
+        # Terrain sampling detail. These only bite when Unreal's GPU landscape
+        # export produces nothing -- the normal case on asset-pack landscapes,
+        # which have no edit layers -- and the exporter falls back to sampling
+        # the collision heightfield and paint layers on the CPU. Both trade
+        # export time for detail; weight sampling is far slower per texel
+        # (~800/s measured on 5.7.4), hence the smaller default.
+        terrain_row = tk.Frame(features_inner, bg="#1e1e1e")
+        terrain_row.pack(fill=tk.X, pady=(6, 0))
+
+        tk.Label(
+            terrain_row,
+            text="Terrain detail — height:",
+            fg="#a3a3a3",
+            bg="#1e1e1e",
+            font=("Segoe UI", 9)
+        ).pack(side=tk.LEFT, padx=(0, 4))
+
+        self.terrain_height_res_entry = tk.Entry(
+            terrain_row, width=6, bg="#121212", fg="#ffffff",
+            insertbackground="#ffffff", bd=1, relief=tk.SOLID, font=("Segoe UI", 10)
+        )
+        self.terrain_height_res_entry.insert(0, str(DEFAULT_TERRAIN_HEIGHT_RES))
+        self.terrain_height_res_entry.pack(side=tk.LEFT, ipady=1)
+
+        tk.Label(
+            terrain_row,
+            text="  weightmaps:",
+            fg="#a3a3a3",
+            bg="#1e1e1e",
+            font=("Segoe UI", 9)
+        ).pack(side=tk.LEFT, padx=(0, 4))
+
+        self.terrain_weight_res_entry = tk.Entry(
+            terrain_row, width=6, bg="#121212", fg="#ffffff",
+            insertbackground="#ffffff", bd=1, relief=tk.SOLID, font=("Segoe UI", 10)
+        )
+        self.terrain_weight_res_entry.insert(0, str(DEFAULT_TERRAIN_WEIGHT_RES))
+        self.terrain_weight_res_entry.pack(side=tk.LEFT, ipady=1)
+
+        tk.Label(
+            terrain_row,
+            text="  (grid size per side; higher = slower export)",
+            fg="#6b7280",
+            bg="#1e1e1e",
+            font=("Segoe UI", 8)
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
         # Direct .tscn generation (needs the Godot project path from Section 3)
         self.write_tscn_var = tk.BooleanVar(value=False)
         self.write_tscn_cb = tk.Checkbutton(
@@ -802,6 +866,10 @@ class UnrealToGodotApp:
             "metadata": self.feat_metadata_var.get(),
             "write_tscn": self.write_tscn_var.get(),
             "tscn_scene_name": self.tscn_name_entry.get().strip(),
+            "terrain_height_resolution": _positive_int(
+                self.terrain_height_res_entry.get(), DEFAULT_TERRAIN_HEIGHT_RES),
+            "terrain_weight_resolution": _positive_int(
+                self.terrain_weight_res_entry.get(), DEFAULT_TERRAIN_WEIGHT_RES),
         }
 
     def load_settings(self):
@@ -841,6 +909,13 @@ class UnrealToGodotApp:
                         self.feat_navigation_var.set(feats.get("navigation", True))
                         self.feat_metadata_var.set(feats.get("metadata", True))
                         self.write_tscn_var.set(feats.get("write_tscn", False))
+                        for entry, key, default in (
+                                (self.terrain_height_res_entry, "terrain_height_resolution",
+                                 DEFAULT_TERRAIN_HEIGHT_RES),
+                                (self.terrain_weight_res_entry, "terrain_weight_resolution",
+                                 DEFAULT_TERRAIN_WEIGHT_RES)):
+                            entry.delete(0, tk.END)
+                            entry.insert(0, str(_positive_int(feats.get(key, default), default)))
                         if feats.get("tscn_scene_name"):
                             self.tscn_name_entry.delete(0, tk.END)
                             self.tscn_name_entry.insert(0, feats["tscn_scene_name"])

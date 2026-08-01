@@ -103,6 +103,33 @@ check("a long status message wraps instead of being clipped",
       app.status_lbl.winfo_reqheight() > 20, app.status_lbl.winfo_reqheight())
 check("status colour tracks the message type", app.status_lbl.cget("fg") == "#ef4444")
 
+print("\n=== 3b. Terrain sampling options reach the exporter ===")
+
+opts = app.get_export_feature_options()
+check("height grid default matches the exporter's",
+      opts["terrain_height_resolution"] == G.DEFAULT_TERRAIN_HEIGHT_RES,
+      "%r vs %r" % (opts["terrain_height_resolution"], G.DEFAULT_TERRAIN_HEIGHT_RES))
+check("weight grid default matches the exporter's",
+      opts["terrain_weight_resolution"] == G.DEFAULT_TERRAIN_WEIGHT_RES,
+      "%r vs %r" % (opts["terrain_weight_resolution"], G.DEFAULT_TERRAIN_WEIGHT_RES))
+
+app.terrain_height_res_entry.delete(0, "end")
+app.terrain_height_res_entry.insert(0, "1009")
+app.terrain_weight_res_entry.delete(0, "end")
+app.terrain_weight_res_entry.insert(0, "0")
+opts = app.get_export_feature_options()
+check("a typed height grid is carried through", opts["terrain_height_resolution"] == 1009,
+      repr(opts["terrain_height_resolution"]))
+# 0 is meaningful: it switches the (slow) CPU weightmap fallback off entirely.
+check("0 survives as 0 rather than snapping to the default",
+      opts["terrain_weight_resolution"] == 0, repr(opts["terrain_weight_resolution"]))
+
+for junk in ("", "  ", "abc", "-5", "12.5"):
+    app.terrain_height_res_entry.delete(0, "end")
+    app.terrain_height_res_entry.insert(0, junk)
+    got = app.get_export_feature_options()["terrain_height_resolution"]
+    check("garbage %r falls back to the default" % junk, got == G.DEFAULT_TERRAIN_HEIGHT_RES, repr(got))
+
 print("\n=== 4. Wheel scrolling and a squeezed window ===")
 
 

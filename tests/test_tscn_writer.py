@@ -129,8 +129,13 @@ layout = {
     "landscapes": [
         {"name": "Landscape_0", "godot_transform": IDENT, "heightmap_file": "terrain/L0_height.exr",
          "heightmap_resolution": [513, 513], "world_size_m": [504, 504], "world_center_m": [0, 25, 0],
-         "height_range_m": [0.0, 50.0], "height_encoding": "normalized",
-         "layers": [{"name": "Grass", "weightmap_file": "terrain/L0_weight_Grass.exr"}]},
+         "height_range_m": [0.0, 50.0], "height_encoding": "normalized", "vertex_spacing_m": 0.984375,
+         "layers": [
+             {"name": "Grass", "weightmap_file": "terrain/L0_weight_Grass.exr",
+              "debug_color": [0.2, 0.8, 0.3]},
+             # An unpainted layer: discovered, but no weightmap on disk.
+             {"name": "Rock", "debug_color": [0.5, 0.5, 0.5]},
+         ]},
     ],
     "foliage": [
         {"name": "Foliage_SM_Grass", "mesh_key": "SM_Grass", "mesh_name": "SM_Grass",
@@ -392,6 +397,45 @@ for gd_prop in ("mmi.cast_shadow =", "mmi.visible = bool", "mmi.visibility_range
     assert gd_prop in foliage_gd, \
         "import_foliage.gd no longer sets %r; tscn_writer would drift" % gd_prop
 print("foliage properties agree with import_foliage.gd")
+
+# ---------------------------------------------------------------------------
+# Landscapes are the fifth two-implementation feature. Here the two sides do
+# DIFFERENT jobs -- the addon rebuilds real terrain, this writer emits a
+# placeholder -- so what must not drift is the handover: every metadata key the
+# addon stamps has to be a key this writer also emits, or a .tscn-path user
+# silently loses the terrain data.
+# ---------------------------------------------------------------------------
+TERRAIN_GD_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "addons", "unreal_importer", "import_terrain.gd")
+terrain_gd = io.open(TERRAIN_GD_PATH, encoding="utf-8").read() if os.path.exists(TERRAIN_GD_PATH) else ""
+assert terrain_gd, "import_terrain.gd not found; cannot cross-check the landscape mapping"
+
+land = node_block("Landscape_0")
+assert node_type("Landscape_0") == "Node3D", "landscape placeholder node class wrong"
+assert "metadata/unreal_landscape = true" in land, "landscape marker metadata missing: %s" % land
+assert 'metadata/heightmap_file = "res://terrain/L0_height.exr"' in land, \
+    "heightmap must be rewritten into the project's terrain dir: %s" % land
+assert "metadata/heightmap_resolution = Vector2i(513, 513)" in land, "resolution metadata missing: %s" % land
+assert "metadata/height_range_m = Vector2(0.0, 50.0)" in land, "height range metadata missing: %s" % land
+assert "metadata/world_center_m = Vector3(0.0, 25.0, 0.0)" in land, "world centre metadata missing: %s" % land
+assert 'metadata/height_encoding = "normalized"' in land, "height encoding metadata missing: %s" % land
+assert "metadata/vertex_spacing_m = 0.984375" in land, "vertex spacing metadata missing: %s" % land
+# Both layers are listed, but only the painted one contributes a file path.
+assert 'metadata/weightmap_layers = PackedStringArray("Grass", "Rock")' in land, \
+    "every discovered paint layer must be listed: %s" % land
+assert 'metadata/weightmap_files = PackedStringArray("res://terrain/L0_weight_Grass.exr", "")' in land, \
+    "weightmap paths must be rewritten and hold a slot for unpainted layers: %s" % land
+
+# Every meta key the addon writes must have a counterpart here.
+for meta_key in re.findall(r'set_meta\("([a-z_0-9]+)"', terrain_gd):
+    assert "metadata/%s" % meta_key in land, (
+        "import_terrain.gd stamps metadata/%s but tscn_writer does not emit it -- "
+        "the .tscn path would lose it" % meta_key)
+# ...and the schema fields the addon reads must be ones the exporter still ships.
+for schema_key in ("heightmap_file", "height_range_m", "ue_bounds", "vertex_spacing_m", "debug_color",
+                   "weightmap_file"):
+    assert schema_key in terrain_gd, "import_terrain.gd no longer reads %r" % schema_key
+print("landscape metadata agrees with import_terrain.gd")
 
 # Exposure mapping, all four shapes.
 def exposure(**kw):

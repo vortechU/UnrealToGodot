@@ -64,7 +64,7 @@ func _run() -> void:
 	if not scene_root:
 		printerr("Import Error: No active scene is open. Please open a 3D scene in the editor first.")
 		return
-	var _ok = do_import(JSON_FILE_PATH, GLTF_MODELS_FOLDER, TEXTURES_FOLDER_PATH, scene_root)
+	var _ok = await do_import(JSON_FILE_PATH, GLTF_MODELS_FOLDER, TEXTURES_FOLDER_PATH, scene_root)
 
 func do_import(json_path: String, models_folder: String, textures_folder: String, scene_root: Node, options: Dictionary = {}) -> bool:
 	active_scene_root = scene_root
@@ -276,7 +276,12 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 		var module = _load_feature(file_name)
 		if module == null:
 			continue
-		var res = module.apply(data, active_scene_root, active_scene_root, import_options)
+		# await, not a plain call: import_terrain has to yield a frame for
+		# Terrain3D to build its data object (probed — the property does not
+		# exist until one frame after the node enters the tree). Awaiting a
+		# module that is NOT a coroutine returns its value unchanged, so this
+		# is safe for every feature module.
+		var res = await module.apply(data, active_scene_root, active_scene_root, import_options)
 		if res is Dictionary:
 			var created := int(res.get("created", 0))
 			if created > 0:

@@ -18,6 +18,71 @@ if os.path.exists(HARNESS):
     shutil.rmtree(HARNESS)
 os.makedirs(os.path.join(HARNESS, "models"))
 os.makedirs(os.path.join(HARNESS, "textures"))
+os.makedirs(os.path.join(HARNESS, "terrain"))
+
+
+def _exr_writer():
+    """The production float-EXR writer from export_landscape, imported with a
+    stub `unreal` so the harness feeds Godot the exact bytes the exporter emits
+    rather than a lookalike."""
+    import sys
+    import types
+    if "unreal" not in sys.modules:
+        stub = types.ModuleType("unreal")
+        stub.log = stub.log_warning = stub.log_error = lambda *a: None
+        for attr in ("Vector", "Name", "Transform", "Box2D", "LandscapeProxy", "Landscape",
+                     "LandscapeStreamingProxy", "LandscapeComponent",
+                     "LandscapeHeightfieldCollisionComponent", "UnrealEditorSubsystem"):
+            setattr(stub, attr, type(attr, (), {}))
+        stub.TextureRenderTargetFormat = types.SimpleNamespace()
+        stub.get_editor_subsystem = lambda cls: None
+        sys.modules["unreal"] = stub
+    sys.path.insert(0, os.path.join(REPO, "UnrealToGodot", "Content", "Python"))
+    import export_landscape
+    return export_landscape._write_exr_r32
+
+
+write_exr_r32 = _exr_writer()
+
+# --- landscape fixture -------------------------------------------------------
+# A 33x33 heightmap holding absolute Unreal centimetres, exactly as the CPU
+# collision-tracing fallback writes it. Values ramp along image U (Unreal +X)
+# so the importer's axis mapping is checkable from the resulting geometry:
+# image U -> Godot -Z, so height must RISE towards -Z.
+LS_N = 33
+LS_MIN_CM, LS_MAX_CM = -500.0, 1500.0
+_heights = []
+for _py in range(LS_N):
+    for _px in range(LS_N):
+        _heights.append(LS_MIN_CM + (LS_MAX_CM - LS_MIN_CM) * (_px / float(LS_N - 1)))
+write_exr_r32(os.path.join(HARNESS, "terrain", "LS_height.exr"), LS_N, LS_N, _heights)
+
+# Two paint layers: "Grass" covers the left half, "Rock" the right.
+write_exr_r32(os.path.join(HARNESS, "terrain", "LS_weight_Grass.exr"), LS_N, LS_N,
+              [1.0 if (i % LS_N) < LS_N // 2 else 0.0 for i in range(LS_N * LS_N)])
+write_exr_r32(os.path.join(HARNESS, "terrain", "LS_weight_Rock.exr"), LS_N, LS_N,
+              [0.0 if (i % LS_N) < LS_N // 2 else 1.0 for i in range(LS_N * LS_N)])
+
+# 3200 x 3200 cm footprint centred on the Unreal origin => 32 x 32 m in Godot.
+LANDSCAPE_FIXTURE = {
+    "name": "LS",
+    "godot_transform": {"translation": [0.0, 0.0, 0.0],
+                        "rotation_quat": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]},
+    "heightmap_file": "terrain/LS_height.exr",
+    "heightmap_resolution": [LS_N, LS_N],
+    "world_size_m": [32.0, 32.0],
+    "world_center_m": [0.0, 5.0, 0.0],
+    "height_range_m": [LS_MIN_CM * 0.01, LS_MAX_CM * 0.01],
+    "height_encoding": "normalized",
+    "vertex_spacing_m": 1.0,
+    "ue_bounds": {"center": [0.0, 0.0, 500.0], "extent": [1600.0, 1600.0, 1000.0]},
+    "layers": [
+        {"name": "Grass", "weightmap_file": "terrain/LS_weight_Grass.exr",
+         "debug_color": [0.2, 0.8, 0.3]},
+        {"name": "Rock", "weightmap_file": "terrain/LS_weight_Rock.exr",
+         "debug_color": [0.6, 0.6, 0.6]},
+    ],
+}
 
 
 def write_png(path, rgb):
@@ -314,7 +379,7 @@ layout = {
             "mobility": "stationary", "visible": False,
         },
     ],
-    "post_process": [], "landscapes": [],
+    "post_process": [], "landscapes": [LANDSCAPE_FIXTURE],
     # Only the real engine can confirm MultiMeshInstance3D accepts these
     # GeometryInstance3D property names and enum values.
     "foliage": [
@@ -373,7 +438,7 @@ func _init() -> void:
 	get_root().add_child(root)
 
 	var importer = Importer.new()
-	var ok = importer.do_import("res://level_layout.json", "res://models/",
+	var ok = await importer.do_import("res://level_layout.json", "res://models/",
 		"res://textures/", root, {"apply_metadata": false})
 	check("do_import returned true", ok == true)
 
