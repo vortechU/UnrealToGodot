@@ -923,7 +923,8 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
     foliage_data = []
     if foliage_mod and opts.get("foliage"):
         try:
-            foliage_data = foliage_mod.collect_foliage(all_actors, register_mesh) or []
+            foliage_data = foliage_mod.collect_foliage(
+                all_actors, register_mesh, collected_textures) or []
         except Exception as e:
             unreal.log_warning(f"Foliage export failed: {str(e)}")
 

@@ -135,9 +135,18 @@ layout = {
     "foliage": [
         {"name": "Foliage_SM_Grass", "mesh_key": "SM_Grass", "mesh_name": "SM_Grass",
          "instance_count": 3, "source": "foliage",
+         "visible": True, "cast_shadow": False,
+         "cull_begin_m": 30.0, "cull_end_m": 50.0, "material_overrides": [],
          "godot_transforms": [1,0,0, 0,1,0, 0,0,1, 1,0,1,
                               1,0,0, 0,1,0, 0,0,1, 2,0,2,
                               0.5,0,0, 0,0.5,0, 0,0,0.5, 3,0,3]},
+        # Hidden, shadow-casting, never culled: the writer must mark it invisible
+        # and emit no visibility-range properties at all.
+        {"name": "Instances_Shed_SM_Crate", "mesh_key": "SM_Crate", "mesh_name": "SM_Crate",
+         "instance_count": 1, "source": "ism",
+         "visible": False, "cast_shadow": True,
+         "cull_begin_m": None, "cull_end_m": None, "material_overrides": [],
+         "godot_transforms": [1,0,0, 0,1,0, 0,0,1, 5,0,5]},
     ],
     "navigation": {
         "bounds_volumes": [{"name": "NavVol_1", "godot_transform": IDENT, "extent_m": [20, 5, 20]}],
@@ -351,6 +360,38 @@ for gd_prop in ("light.light_indirect_energy =", "light.light_volumetric_fog_ene
                 "sun.directional_shadow_max_distance =", "light.light_size ="):
     assert gd_prop in gd, "addon no longer sets %r; tscn_writer would drift" % gd_prop
 print("light properties agree with import_environment.gd")
+
+# Foliage is the fourth two-implementation feature: _build_foliage here and
+# apply() in import_foliage.gd. The rendering state (visibility, shadows, cull
+# range) was set by neither until it was mapped, so pin it on both sides.
+FOLIAGE_GD_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "addons", "unreal_importer", "import_foliage.gd")
+foliage_gd = io.open(FOLIAGE_GD_PATH, encoding="utf-8").read() if os.path.exists(FOLIAGE_GD_PATH) else ""
+assert foliage_gd, "import_foliage.gd not found; cannot cross-check the foliage mapping"
+
+grass = node_block("Foliage_SM_Grass")
+assert node_type("Foliage_SM_Grass") == "MultiMeshInstance3D", "foliage node class wrong"
+assert "cast_shadow = 0" in grass, "a shadowless foliage component must import shadowless: %s" % grass
+# 50 m cull end, fading over the 20 m from the 30 m start distance.
+assert "visibility_range_end = 50.0" in grass, "foliage cull distance missing: %s" % grass
+assert "visibility_range_end_margin = 20.0" in grass, "foliage cull fade missing: %s" % grass
+assert "visibility_range_fade_mode = 1" in grass, "foliage fade mode missing: %s" % grass
+assert 'metadata/unreal_foliage_source = "foliage"' in grass, "foliage source metadata missing: %s" % grass
+assert "visible = false" not in grass, "a visible foliage component must not be written invisible"
+
+crate = node_block("Instances_Shed_SM_Crate")
+assert "visible = false" in crate, "a hidden instanced component must import invisible: %s" % crate
+assert "cast_shadow" not in crate, "a shadow-casting component must keep Godot's default: %s" % crate
+assert "visibility_range" not in crate, "an unculled component must get no visibility range: %s" % crate
+assert 'metadata/unreal_foliage_source = "ism"' in crate, "ism source metadata missing: %s" % crate
+
+for gd_prop in ("mmi.cast_shadow =", "mmi.visible = bool", "mmi.visibility_range_end =",
+                "mmi.visibility_range_end_margin =", "mmi.visibility_range_fade_mode =",
+                'mmi.set_meta("unreal_foliage_source"', 'mmi.set_meta("unreal_mesh_key"',
+                "_apply_material_overrides("):
+    assert gd_prop in foliage_gd, \
+        "import_foliage.gd no longer sets %r; tscn_writer would drift" % gd_prop
+print("foliage properties agree with import_foliage.gd")
 
 # Exposure mapping, all four shapes.
 def exposure(**kw):

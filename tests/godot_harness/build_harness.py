@@ -314,7 +314,27 @@ layout = {
             "mobility": "stationary", "visible": False,
         },
     ],
-    "post_process": [], "foliage": [], "landscapes": [],
+    "post_process": [], "landscapes": [],
+    # Only the real engine can confirm MultiMeshInstance3D accepts these
+    # GeometryInstance3D property names and enum values.
+    "foliage": [
+        {
+            "name": "Foliage_Grass", "mesh_key": "SM_Rock", "mesh_name": "SM_Rock",
+            "instance_count": 2, "source": "foliage",
+            "visible": True, "cast_shadow": False,
+            "cull_begin_m": 30.0, "cull_end_m": 50.0, "material_overrides": [],
+            "godot_transforms": [1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1,
+                                 2, 0, 0, 0, 2, 0, 0, 0, 2, 4, 0, 4],
+        },
+        {
+            # Hidden in Unreal, shadow-casting, never culled.
+            "name": "Instances_Hidden", "mesh_key": "SM_Crate", "mesh_name": "SM_Crate",
+            "instance_count": 1, "source": "ism",
+            "visible": False, "cast_shadow": True,
+            "cull_begin_m": None, "cull_end_m": None, "material_overrides": [],
+            "godot_transforms": [1, 0, 0, 0, 1, 0, 0, 0, 1, 9, 0, 9],
+        },
+    ],
     "height_fog": None, "sky_light": None, "has_sky_atmosphere": False, "navigation": None,
 }
 

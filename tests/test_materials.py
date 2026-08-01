@@ -1013,6 +1013,205 @@ hostile = EE._build_light_entries(_FakeLightActor([_HostileComp()]))
 check("an unreadable light component still produces an entry rather than raising",
       len(hostile) == 1 and hostile[0]["type"] == "point", hostile)
 
+print("\n=== 9. Foliage / instanced meshes ===")
+
+# UE 5.7 hierarchy, probed: FISM derives from HISM derives from ISM.
+u.InstancedStaticMeshComponent = type("InstancedStaticMeshComponent", (), {})
+u.HierarchicalInstancedStaticMeshComponent = type(
+    "HierarchicalInstancedStaticMeshComponent", (u.InstancedStaticMeshComponent,), {})
+u.FoliageInstancedStaticMeshComponent = type(
+    "FoliageInstancedStaticMeshComponent", (u.HierarchicalInstancedStaticMeshComponent,), {})
+u.InstancedFoliageActor = type("InstancedFoliageActor", (), {})
+
+import export_foliage as EF
+
+# CDO defaults probed off UE 5.7 (scratchpad probe_foliage_api.py).
+_ISM_DEFAULTS = {
+    "static_mesh": None, "cast_shadow": True, "visible": True, "hidden_in_game": False,
+    "instance_start_cull_distance": 0, "instance_end_cull_distance": 0,
+    "is_editor_only": False, "override_materials": [],
+}
+
+
+class _FoliageTransform(u.Transform):
+    """Must actually BE an unreal.Transform: _instance_world_transform
+    isinstance-checks the value it gets back before packing it."""
+
+    def __init__(self, translation, scale=(1.0, 1.0, 1.0)):
+        self.translation = _Vec(*translation)
+        self.rotation = _Quat(0.0, 0.0, 0.0, 1.0)
+        self.scale3d = _Vec(*scale)
+
+
+class _FakeClass:
+    def __init__(self, name):
+        self._name = name
+
+    def get_name(self):
+        return self._name
+
+
+class _FakeISM:
+    def __init__(self, mesh, class_name="InstancedStaticMeshComponent",
+                 instances=None, **overrides):
+        self._props = dict(_ISM_DEFAULTS)
+        self._props["static_mesh"] = mesh
+        self._props.update(overrides)
+        self._class_name = class_name
+        self._instances = instances if instances is not None else [
+            _FoliageTransform((100.0, 200.0, 300.0), (1.0, 2.0, 3.0))]
+
+    def get_editor_property(self, key):
+        if key not in self._props:
+            raise Exception("no property %r" % key)
+        return self._props[key]
+
+    def get_instance_count(self):
+        return len(self._instances)
+
+    def get_instance_transform(self, index, world_space):
+        return self._instances[index]
+
+    def get_class(self):
+        return _FakeClass(self._class_name)
+
+
+class _FakeFoliageActor:
+    def __init__(self, comps, label="Foliage_0", is_ifa=False):
+        self._comps = comps
+        self.label = label
+        if is_ifa:
+            self.__class__ = _IFA_ACTOR
+
+    def get_components_by_class(self, cls):
+        return self._comps
+
+    def get_actor_label(self):
+        return self.label
+
+
+_IFA_ACTOR = type("_FakeIFA", (_FakeFoliageActor, u.InstancedFoliageActor), {})
+
+
+class _FakeMesh:
+    def __init__(self, name="SM_Grass"):
+        self._name = name
+
+    def get_name(self):
+        return self._name
+
+    def get_path_name(self):
+        return "/Game/%s.%s" % (self._name, self._name)
+
+
+def _foliage(comp_kwargs=None, class_name="InstancedStaticMeshComponent",
+             is_ifa=False, instances=None):
+    comp = _FakeISM(_FakeMesh(), class_name=class_name, instances=instances,
+                    **(comp_kwargs or {}))
+    actor = _FakeFoliageActor([comp], is_ifa=is_ifa)
+    entries = EF.collect_foliage([actor], lambda m: m.get_name(), set())
+    return entries[0] if entries else None
+
+
+default_foliage = _foliage()
+check("a default instanced component exports visible and shadow-casting",
+      default_foliage["visible"] is True and default_foliage["cast_shadow"] is True,
+      default_foliage)
+check("a default instanced component has no cull range",
+      default_foliage["cull_begin_m"] is None and default_foliage["cull_end_m"] is None,
+      (default_foliage["cull_begin_m"], default_foliage["cull_end_m"]))
+
+# Packing: UE (100,200,300) cm, identity rotation, scale (1,2,3) becomes
+# origin (uy, uz, -ux) m and basis columns scaled by (usy, usz, usx).
+check("instance transforms pack as basis columns then origin, in metres",
+      default_foliage["godot_transforms"] == [2.0, 0.0, 0.0,
+                                              0.0, 3.0, 0.0,
+                                              0.0, 0.0, 1.0,
+                                              2.0, 3.0, -1.0],
+      default_foliage["godot_transforms"])
+check("instance_count matches the packed transforms",
+      default_foliage["instance_count"] == 1, default_foliage["instance_count"])
+
+check("a shadowless foliage component exports shadowless",
+      _foliage({"cast_shadow": False})["cast_shadow"] is False)
+check("a foliage component hidden in game exports invisible",
+      _foliage({"hidden_in_game": True})["visible"] is False)
+check("a foliage component switched off exports invisible",
+      _foliage({"visible": False})["visible"] is False)
+
+culled = _foliage({"instance_start_cull_distance": 3000,
+                   "instance_end_cull_distance": 5000})
+check("UE cull distances convert to metres",
+      culled["cull_begin_m"] == 30.0 and culled["cull_end_m"] == 50.0,
+      (culled["cull_begin_m"], culled["cull_end_m"]))
+
+no_end = _foliage({"instance_start_cull_distance": 3000,
+                   "instance_end_cull_distance": 0})
+check("a start distance alone is not a cull range (UE treats end 0 as never)",
+      no_end["cull_begin_m"] is None and no_end["cull_end_m"] is None,
+      (no_end["cull_begin_m"], no_end["cull_end_m"]))
+
+hard_pop = _foliage({"instance_start_cull_distance": 9000,
+                     "instance_end_cull_distance": 5000})
+check("a start beyond the end culls hard rather than fading backwards",
+      hard_pop["cull_begin_m"] is None and hard_pop["cull_end_m"] == 50.0,
+      (hard_pop["cull_begin_m"], hard_pop["cull_end_m"]))
+
+check("an editor-only instanced component is not exported at all",
+      _foliage({"is_editor_only": True}) is None)
+
+# Source classification, which drives the node naming.
+check("a component on an InstancedFoliageActor is painted foliage",
+      _foliage(is_ifa=True)["source"] == "foliage")
+check("a HISM component is classified hism",
+      _foliage(class_name="HierarchicalInstancedStaticMeshComponent")["source"] == "hism")
+check("a plain ISM component is classified ism",
+      _foliage()["source"] == "ism")
+check("painted foliage and plain instances get different node names",
+      _foliage(is_ifa=True)["name"] == "Foliage_SM_Grass"
+      and _foliage()["name"].startswith("Instances_"),
+      (_foliage(is_ifa=True)["name"], _foliage()["name"]))
+
+# Material overrides: reached through the real extract_component_material_overrides,
+# which needs an asset path as well as a name.
+class _OverrideMI(_MI):
+    def get_name(self):
+        return "MI_Grass_Winter"
+
+    def get_path_name(self):
+        return "/Game/MI_Grass_Winter.MI_Grass_Winter"
+
+
+override_entry = _foliage({"override_materials": [_OverrideMI({
+    "texture_parameter_values": [_TexParam("Diff", _Tex("TX_Winter_ALB"))],
+    "scalar_parameter_values": [], "vector_parameter_values": [], "parent": None})]})
+check("a foliage material override is exported with its parameters",
+      len(override_entry["material_overrides"]) == 1
+      and override_entry["material_overrides"][0]["slot_index"] == 0
+      and override_entry["material_overrides"][0]["parameters"]["albedo_texture"] == "TX_Winter_ALB",
+      override_entry["material_overrides"])
+
+# Two components on one actor must both survive with unique names.
+multi_actor = _FakeFoliageActor([_FakeISM(_FakeMesh("SM_Grass")),
+                                 _FakeISM(_FakeMesh("SM_Grass"))], label="BP_Field")
+multi = EF.collect_foliage([multi_actor], lambda m: m.get_name(), set())
+check("every instanced component on an actor is exported",
+      len(multi) == 2, multi)
+check("colliding foliage node names are made unique",
+      multi[0]["name"] != multi[1]["name"], [e["name"] for e in multi])
+
+# Defensiveness: an unreadable component must not take the level down with it.
+class _HostileISM(_FakeISM):
+    def get_instance_count(self):
+        raise Exception("boom")
+
+
+survivors = EF.collect_foliage(
+    [_FakeFoliageActor([_HostileISM(_FakeMesh()), _FakeISM(_FakeMesh("SM_Fern"))])],
+    lambda m: m.get_name(), set())
+check("an unreadable instanced component is skipped, not fatal",
+      len(survivors) == 1 and survivors[0]["mesh_name"] == "SM_Fern", survivors)
+
 print("\n" + "=" * 60)
 if FAIL:
     print("FAILURES (%d): %s" % (len(FAIL), FAIL))

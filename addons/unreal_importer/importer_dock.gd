@@ -162,7 +162,7 @@ func _enter_tree() -> void:
 	terrain_mode_row.add_child(terrain_mode_option)
 	features.add_child(terrain_mode_row)
 
-	foliage_check = _make_check(features,"Foliage (MultiMesh)", "Rebuild painted foliage and instanced meshes as MultiMeshInstance3D nodes (thousands of instances stay performant).")
+	foliage_check = _make_check(features,"Foliage (MultiMesh)", "Rebuild painted foliage and instanced meshes as MultiMeshInstance3D nodes (thousands of instances stay performant), with matching visibility, shadow casting, cull distances and material overrides.")
 	navigation_check = _make_check(features,"Navigation Regions", "Create NavigationRegion3D nodes from Unreal NavMeshBoundsVolumes with matching agent settings.")
 	navigation_bake_check = _make_check(features,"    Bake navigation on import", "Bake the navigation meshes immediately after import (synchronous; can take a moment on large levels).", false)
 	metadata_check = _make_check(features,"Tags & Metadata", "Copy Unreal actor tags, classes and Blueprint variables onto nodes as metadata (get_meta()).")

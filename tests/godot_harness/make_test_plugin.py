@@ -157,6 +157,7 @@ func _run_tests() -> void:
 		check("a decal with no UE fade gets no distance fade", not hd.distance_fade_enabled)
 
 	_test_lights(root)
+	_test_foliage(root)
 	_test_materials(root)
 
 	print("\\n============================================")
@@ -185,6 +186,55 @@ func _write_results() -> void:
 	f.store_line("TOTAL %d" % results.size())
 	f.store_line("VERDICT %s" % ("FAIL" if failures.size() > 0 else "PASS"))
 	f.close()
+
+func _test_foliage(root: Node) -> void:
+	var grass_node := find_node(root, "Foliage_Grass")
+	check("Foliage_Grass exists", grass_node != null)
+	if grass_node and grass_node is MultiMeshInstance3D:
+		var grass := grass_node as MultiMeshInstance3D
+		check("foliage rebuilt as a MultiMesh with every instance",
+			grass.multimesh != null and grass.multimesh.instance_count == 2,
+			str(grass.multimesh.instance_count if grass.multimesh else -1))
+		check("foliage MultiMesh got a mesh bound",
+			grass.multimesh != null and grass.multimesh.mesh != null)
+		# Shadowless grass is the common Unreal authoring; importing it ON is a
+		# visual and performance regression.
+		check("a shadowless foliage component imports shadowless",
+			grass.cast_shadow == GeometryInstance3D.SHADOW_CASTING_SETTING_OFF,
+			str(grass.cast_shadow))
+		check("UE cull distance becomes the Godot visibility range",
+			absf(grass.visibility_range_end - 50.0) < 0.001, str(grass.visibility_range_end))
+		check("UE cull fade becomes the visibility range end margin",
+			absf(grass.visibility_range_end_margin - 20.0) < 0.001,
+			str(grass.visibility_range_end_margin))
+		check("a faded cull range uses the self fade mode",
+			grass.visibility_range_fade_mode == GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF,
+			str(grass.visibility_range_fade_mode))
+		check("foliage source rides along as metadata",
+			grass.get_meta("unreal_foliage_source", "") == "foliage",
+			str(grass.get_meta("unreal_foliage_source", "")))
+		# NB: the per-instance transforms CANNOT be checked here. Under --headless
+		# Godot uses the dummy renderer, which stores no MultiMesh instance data:
+		# get_instance_transform() hands back identity and .buffer comes back
+		# empty no matter what was written (re-verified on 4.7.1). instance_count
+		# is a plain property and does survive, which is why it is checked above.
+		# The placement math is proven offline instead -- test_math.py section 9
+		# (300-case Ry(+90) glTF axis-fix proof) and test_tscn_writer.py, which
+		# reads the written floats straight out of the .tscn text.
+	else:
+		check("Foliage_Grass is a MultiMeshInstance3D", false, str(grass_node))
+
+	var hidden_node := find_node(root, "Instances_Hidden")
+	check("Instances_Hidden exists", hidden_node != null)
+	if hidden_node and hidden_node is MultiMeshInstance3D:
+		var hidden := hidden_node as MultiMeshInstance3D
+		check("an instanced component hidden in Unreal imports invisible", not hidden.visible)
+		check("a shadow-casting component keeps Godot's default",
+			hidden.cast_shadow == GeometryInstance3D.SHADOW_CASTING_SETTING_ON,
+			str(hidden.cast_shadow))
+		check("an unculled component gets no visibility range",
+			absf(hidden.visibility_range_end) < 0.001, str(hidden.visibility_range_end))
+
 
 func _test_lights(root: Node) -> void:
 	# Only the real engine can confirm these property names exist on the real

@@ -433,6 +433,12 @@ tool works with no third-party plugins.
     "mesh_name": "SM_Grass_01",
     "instance_count": 1234,
     "source": "foliage" | "ism" | "hism",    // component origin
+    "visible": true,                         // Visible AND NOT HiddenInGame
+    "cast_shadow": true,
+    "cull_begin_m": 30.0 | null,             // UE InstanceStartCullDistance (cm * 0.01)
+    "cull_end_m": 50.0 | null,               // UE InstanceEndCullDistance; both null = never culled
+    "material_overrides": [ { "slot_index": 0, "material_name": "...",
+                              "material_path": "...", "parameters": { ... } } ],
     "godot_transforms": [ /* 12 floats per instance */ ]
 }
 ```
@@ -445,6 +451,30 @@ Godot: one `MultiMeshInstance3D` per entry; the Mesh is taken from the first
 `MeshInstance3D` found inside the instanced glTF for `mesh_key`.
 Regular `InstancedStaticMeshComponent`/HISM components on ordinary actors are ALSO
 routed here (source `"ism"`/`"hism"`), and are excluded from `actors[].components`.
+Components flagged `bIsEditorOnly` are skipped entirely — they never ship with the
+game and must not ship with the export.
+
+### Cull distances
+
+UE's per-instance cull pair maps onto `GeometryInstance3D`'s visibility range:
+`visibility_range_end = cull_end_m`, and when a start distance is set,
+`visibility_range_end_margin = cull_end_m - cull_begin_m` with
+`visibility_range_fade_mode = VISIBILITY_RANGE_FADE_SELF`. UE treats
+`InstanceEndCullDistance == 0` as "never cull" regardless of the start distance,
+so both fields are then `null` and no visibility range is written. With an end but
+no usable start distance UE pops the instances out, so the fade mode is left
+DISABLED and the pop is reproduced rather than smoothed over.
+
+`cast_shadow` matters more than it looks: grass and undergrowth are routinely
+authored shadowless in Unreal because per-blade shadows are ruinous, so importing
+them shadow-casting is both a visual and a performance regression.
+
+Deliberately **not** mapped: `bounds_scale`, `min_lod`,
+`world_position_offset_disable_distance` and `receives_decals` have no faithful
+Godot counterpart. Per-instance custom data is **unreachable**, not merely
+skipped — UE 5.7 exposes `num_custom_data_floats` but no getter for the values
+(verified by probing the component API), so Godot's `MultiMesh.use_custom_data`
+channel cannot be filled from an export.
 
 ## navigation
 

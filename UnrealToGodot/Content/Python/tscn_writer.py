@@ -140,6 +140,10 @@ MAX_SPOT_ANGLE_DEG = 89.9
 GODOT_DIRECTIONAL_SPECULAR = 1.0
 GODOT_LOCAL_SPECULAR = 0.5
 
+# GeometryInstance3D enums, used by the foliage MultiMeshInstance3D nodes.
+_SHADOW_CASTING_OFF = 0            # SHADOW_CASTING_SETTING_OFF
+_VISIBILITY_RANGE_FADE_SELF = 1    # VISIBILITY_RANGE_FADE_SELF
+
 
 def _exposure_for_settings(settings):
     """Maps a volume's exposure settings to (tonemap_exposure | None, camera-attr lines).
@@ -1052,6 +1056,24 @@ class _TscnWriter(object):
             mm_id = self._register_sub("MultiMesh", mm_lines)
 
             props = ['multimesh = SubResource("%s")' % mm_id]
+
+            # Rendering state, mirroring import_foliage.gd::apply. Grass is
+            # routinely authored shadowless in Unreal, and UE's per-instance cull
+            # pair becomes Godot's visibility range (fade only when UE fades).
+            if entry.get("visible") is False:
+                props.append("visible = false")
+            if entry.get("cast_shadow") is False:
+                props.append("cast_shadow = %d" % _SHADOW_CASTING_OFF)
+
+            cull_end = entry.get("cull_end_m")
+            if isinstance(cull_end, (int, float)) and float(cull_end) > 0.0:
+                props.append("visibility_range_end = " + _f(float(cull_end)))
+                cull_begin = entry.get("cull_begin_m")
+                if isinstance(cull_begin, (int, float)) and 0.0 < float(cull_begin) < float(cull_end):
+                    props.append("visibility_range_end_margin = "
+                                 + _f(float(cull_end) - float(cull_begin)))
+                    props.append("visibility_range_fade_mode = %d" % _VISIBILITY_RANGE_FADE_SELF)
+
             metadata = ["metadata/unreal_foliage = true"]
             # Point the dock's "bind foliage meshes" pass at the source glTF (verified if present).
             res_path = self._mesh_res_path(mesh_key)
@@ -1059,6 +1081,8 @@ class _TscnWriter(object):
                 res_path = self.models_res + str(mesh_key) + ".gltf"  # best-effort hint
             metadata.append('metadata/source_model = "%s"' % _escape_string(res_path))
             metadata.append('metadata/unreal_mesh_key = "%s"' % _escape_string(mesh_key))
+            metadata.append('metadata/unreal_foliage_source = "%s"'
+                            % _escape_string(str(entry.get("source") or "foliage")))
             self._add_node(name, "MultiMeshInstance3D", root_path,
                            props=props, metadata=metadata)
 
