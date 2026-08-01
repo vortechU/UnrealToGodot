@@ -116,3 +116,19 @@ not on stdout.
 after it in the same `try` block, leaving material baking on and writing
 `<material>_<mesh>_BaseColor.png` files next to each `.gltf`. Probe before
 trusting a property name.
+
+### Terrain3D (manual, needs a project with the plugin)
+
+`tests/real_terrain3d_check.gd` covers what the throwaway harness cannot: the
+harness project ships no Terrain3D, so `import_terrain` always takes the mesh
+fallback there. Run it against a real exported layout in a project that has the
+plugin installed:
+
+```
+set UE2G_LAYOUT=res://Assets/<...>/<Map>_layout.json
+godot --headless --path <project> --script res://real_terrain3d_check.gd
+```
+
+It asserts the regions reach disk (import_images only fills memory), that
+Terrain3D's runtime children are not baked into the saved scene, and that the
+reloaded terrain has real relief at the Unreal world position.

@@ -474,6 +474,7 @@ func _try_terrain3d(ls: Dictionary, img: Image, root: Node, scene_owner: Node,
 	if data.has_method("save_directory"):
 		data.call("save_directory", data_dir)
 
+	_disown_children(terrain)
 	_store_terrain_metadata(terrain, ls)
 	warnings.append(("Landscape '%s' imported via Terrain3D at %.2f m vertex spacing, %d region(s) "
 		+ "saved to '%s'. It renders as a flat checkerboard until you assign a Terrain3DAssets "
@@ -488,6 +489,23 @@ func _try_terrain3d(ls: Dictionary, img: Image, root: Node, scene_owner: Node,
 			+ "(%.0f, %.0f).") % [ls_name, int(aligned.get("pad_x", 0)) * spacing,
 			int(aligned.get("pad_z", 0)) * spacing, corner.x, corner.z])
 	return true
+
+
+func _disown_children(node: Node) -> void:
+	"""Strips scene ownership from a node's children so they are NOT written
+	into the .tscn.
+
+	Terrain3D builds its own internal children (Labels, MMI, MouseViewport...).
+	`add_child()` fires their creation synchronously — the parent is already in
+	the tree, so Terrain3D's _ready() runs inside the call — and the
+	set_owner_recursive() that follows then stamps the scene root onto them.
+	Anything with an owner gets serialized, so saving produced a scene holding
+	copies of those children; on load Terrain3D recreated its own and Godot
+	reported 'An incoming node's name clashes with .../Labels already in the
+	scene'. The plugin rebuilds them every time, so they must never be saved."""
+	for child in node.get_children():
+		child.owner = null
+		_disown_children(child)
 
 
 func _discard(node: Node, root: Node) -> void:
