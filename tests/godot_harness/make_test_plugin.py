@@ -156,6 +156,7 @@ func _run_tests() -> void:
 		check("a decal hidden in Unreal imports invisible", not hd.visible)
 		check("a decal with no UE fade gets no distance fade", not hd.distance_fade_enabled)
 
+	_test_lights(root)
 	_test_materials(root)
 
 	print("\\n============================================")
@@ -184,6 +185,72 @@ func _write_results() -> void:
 	f.store_line("TOTAL %d" % results.size())
 	f.store_line("VERDICT %s" % ("FAIL" if failures.size() > 0 else "PASS"))
 	f.close()
+
+func _test_lights(root: Node) -> void:
+	# Only the real engine can confirm these property names exist on the real
+	# Light3D classes and survive being set -- the unit tests stub everything.
+	var sun_node := find_node(root, "Sun_Test")
+	check("Sun_Test exists", sun_node != null)
+	if sun_node and sun_node is DirectionalLight3D:
+		var sun := sun_node as DirectionalLight3D
+		check("directional light energy survives the import",
+			absf(sun.light_energy - 1.0) < 0.001, str(sun.light_energy))
+		check("UE LightSourceAngle becomes light_angular_distance",
+			absf(sun.light_angular_distance - 0.5357) < 0.001, str(sun.light_angular_distance))
+		check("UE dynamic shadow distance becomes directional_shadow_max_distance",
+			absf(sun.directional_shadow_max_distance - 400.0) < 0.001,
+			str(sun.directional_shadow_max_distance))
+		check("a directional light keeps Godot's 1.0 specular at UE's default scale",
+			absf(sun.light_specular - 1.0) < 0.001, str(sun.light_specular))
+		check("a light UE never culls gets no distance fade", not sun.distance_fade_enabled)
+	else:
+		check("Sun_Test is a DirectionalLight3D", false, str(sun_node))
+
+	var spot_node := find_node(root, "Spot_Test")
+	check("Spot_Test exists", spot_node != null)
+	if spot_node and spot_node is SpotLight3D:
+		var spot := spot_node as SpotLight3D
+		check("spot range comes from the UE attenuation radius",
+			absf(spot.spot_range - 12.0) < 0.001, str(spot.spot_range))
+		check("spot angle comes from the UE outer cone",
+			absf(spot.spot_angle - 40.0) < 0.001, str(spot.spot_angle))
+		check("the UE inner cone sharpens the falloff",
+			absf(spot.spot_angle_attenuation - 2.0) < 0.001, str(spot.spot_angle_attenuation))
+		check("UE IndirectLightingIntensity becomes light_indirect_energy",
+			absf(spot.light_indirect_energy - 0.25) < 0.001, str(spot.light_indirect_energy))
+		check("UE VolumetricScatteringIntensity becomes light_volumetric_fog_energy",
+			absf(spot.light_volumetric_fog_energy - 2.0) < 0.001,
+			str(spot.light_volumetric_fog_energy))
+		# Godot ships omni/spot at 0.5 specular; UE's 0.5 SpecularScale halves it.
+		check("UE SpecularScale scales Godot's own 0.5 default",
+			absf(spot.light_specular - 0.25) < 0.001, str(spot.light_specular))
+		check("UE SourceRadius becomes light_size for soft shadows",
+			absf(spot.light_size - 0.1) < 0.001, str(spot.light_size))
+		check("UE MaxDrawDistance becomes a light distance fade",
+			spot.distance_fade_enabled and absf(spot.distance_fade_begin - 40.0) < 0.001
+			and absf(spot.distance_fade_length - 10.0) < 0.001,
+			"%s begin=%s len=%s" % [spot.distance_fade_enabled, spot.distance_fade_begin,
+				spot.distance_fade_length])
+		check("light mobility rides along as metadata",
+			spot.get_meta("unreal_mobility", "") == "static", str(spot.get_meta("unreal_mobility", "")))
+	else:
+		check("Spot_Test is a SpotLight3D", false, str(spot_node))
+
+	var rect_node := find_node(root, "Rect_Test")
+	check("Rect_Test exists", rect_node != null)
+	if rect_node and rect_node is OmniLight3D:
+		var rect := rect_node as OmniLight3D
+		check("a rect light is approximated by an omni and marked as such",
+			rect.get_meta("unreal_rect_light", false), str(rect.get_meta("unreal_rect_light", false)))
+		check("the rect panel size survives as metadata",
+			rect.get_meta("unreal_rect_size_m", Vector2.ZERO).is_equal_approx(Vector2(0.64, 1.28)),
+			str(rect.get_meta("unreal_rect_size_m", Vector2.ZERO)))
+		check("the rect panel softens the shadow via light_size",
+			absf(rect.light_size - 0.64) < 0.001, str(rect.light_size))
+		check("a light switched off in Unreal imports invisible", not rect.visible)
+	else:
+		check("Rect_Test is an OmniLight3D", false, str(rect_node))
+
 
 func _test_materials(root: Node) -> void:
 	print("\\n--- materials ---")

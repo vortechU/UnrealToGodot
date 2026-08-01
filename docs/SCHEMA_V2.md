@@ -177,40 +177,94 @@ Implementations: `component_world_transform()` in `import_unreal_layout.gd`, and
 
 ## lights
 
+One entry per **LightComponent**, not per light actor: a Blueprint prop with a
+light component (lamps, ceiling fixtures, torches) exports too, and an actor
+carrying several lights gets one entry each, named `"<actor>_<component>"`.
+`godot_transform` is the **component's** world transform, so a light offset
+inside a Blueprint lands where it belongs instead of on the actor origin.
+`USkyLightComponent` does not derive from `ULightComponent`, so the sky light is
+not caught by this scan — it stays in `sky_light`.
+
 ```json
 {
     "name": "PointLight_2",
     "type": "directional" | "point" | "spot" | "rect",
     "godot_transform": { ... },
-    "color": [r, g, b],
-    "intensity": 5000.0,
-    "intensity_units": "lux" | "lumens" | "candela" | "ev" | "unitless" | "unknown",
+    "color": [r, g, b],                  // linear; UE's FColor is sRGB and is decoded
+    "intensity": 5000.0,                 // as authored, in intensity_units
+    "intensity_units": "lux" | "lumens" | "candela" | "ev" | "nits" | "unitless" | "unknown",
                                          // "lux" is always used for directional lights,
                                          // which have no IntensityUnits property in UE
-    "godot_energy": 1.7,                 // pre-converted suggested Godot light_energy
+    "intensity_candelas": 8.0 | null,    // local lights only; null for directional (lux)
+    "inverse_squared_falloff": true,     // when false UE ignores intensity_units
+    "godot_energy": 1.0,                 // pre-converted suggested Godot light_energy
     "temperature_kelvin": 6500.0 | null,
     "use_temperature": false,
     "cast_shadows": true,
     "attenuation_radius_m": 10.0,        // point/spot/rect; UE cm * 0.01
-    "source_radius_m": 0.0,
+    "source_radius_m": 0.0,              // -> Godot light_size (soft shadows)
+    "source_angle_deg": 0.5357 | null,   // directional only; -> light_angular_distance
+    "shadow_distance_m": 400.0 | null,   // directional only; UE dynamic shadow distance
+    "rect_size_m": [w, h] | null,        // rect only; the emissive panel
     "inner_cone_angle_deg": 0.0,         // spot only (half-angle)
     "outer_cone_angle_deg": 44.0,        // spot only (half-angle)
-    "indirect_intensity": 1.0,
-    "visible": true
+    "indirect_intensity": 1.0,           // -> light_indirect_energy
+    "specular_scale": 1.0,               // multiplier against Godot's light_specular default
+    "volumetric_scattering": 1.0,        // -> light_volumetric_fog_energy
+    "distance_fade_begin_m": null,       // from UE MaxDrawDistance/MaxDistanceFadeRange
+    "distance_fade_length_m": null,      // both null when UE never culls the light
+    "mobility": "static" | "stationary" | "movable" | null,
+    "visible": true                      // Visible AND NOT HiddenInGame AND AffectsWorld
 }
 ```
 
 Godot mapping: directional→`DirectionalLight3D`; point→`OmniLight3D`
 (`omni_range = attenuation_radius_m`); spot→`SpotLight3D` (`spot_range`,
-`spot_angle = outer_cone_angle_deg`); rect→`OmniLight3D` approximation with
-`set_meta("unreal_rect_light", true)`. `light_energy = godot_energy * options.light_energy_scale`.
-If `use_temperature`, apply Kelvin→RGB approximation multiplied into color.
+`spot_angle = clamp(outer_cone_angle_deg, 0.5, 89.9)`); rect→`OmniLight3D`
+approximation with `set_meta("unreal_rect_light", true)` and
+`set_meta("unreal_rect_size_m", Vector2)`. `light_energy = godot_energy *
+options.light_energy_scale`. If `use_temperature`, apply Kelvin→RGB approximation
+multiplied into color.
 
-`godot_energy` conversion heuristic (documented in export_environment.py, tunable at
-import time): directional lux → `intensity / 10.0`; lumens → `intensity / 1700.0 * 8.0`
-adjusted so UE defaults land near Godot defaults; candela → `intensity / 100.0`;
-unitless → `intensity / 8.0`. The exporter also always stores raw `intensity` + units so
-the importer/user can re-derive.
+`specular_scale` is applied **relative** to Godot's own per-class default
+(`light_specular` ships at 1.0 on directional lights and 0.5 on omni/spot), so a
+UE light left at the default 1.0 keeps Godot's stock look. `mobility` is exported
+for diagnostics and carried as metadata but deliberately **not** mapped to
+`light_bake_mode`: Godot's `BAKE_STATIC` removes the light from real-time
+rendering, so a project that never bakes a lightmap would simply lose it.
+
+### `godot_energy` conversion
+
+Two steps, both documented at length in export_environment.py.
+
+**1. Normalise to candelas** using Unreal's own factors, taken from
+`ULocalLightComponent::GetUnitsConversionFactor` and the per-component
+`ComputeLightBrightness` overrides:
+
+| units | → candelas |
+|---|---|
+| `candela` | `intensity` |
+| `unitless` | `intensity * 16 / (100*100)` (UE's "legacy scale of 16") |
+| `lumens` | `intensity / (2π(1-cos(outer_cone)))`; point: `/4π`; rect: `/π` |
+| `ev` | `2**intensity` (EV100→luminance over an implied 1 m²) |
+| `nits` | `intensity * emissive_area_m2` (capsule area; rect: `w*h`) |
+
+When `inverse_squared_falloff` is false, Unreal ignores `intensity_units`
+entirely and the unitless curve is used regardless of what the field says.
+
+**2. Anchor to Godot's defaults**: local lights `candelas / 8.0`, directional
+`lux / 10.0`. Both are the engines' shipped defaults — UE places local lights at
+5000 unitless (exactly 8 cd) and directional lights at 10 lux, Godot places every
+`Light3D` at `light_energy` 1.0 — so an untouched Unreal light imports as an
+untouched Godot light. It is a calibration, not a photometric identity: two
+tonemapped renderers cannot be matched by a constant, which is why
+`options.light_energy_scale` exists. Raw `intensity` + `intensity_units` +
+`intensity_candelas` are all stored so any of it can be re-derived.
+
+Before this normalisation each unit had its own unrelated divisor, so the *same*
+physical light imported up to 625× brighter or 12× dimmer depending only on which
+unit the artist happened to author it in — and since UE's default unit is
+`unitless`, the common case was the 625× one.
 
 ## post_process
 

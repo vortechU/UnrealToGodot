@@ -80,11 +80,28 @@ layout = {
     "lights": [
         {"name": "Sun", "type": "directional", "godot_transform": t(0, 10, 0, 30.0),
          "color": [1.0, 0.95, 0.9], "godot_energy": 1.2, "cast_shadows": True,
-         "use_temperature": False, "temperature_kelvin": None, "indirect_intensity": 1.0, "visible": True},
+         "use_temperature": False, "temperature_kelvin": None, "indirect_intensity": 1.0,
+         "specular_scale": 1.0, "volumetric_scattering": 1.0,
+         "source_angle_deg": 0.5357, "shadow_distance_m": 400.0,
+         "distance_fade_begin_m": None, "distance_fade_length_m": None,
+         "mobility": "movable", "visible": True},
         {"name": "Spot_1", "type": "spot", "godot_transform": t(2, 3, 1),
          "color": [1.0, 0.5, 0.2], "godot_energy": 3.0, "cast_shadows": False,
          "attenuation_radius_m": 12.0, "inner_cone_angle_deg": 20.0, "outer_cone_angle_deg": 40.0,
-         "use_temperature": False, "temperature_kelvin": None, "indirect_intensity": 1.0, "visible": True},
+         "use_temperature": False, "temperature_kelvin": None, "indirect_intensity": 0.25,
+         "specular_scale": 0.5, "volumetric_scattering": 2.0, "source_radius_m": 0.1,
+         "distance_fade_begin_m": 40.0, "distance_fade_length_m": 10.0,
+         "mobility": "static", "visible": True},
+        # A rect light: no Godot equivalent, approximated by an omni, and the
+        # panel size must survive as metadata. Also invisible, and with a cone
+        # angle Godot would reject if it were passed through unclamped.
+        {"name": "Rect_1", "type": "rect", "godot_transform": t(-2, 1, 0),
+         "color": [1.0, 1.0, 1.0], "godot_energy": 2.0, "cast_shadows": True,
+         "attenuation_radius_m": 8.0, "rect_size_m": [0.64, 1.28],
+         "use_temperature": False, "temperature_kelvin": None, "indirect_intensity": 1.0,
+         "specular_scale": 1.0, "volumetric_scattering": 1.0,
+         "distance_fade_begin_m": None, "distance_fade_length_m": None,
+         "mobility": "stationary", "visible": False},
     ],
     "post_process": [
         {"name": "PP", "unbound": True, "priority": 0.0, "godot_transform": IDENT, "extent_m": [10, 10, 10],
@@ -173,6 +190,11 @@ assert text.count('"') % 2 == 0, "unbalanced quotes"
 def node_block(name):
     m = re.search(r'\[node name="%s"[^\]]*\](.*?)(?=\n\[|\Z)' % re.escape(name), text, re.S)
     assert m, "node %s not found" % name
+    return m.group(1)
+
+def node_type(name):
+    m = re.search(r'\[node name="%s" type="([^"]+)"' % re.escape(name), text)
+    assert m, "node %s has no type" % name
     return m.group(1)
 
 def transform_vals(name):
@@ -283,6 +305,52 @@ for gd_prop in ("decal.modulate = Common.color_from_array", "decal.visible = boo
                 "decal.distance_fade_enabled = true", "decal.sorting_offset ="):
     assert gd_prop in gd, "addon no longer sets %r; tscn_writer would drift" % gd_prop
 print("decal properties agree with import_environment.gd")
+
+# Lights are the third two-implementation feature, and the one that had drifted
+# furthest: the addon set light_indirect_energy and spot_angle_attenuation and
+# clamped spot_angle, none of which this writer did, and the two disagreed on
+# the fallback attenuation radius.
+for gd_name, py_value in (("DEFAULT_ATTENUATION_M", tscn_writer.DEFAULT_ATTENUATION_M),
+                          ("MAX_SPOT_ANGLE_DEG", tscn_writer.MAX_SPOT_ANGLE_DEG)):
+    assert abs(gd_num(gd_name) - py_value) < 1e-9, \
+        "%s: addon says %s, tscn_writer says %s" % (gd_name, gd_num(gd_name), py_value)
+
+sun = node_block("Sun")
+assert node_type("Sun") == "DirectionalLight3D", "directional light class wrong: %s" % node_type("Sun")
+assert "light_energy = 1.2" in sun, "light energy missing: %s" % sun
+assert "light_angular_distance = 0.5357" in sun, "sun angular diameter missing: %s" % sun
+assert "directional_shadow_max_distance = 400.0" in sun, "sun shadow distance missing: %s" % sun
+# Godot's DirectionalLight3D defaults light_specular to 1.0, omni/spot to 0.5,
+# and UE's SpecularScale is a multiplier against whichever applies.
+assert "light_specular = 1.0" in sun, "directional specular base wrong: %s" % sun
+assert "distance_fade" not in sun, "a light UE never culls must not fade: %s" % sun
+
+spot = node_block("Spot_1")
+assert node_type("Spot_1") == "SpotLight3D", "spot light class wrong: %s" % node_type("Spot_1")
+assert "spot_range = 12.0" in spot and "spot_angle = 40.0" in spot, "spot cone missing: %s" % spot
+# outer 40 / (40 - 20) = 2.0
+assert "spot_angle_attenuation = 2.0" in spot, "spot inner-cone falloff missing: %s" % spot
+assert "light_indirect_energy = 0.25" in spot, "indirect energy missing: %s" % spot
+assert "light_volumetric_fog_energy = 2.0" in spot, "volumetric scattering missing: %s" % spot
+assert "light_specular = 0.25" in spot, "local specular must scale Godot's 0.5 default: %s" % spot
+assert "light_size = 0.1" in spot, "source radius must drive light_size: %s" % spot
+assert "distance_fade_enabled = true" in spot and "distance_fade_begin = 40.0" in spot \
+    and "distance_fade_length = 10.0" in spot, "light distance fade missing: %s" % spot
+assert 'metadata/unreal_mobility = "static"' in spot, "mobility metadata missing: %s" % spot
+
+rect = node_block("Rect_1")
+assert node_type("Rect_1") == "OmniLight3D", "rect light must fall back to an omni: %s" % node_type("Rect_1")
+assert "metadata/unreal_rect_light = true" in rect, "rect marker missing: %s" % rect
+assert "metadata/unreal_rect_size_m = Vector2(0.64, 1.28)" in rect, "rect size missing: %s" % rect
+assert "light_size = 0.64" in rect, "rect panel must soften shadows: %s" % rect
+assert "visible = false" in rect, "an invisible light must import invisible: %s" % rect
+
+for gd_prop in ("light.light_indirect_energy =", "light.light_volumetric_fog_energy =",
+                "light.light_specular *=", "light.distance_fade_enabled = true",
+                "spot.spot_angle_attenuation =", "sun.light_angular_distance =",
+                "sun.directional_shadow_max_distance =", "light.light_size ="):
+    assert gd_prop in gd, "addon no longer sets %r; tscn_writer would drift" % gd_prop
+print("light properties agree with import_environment.gd")
 
 # Exposure mapping, all four shapes.
 def exposure(**kw):

@@ -254,11 +254,37 @@ def vector_to_godot(v):
     return [v.y * CM_TO_M, v.z * CM_TO_M, -v.x * CM_TO_M]
 
 
+def srgb_to_linear(channel):
+    """
+    sRGB EOTF, matching FLinearColor::sRGBToLinearTable entry for entry.
+
+    UE stores some colours -- notably every light's LightColor -- as an FColor,
+    which is sRGB-encoded bytes. Every time the engine renders one it goes
+    through FLinearColor(FColor), i.e. this curve. Dividing by 255 and calling
+    it linear (what this module used to do) leaves a tinted light far too pale:
+    an orange FColor(255, 128, 50) renders as 1.0/0.216/0.030 in Unreal but
+    arrived in Godot as 1.0/0.502/0.196.
+    """
+    c = max(0.0, min(1.0, channel))
+    if c <= 0.04045:
+        return c / 12.92
+    return ((c + 0.055) / 1.055) ** 2.4
+
+
 def linear_color_to_list(color, include_alpha=False):
-    """Converts an unreal.LinearColor (or unreal.Color) to a [r, g, b(, a)] float list."""
+    """
+    Converts an unreal.LinearColor (or unreal.Color) to a [r, g, b(, a)] float list.
+
+    SCHEMA_V2.md guarantees linear colours, so an sRGB-encoded FColor is
+    decoded on the way through. Alpha is a plain 0..255 ratio in both engines
+    and is never gamma-encoded.
+    """
     try:
         if isinstance(color, unreal.Color):
-            color = unreal.LinearColor(color.r / 255.0, color.g / 255.0, color.b / 255.0, color.a / 255.0)
+            color = unreal.LinearColor(srgb_to_linear(color.r / 255.0),
+                                       srgb_to_linear(color.g / 255.0),
+                                       srgb_to_linear(color.b / 255.0),
+                                       color.a / 255.0)
         if include_alpha:
             return [color.r, color.g, color.b, color.a]
         return [color.r, color.g, color.b]

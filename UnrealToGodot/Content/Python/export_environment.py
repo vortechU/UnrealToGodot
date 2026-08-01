@@ -21,30 +21,58 @@ godot_energy heuristic (see docs/SCHEMA_V2.md "lights" section)
 Unreal light intensities are expressed in very different units depending on
 light type: directional lights are always authored in lux (illuminance),
 while local lights (point/spot/rect) can be authored in any of
-unreal.LightUnits {Unitless, Candelas, Lumens, EV} (ULocalLightComponent's
+unreal.LightUnits {Unitless, Candelas, Lumens, EV, Nits} (ULocalLightComponent's
 IntensityUnits). Godot's Light3D.light_energy is a small unitless multiplier
 with no fixed physical scale -- its default of "1.0" is calibrated so Godot's
 own default lights look reasonable.
 
-To land Unreal-authored lights near their Godot-default-equivalent brightness
-without per-light manual tuning, a fixed linear scale is applied per unit
-type (further tunable at import time via options.light_energy_scale):
+The conversion runs in two steps.
 
-    lux (directional)   -> intensity / 10.0
-    lumens (point/spot)  -> intensity / 1700.0 * 8.0
-    candela               -> intensity / 100.0
-    unitless               -> intensity / 8.0
-    ev / unknown            -> treated as unitless (intensity / 8.0). EV is a
-                               logarithmic photographic exposure value with no
-                               documented canonical intensity range for scene
-                               lights, and SCHEMA_V2.md does not specify a
-                               dedicated EV formula, so falling back to the
-                               unitless curve keeps godot_energy in a sane,
-                               tunable range instead of leaving it undefined.
+**Step 1 -- normalise to candelas.** Every local-light unit is folded into
+luminous intensity using Unreal's *own* factors, read out of
+ULocalLightComponent::GetUnitsConversionFactor and the per-component
+ComputeLightBrightness overrides (UE 5.7 source), not invented here:
 
-These constants match the ones documented in docs/SCHEMA_V2.md verbatim. The
-raw `intensity` + `intensity_units` are always stored too, so the value can
-be re-derived or hand-tuned on the Godot side.
+    candelas  -> intensity
+    unitless  -> intensity * 16 / (100*100)      # UE's "legacy scale of 16"
+    lumens    -> intensity / (2*pi*(1-cos(half_cone)))   # point: cos=-1 -> /4pi
+                 rect lights use /pi (cosine distribution over the panel)
+    ev        -> 2**intensity                    # EV100ToLuminance, 1 m^2 implied
+    nits      -> intensity * emissive_area_m2    # capsule area; rect: w*h
+
+Doing this first is the whole point: before it, the same physical light
+imported up to 625x brighter or 12x dimmer purely depending on which unit the
+artist happened to author it in, because each unit had its own unrelated
+divisor. They now agree with each other by construction.
+
+**Step 2 -- anchor to Godot's defaults.** A single scale maps candelas to
+light_energy, chosen so an untouched Unreal light lands on an untouched Godot
+light (further tunable at import time via options.light_energy_scale):
+
+    local (point/spot/rect) -> candelas / 8.0
+    lux (directional)       -> intensity / 10.0
+
+Both anchors are the engine defaults: UE 5.7 ships local lights at 5000
+unitless, which is exactly 8 cd, and directional lights at 10 lux; Godot ships
+every Light3D at light_energy 1.0. This is a calibration, not a photometric
+identity -- two tonemapped renderers cannot be matched by a constant -- but it
+makes the common case land right instead of 625x hot, which is what the old
+"unitless -> intensity / 8.0" curve did to every default-authored UE light.
+
+The raw `intensity` + `intensity_units` are always stored too, alongside the
+normalised `intensity_candelas`, so the value can be re-derived or hand-tuned
+on the Godot side.
+
+--------------------------------------------------------------------------
+Lights are collected per component
+--------------------------------------------------------------------------
+Like decals (below), lights are gathered by scanning every actor for
+LightComponents rather than by matching actor classes. Keying off
+unreal.PointLight and friends silently dropped every light living on a
+Blueprint -- lamp props, ceiling fixtures, torch pickups -- which is where a
+dressed level keeps most of them, and exported only the first light of any
+actor carrying several. USkyLightComponent deliberately does not derive from
+ULightComponent, so the sky light is not caught twice by this scan.
 
 --------------------------------------------------------------------------
 Decal axis fix-up (see docs/SCHEMA_V2.md "decals" section)
@@ -83,8 +111,18 @@ from export_level_to_json import extract_material_parameters
 # Optional/engine-version-dependent classes. Resolved once at import time
 # (via getattr, which never raises) so that per-actor isinstance() checks
 # never blow up on older Unreal versions that lack RectLight/SkyAtmosphere.
-_RECT_LIGHT_CLASS = getattr(unreal, "RectLight", None)
+_RECT_LIGHT_COMPONENT = getattr(unreal, "RectLightComponent", None)
 _SKY_ATMOSPHERE_CLASS = getattr(unreal, "SkyAtmosphere", None)
+
+# Unreal's "legacy scale of 16" over its cm^2 -> m^2 factor: the exact figure
+# ULocalLightComponent::GetUnitsConversionFactor uses for Unitless -> Candelas.
+_UNITLESS_TO_CANDELA = 16.0 / (100.0 * 100.0)
+
+# Anchors mapping Unreal's physical units onto Godot's unitless light_energy.
+# Both are the engines' own defaults: UE ships local lights at 5000 unitless
+# (= 8 cd) and directional lights at 10 lux, Godot ships Light3D at energy 1.0.
+_CANDELA_PER_GODOT_ENERGY = 8.0
+_LUX_PER_GODOT_ENERGY = 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -132,20 +170,22 @@ def _log_actor_warning(actor, context, err):
 # Lights
 # ---------------------------------------------------------------------------
 
-def _light_type_of(actor):
+def _light_type_of(comp):
     """
-    Classifies a level actor into one of the 4 supported light types, or None
-    if it isn't a light actor. Order matters: ARectLight and ASpotLight both
-    derive from APointLight in the Unreal class hierarchy, so the more
-    specific subclasses must be checked before the generic PointLight check.
+    Classifies a LightComponent into one of the 4 supported light types, or
+    None if it is not one of them. Order matters: USpotLightComponent derives
+    from UPointLightComponent, so the more specific subclass must be checked
+    first. (URectLightComponent does *not* derive from UPointLightComponent --
+    verified against UE 5.7 -- but is checked first anyway so the ordering
+    stays correct if that ever changes.)
     """
-    if _RECT_LIGHT_CLASS is not None and isinstance(actor, _RECT_LIGHT_CLASS):
+    if _RECT_LIGHT_COMPONENT is not None and isinstance(comp, _RECT_LIGHT_COMPONENT):
         return "rect"
-    if isinstance(actor, unreal.SpotLight):
+    if isinstance(comp, unreal.SpotLightComponent):
         return "spot"
-    if isinstance(actor, unreal.PointLight):
+    if isinstance(comp, unreal.PointLightComponent):
         return "point"
-    if isinstance(actor, unreal.DirectionalLight):
+    if isinstance(comp, unreal.DirectionalLightComponent):
         return "directional"
     return None
 
@@ -159,36 +199,151 @@ def _map_intensity_units(enum_val):
     except Exception:
         name = str(enum_val)
     name = name.upper()
+    # UNITLESS is tested first on purpose: it contains "NIT", so a substring
+    # test for nits would claim every default-authored light as a luminance.
+    if "UNITLESS" in name:
+        return "unitless"
     if "CANDELA" in name:
         return "candela"
     if "LUMEN" in name:
         return "lumens"
+    if "NIT" in name:
+        return "nits"
     if "EV" in name:
         return "ev"
-    if "UNITLESS" in name:
-        return "unitless"
     return "unknown"
 
 
-def _compute_godot_energy(intensity, units):
-    """godot_energy heuristic; see the module docstring for the rationale."""
+def _emissive_area_m2(comp, light_type):
+    """
+    The emitting surface area UE uses to turn nits (luminance) into candelas.
+
+    Mirrors the ComputeLightBrightness overrides: a rect light emits from its
+    source panel, a point/spot light from a capsule of SourceRadius and
+    SourceLength. Both are authored in cm, so the cm^2 area is scaled to m^2.
+    """
+    if light_type == "rect":
+        width = _f(ue2g_common.safe_get_prop(comp, "source_width", 0.0), 0.0)
+        height = _f(ue2g_common.safe_get_prop(comp, "source_height", 0.0), 0.0)
+        area_cm2 = width * height
+    else:
+        radius = _f(ue2g_common.safe_get_prop(comp, "source_radius", 0.0), 0.0)
+        length = _f(ue2g_common.safe_get_prop(comp, "source_length", 0.0), 0.0)
+        area_cm2 = 4.0 * math.pi * radius * (radius + 0.5 * length)
+    return area_cm2 * ue2g_common.CM_TO_M * ue2g_common.CM_TO_M
+
+
+def _intensity_in_candelas(comp, light_type, intensity, units, outer_cone_angle_deg):
+    """
+    Normalises a local light's authored intensity to candelas using Unreal's
+    own unit factors. See the module docstring for the table and its source.
+    """
     intensity = _f(intensity, 0.0)
-    if units == "lux":
-        return intensity / 10.0
-    if units == "lumens":
-        return intensity / 1700.0 * 8.0
+
     if units == "candela":
-        return intensity / 100.0
-    # "unitless", "ev" and "unknown" all fall back to the same curve.
-    return intensity / 8.0
+        return intensity
+    if units == "ev":
+        # EV is logarithmic, and legitimately negative for dim lights.
+        try:
+            return 2.0 ** intensity
+        except Exception:
+            return 0.0
+    if units == "lumens":
+        if light_type == "rect":
+            return intensity / math.pi
+        cos_half_cone = -1.0
+        if light_type == "spot" and outer_cone_angle_deg is not None:
+            # USpotLightComponent::GetCosHalfConeAngle clamps to 0..89.9 deg.
+            cos_half_cone = math.cos(math.radians(
+                min(max(_f(outer_cone_angle_deg, 44.0), 0.0), 89.9)))
+        return intensity / (2.0 * math.pi * (1.0 - cos_half_cone))
+    if units == "nits":
+        return intensity * _emissive_area_m2(comp, light_type)
+
+    # "unitless", "unknown", and every light with inverse-square falloff
+    # switched off (where UE ignores IntensityUnits entirely) share UE's
+    # legacy scale of 16.
+    return intensity * _UNITLESS_TO_CANDELA
 
 
-def _build_light_entry(actor, light_type):
+def _compute_godot_energy(intensity_candelas, lux=None):
+    """godot_energy heuristic; see the module docstring for the rationale."""
+    if lux is not None:
+        return _f(lux, 0.0) / _LUX_PER_GODOT_ENERGY
+    return _f(intensity_candelas, 0.0) / _CANDELA_PER_GODOT_ENERGY
+
+
+def _light_distance_fade(comp):
+    """
+    Converts UE's MaxDrawDistance/MaxDistanceFadeRange (cm) into Godot
+    (distance_fade_begin, distance_fade_length) metres, or (None, None) when
+    the light is never culled. UE fades out over the last MaxDistanceFadeRange
+    before MaxDrawDistance, which is exactly Godot's begin/length pair.
+    """
+    max_draw_cm = _f(ue2g_common.safe_get_prop(comp, "max_draw_distance", 0.0), 0.0)
+    if max_draw_cm <= 0.0:
+        return None, None
+    fade_range_cm = _f(ue2g_common.safe_get_prop(comp, "max_distance_fade_range", 0.0), 0.0)
+
+    end_m = max_draw_cm * ue2g_common.CM_TO_M
+    length_m = max(0.01, fade_range_cm * ue2g_common.CM_TO_M)
+    return max(0.0, end_m - length_m), length_m
+
+
+def _light_mobility(comp):
+    """'static' | 'stationary' | 'movable' | None -- diagnostic only."""
+    mobility = ue2g_common.safe_get_prop(comp, "mobility", None)
+    if mobility is None:
+        return None
     try:
-        light_comp = actor.get_component_by_class(unreal.LightComponent)
+        name = mobility.name
+    except Exception:
+        name = str(mobility)
+    name = name.upper()
+    for candidate in ("STATIONARY", "STATIC", "MOVABLE"):
+        if candidate in name:
+            return candidate.lower()
+    return None
+
+
+def _light_components(actor):
+    """Every LightComponent on an actor, in declaration order; never raises."""
+    try:
+        comps = actor.get_components_by_class(unreal.LightComponent)
     except Exception as e:
-        _log_actor_warning(actor, "failed to get LightComponent", e)
-        light_comp = None
+        _log_actor_warning(actor, "failed to list LightComponents", e)
+        return []
+    return [c for c in (comps or []) if c is not None]
+
+
+def _build_light_entries(actor):
+    """
+    One schema entry per supported LightComponent on `actor`.
+
+    Actors carrying more than one light get the component name appended so the
+    Godot node names stay unique and traceable -- the same rule decals use.
+    """
+    comps = [c for c in _light_components(actor) if _light_type_of(c) is not None]
+    label = _safe_label(actor)
+    entries = []
+    for comp in comps:
+        name = label
+        if len(comps) > 1:
+            name = "{}_{}".format(label, ue2g_common.safe_get_name(comp))
+        try:
+            entry = _build_light_entry(actor, comp, name)
+        except Exception as e:
+            _log_actor_warning(actor, "failed to build light entry", e)
+            continue
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
+def _build_light_entry(actor, light_comp, name):
+    light_type = _light_type_of(light_comp)
+    if light_type is None:
+        return None
 
     intensity = _f(ue2g_common.safe_get_prop(light_comp, "intensity", None), 0.0)
 
@@ -199,11 +354,31 @@ def _build_light_entry(actor, light_type):
     source_radius_m = None
     inner_cone_angle_deg = None
     outer_cone_angle_deg = None
+    source_angle_deg = None
+    shadow_distance_m = None
+    rect_size_m = None
+    intensity_candelas = None
+    inverse_squared = True
 
     if light_type == "directional":
         # Directional lights have no IntensityUnits property; UE always
         # authors/interprets their intensity as lux (illuminance).
         intensity_units = "lux"
+        godot_energy = _compute_godot_energy(None, lux=intensity)
+
+        # The angular diameter of the sun disc: UE calls it LightSourceAngle,
+        # Godot light_angular_distance, and both are degrees.
+        angle = ue2g_common.safe_get_prop(light_comp, "light_source_angle", None)
+        if angle is not None:
+            source_angle_deg = _f(angle)
+
+        shadow_cm = _f(ue2g_common.safe_get_prop(
+            light_comp, "dynamic_shadow_distance_movable_light", 0.0), 0.0)
+        if shadow_cm <= 0.0:
+            shadow_cm = _f(ue2g_common.safe_get_prop(
+                light_comp, "dynamic_shadow_distance_stationary_light", 0.0), 0.0)
+        if shadow_cm > 0.0:
+            shadow_distance_m = shadow_cm * ue2g_common.CM_TO_M
     else:
         radius = ue2g_common.safe_get_prop(light_comp, "attenuation_radius", None)
         if radius is not None:
@@ -225,27 +400,75 @@ def _build_light_entry(actor, light_type):
             if outer is not None:
                 outer_cone_angle_deg = _f(outer)
 
+        if light_type == "rect":
+            rect_size_m = [
+                _f(ue2g_common.safe_get_prop(light_comp, "source_width", 0.0), 0.0)
+                * ue2g_common.CM_TO_M,
+                _f(ue2g_common.safe_get_prop(light_comp, "source_height", 0.0), 0.0)
+                * ue2g_common.CM_TO_M,
+            ]
+
+        # With inverse-square falloff off, UE ignores IntensityUnits and reads
+        # Intensity on its legacy scale, so the unit conversion must too.
+        inverse_squared = _b(ue2g_common.safe_get_prop(
+            light_comp, "use_inverse_squared_falloff", True), True)
+        units_for_conversion = intensity_units if inverse_squared else "unitless"
+
+        intensity_candelas = _intensity_in_candelas(
+            light_comp, light_type, intensity, units_for_conversion, outer_cone_angle_deg)
+        godot_energy = _compute_godot_energy(intensity_candelas)
+
+        if intensity > 0.0 and intensity_candelas <= 0.0 and units_for_conversion == "nits":
+            _log_actor_warning(
+                actor, "light exports black",
+                "'{}' is authored in nits but has no emissive area (source "
+                "radius/width are 0), which Unreal also renders as no light"
+                .format(name))
+
     temperature = ue2g_common.safe_get_prop(light_comp, "temperature", None)
+    fade_begin, fade_length = _light_distance_fade(light_comp)
+
+    # A light switched off in game, or excluded from the world entirely, is
+    # content the level deliberately disabled; a Godot node that ignores that
+    # arrives lit.
+    visible = (_b(ue2g_common.safe_get_prop(light_comp, "visible", True), True)
+               and not _b(ue2g_common.safe_get_prop(light_comp, "hidden_in_game", False), False)
+               and _b(ue2g_common.safe_get_prop(light_comp, "affects_world", True), True))
 
     return {
-        "name": _safe_label(actor),
+        "name": name,
         "type": light_type,
-        "godot_transform": ue2g_common.unreal_to_godot_transform(actor.get_actor_transform()),
+        "godot_transform": ue2g_common.unreal_to_godot_transform(
+            _component_world_transform(actor, light_comp)),
         "color": color,
         "intensity": intensity,
         "intensity_units": intensity_units,
-        "godot_energy": _compute_godot_energy(intensity, intensity_units),
+        "intensity_candelas": intensity_candelas,
+        "inverse_squared_falloff": inverse_squared,
+        "godot_energy": godot_energy,
         "temperature_kelvin": _f(temperature) if temperature is not None else None,
         "use_temperature": _b(ue2g_common.safe_get_prop(light_comp, "use_temperature", False), False),
         "cast_shadows": _b(ue2g_common.safe_get_prop(light_comp, "cast_shadows", True), True),
         "attenuation_radius_m": attenuation_radius_m,
         "source_radius_m": source_radius_m,
+        "source_angle_deg": source_angle_deg,
+        "shadow_distance_m": shadow_distance_m,
+        "rect_size_m": rect_size_m,
         "inner_cone_angle_deg": inner_cone_angle_deg,
         "outer_cone_angle_deg": outer_cone_angle_deg,
         "indirect_intensity": _f(
             ue2g_common.safe_get_prop(light_comp, "indirect_lighting_intensity", None), 1.0
         ),
-        "visible": _b(ue2g_common.safe_get_prop(light_comp, "visible", True), True),
+        "specular_scale": _f(
+            ue2g_common.safe_get_prop(light_comp, "specular_scale", None), 1.0
+        ),
+        "volumetric_scattering": _f(
+            ue2g_common.safe_get_prop(light_comp, "volumetric_scattering_intensity", None), 1.0
+        ),
+        "distance_fade_begin_m": fade_begin,
+        "distance_fade_length_m": fade_length,
+        "mobility": _light_mobility(light_comp),
+        "visible": visible,
     }
 
 
@@ -767,7 +990,7 @@ def _build_decal_entry(actor, comp, name, collected_textures):
         except Exception as e:
             _log_actor_warning(actor, "failed to extract decal material parameters", e)
 
-    godot_transform = _decal_transform(_decal_world_transform(actor, comp))
+    godot_transform = _decal_transform(_component_world_transform(actor, comp))
     fade_begin, fade_length = _decal_distance_fade(
         comp, size_m, godot_transform.get("scale") or [1.0, 1.0, 1.0])
 
@@ -792,14 +1015,21 @@ def _build_decal_entry(actor, comp, name, collected_textures):
     }
 
 
-def _decal_world_transform(actor, comp):
-    """The decal component's world transform, falling back to the actor's."""
+def _component_world_transform(actor, comp):
+    """
+    A scene component's world transform, falling back to the actor's.
+
+    The actor transform is only the same thing when the component *is* the
+    root -- true for a plain DecalActor or PointLight, false for every decal
+    or light hanging off a Blueprint, which is exactly the content that
+    component-level collection exists to pick up.
+    """
     try:
         transform = comp.get_world_transform()
         if transform is not None:
             return transform
     except Exception as e:
-        _log_actor_warning(actor, "could not read DecalComponent world transform", e)
+        _log_actor_warning(actor, "could not read component world transform", e)
     return actor.get_actor_transform()
 
 
@@ -834,18 +1064,13 @@ def collect_environment(all_actors, collected_textures):
                 if actor is None:
                     continue
 
-                # Decals first and unconditionally: they are components, not an
-                # actor class, so keying off unreal.DecalActor dropped every
-                # decal riding on a Blueprint prop -- and every branch below
+                # Decals and lights first and unconditionally: both are
+                # components, not actor classes, so keying off
+                # unreal.DecalActor / unreal.PointLight dropped every one of
+                # them riding on a Blueprint prop -- and every branch below
                 # continues, which would have kept skipping them.
                 result["decals"].extend(_build_decal_entries(actor, collected_textures))
-
-                light_type = _light_type_of(actor)
-                if light_type is not None:
-                    entry = _build_light_entry(actor, light_type)
-                    if entry is not None:
-                        result["lights"].append(entry)
-                    continue
+                result["lights"].extend(_build_light_entries(actor))
 
                 if isinstance(actor, unreal.PostProcessVolume):
                     entry = _build_post_process_entry(actor)

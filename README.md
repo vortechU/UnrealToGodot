@@ -37,7 +37,7 @@ part-way through an import.
 - 🧱 **Collision Shape Extraction**: Extracts Unreal collision primitives (Boxes, Spheres, Capsules, and Convex Hulls) and auto-generates corresponding Godot `CollisionShape3D` nodes attached to `StaticBody3D` nodes.
 - 🎨 **PBR Material & Texture Binding**: Translates Unreal material parameters (albedo, roughness, metallic, tiling) and binds exported textures to Godot `StandardMaterial3D` resources (case-insensitive file matching).
 - 🌿 **Blueprint/Complex Actor Support**: Supports multi-mesh/multi-component Blueprint actors by instancing them as a parent `Node3D` with relative component offsets.
-- 💡 **Lighting & Post-Processing**: Converts `DirectionalLight`/`PointLight`/`SpotLight`/`RectLight` into `DirectionalLight3D`/`OmniLight3D`/`SpotLight3D`, and `PostProcessVolume` + height fog + sky into a Godot `WorldEnvironment` (bloom, SSAO, exposure, fog, sky, color temperature).
+- 💡 **Lighting & Post-Processing**: Converts every light component — including those on Blueprint props, not just `DirectionalLight`/`PointLight`/`SpotLight`/`RectLight` actors — into `DirectionalLight3D`/`OmniLight3D`/`SpotLight3D`, carrying intensity (normalised through Unreal's own unit conversion, so lumens/candela/unitless/EV/nits all agree), linear colour, cone angles, source size, specular and volumetric scattering, shadow distance, distance fade and visibility. `PostProcessVolume` + height fog + sky become a Godot `WorldEnvironment` (bloom, SSAO, exposure, fog, sky, color temperature).
 - 🩹 **Decals**: Exports every decal component — including those on Blueprint props, not just `DeferredDecal` actors — as Godot `Decal` nodes with matching size, projection axis, textures, tint/opacity, visibility, sorting priority and distance fade.
 - ⛰️ **Landscape / Terrain Migration**: Exports Landscape heightmaps and paint-layer splatmaps as float EXR images and rebuilds them via the Terrain3D plugin (recommended — see [Landscapes](#landscapes-install-terrain3d)). A plugin-free mesh fallback exists for a quick low-detail preview.
 - 🌱 **Foliage as MultiMesh**: Painted foliage, HISM and ISM instances are exported as packed transform arrays and rebuilt as `MultiMeshInstance3D` nodes — thousands of instances stay performant.
@@ -207,11 +207,15 @@ glTF via the **Export Animations** toggle; the logic driving them cannot.
   materials well. What lives in the master material's *graph* — custom HLSL,
   world-position offset, vertex-paint blending, parallax — has no counterpart and
   is simply absent, so shader-heavy packs need reauthoring.
-- **Lighting is a heuristic, not a match.** Unreal (lumens/candela/lux, Lumen) and
+- **Lighting is a calibration, not a match.** Unreal (lumens/candela/lux, Lumen) and
   Godot (energy, SDFGI/VoxelGI) use different intensity models and different
-  global illumination, so the **Light energy scale** control exists because the
-  first import will not be correctly exposed. Raw Unreal intensities and units
-  are preserved in the JSON so you can re-derive your own mapping.
+  global illumination. Intensities are normalised to candelas using Unreal's own
+  unit conversion and then anchored so a default Unreal light imports as a default
+  Godot light, which makes the units mutually consistent and the common case
+  roughly right — but two tonemapped renderers cannot be reconciled by a constant,
+  so the **Light energy scale** control still exists for the final pass. Raw Unreal
+  intensities, units and the normalised candela figure are all preserved in the JSON
+  so you can re-derive your own mapping.
 - **Nanite has no Godot equivalent.** Nanite meshes export as regular triangle
   meshes at their available LODs; a pack authored on the assumption of Nanite
   density may need decimation to run well.

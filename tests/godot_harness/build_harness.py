@@ -262,7 +262,59 @@ layout = {
             "textures": {"albedo": "TX_Test_ALB", "normal": None, "orm": None, "emission": None},
         },
     ],
-    "lights": [], "post_process": [], "foliage": [], "landscapes": [],
+    # One of each light type, carrying the properties the importer is supposed
+    # to map. Godot itself is the only thing that can confirm these property
+    # names exist and accept these values on the real Light3D classes.
+    "lights": [
+        {
+            "name": "Sun_Test", "type": "directional",
+            "godot_transform": {"translation": [0.0, 10.0, 0.0],
+                                "rotation_quat": [0.0, 0.0, 0.0, 1.0],
+                                "scale": [1.0, 1.0, 1.0]},
+            "color": [1.0, 0.95, 0.9], "intensity": 10.0, "intensity_units": "lux",
+            "intensity_candelas": None, "inverse_squared_falloff": True,
+            "godot_energy": 1.0, "temperature_kelvin": None, "use_temperature": False,
+            "cast_shadows": True, "attenuation_radius_m": None, "source_radius_m": None,
+            "source_angle_deg": 0.5357, "shadow_distance_m": 400.0, "rect_size_m": None,
+            "inner_cone_angle_deg": None, "outer_cone_angle_deg": None,
+            "indirect_intensity": 1.0, "specular_scale": 1.0, "volumetric_scattering": 1.0,
+            "distance_fade_begin_m": None, "distance_fade_length_m": None,
+            "mobility": "movable", "visible": True,
+        },
+        {
+            "name": "Spot_Test", "type": "spot",
+            "godot_transform": {"translation": [3.0, 2.0, 0.0],
+                                "rotation_quat": [0.0, 0.0, 0.0, 1.0],
+                                "scale": [1.0, 1.0, 1.0]},
+            "color": [1.0, 0.5, 0.2], "intensity": 5000.0, "intensity_units": "unitless",
+            "intensity_candelas": 8.0, "inverse_squared_falloff": True,
+            "godot_energy": 1.0, "temperature_kelvin": None, "use_temperature": False,
+            "cast_shadows": True, "attenuation_radius_m": 12.0, "source_radius_m": 0.1,
+            "source_angle_deg": None, "shadow_distance_m": None, "rect_size_m": None,
+            "inner_cone_angle_deg": 20.0, "outer_cone_angle_deg": 40.0,
+            "indirect_intensity": 0.25, "specular_scale": 0.5, "volumetric_scattering": 2.0,
+            "distance_fade_begin_m": 40.0, "distance_fade_length_m": 10.0,
+            "mobility": "static", "visible": True,
+        },
+        {
+            # Rect lights have no Godot node; the panel size must still survive.
+            # Also switched off in Unreal.
+            "name": "Rect_Test", "type": "rect",
+            "godot_transform": {"translation": [-3.0, 2.0, 0.0],
+                                "rotation_quat": [0.0, 0.0, 0.0, 1.0],
+                                "scale": [1.0, 1.0, 1.0]},
+            "color": [1.0, 1.0, 1.0], "intensity": 5000.0, "intensity_units": "unitless",
+            "intensity_candelas": 8.0, "inverse_squared_falloff": True,
+            "godot_energy": 2.0, "temperature_kelvin": None, "use_temperature": False,
+            "cast_shadows": True, "attenuation_radius_m": 8.0, "source_radius_m": 0.0,
+            "source_angle_deg": None, "shadow_distance_m": None, "rect_size_m": [0.64, 1.28],
+            "inner_cone_angle_deg": None, "outer_cone_angle_deg": None,
+            "indirect_intensity": 1.0, "specular_scale": 1.0, "volumetric_scattering": 1.0,
+            "distance_fade_begin_m": None, "distance_fade_length_m": None,
+            "mobility": "stationary", "visible": False,
+        },
+    ],
+    "post_process": [], "foliage": [], "landscapes": [],
     "height_fog": None, "sky_light": None, "has_sky_atmosphere": False, "navigation": None,
 }
 

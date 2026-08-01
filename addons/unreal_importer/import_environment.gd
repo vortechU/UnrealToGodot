@@ -9,6 +9,8 @@ extends RefCounted
 #
 # Conversion heuristics (documented so users can tune light_energy_scale):
 # - light_energy = godot_energy (pre-converted by the exporter) * light_energy_scale
+# - light_specular = UE SpecularScale * Godot's per-class default (1.0 directional,
+#   0.5 omni/spot), so a default UE light keeps Godot's stock look
 # - UE exponential height fog density (~0.02 default) -> Godot fog_density * 0.5
 # - UE AO radius is exported in cm -> * 0.01 m; UE AO intensity (0..1) -> ssao_intensity * 2.0
 # - Exposure: see _apply_exposure below.
@@ -21,6 +23,13 @@ extends RefCounted
 # ==============================================================================
 
 const Common = preload("res://addons/unreal_importer/import_common.gd")
+
+# Fallback attenuation radius (m) for a light whose AttenuationRadius could not
+# be read. UE's own default is 1000 cm, so that is the honest stand-in.
+const DEFAULT_ATTENUATION_M := 10.0
+
+# Godot rejects a spot_angle of 90 or more; UE's OuterConeAngle clamps at 89.9.
+const MAX_SPOT_ANGLE_DEG := 89.9
 
 # Godot renders linear by default; Unreal never does. Without this every import
 # arrived flat and washed out no matter what the grade said -- and the old code
@@ -103,20 +112,60 @@ func _apply_lights(lights, root: Node, scene_owner: Node, energy_scale: float) -
 		light.light_energy = maxf(0.0, Common.get_num(entry, "godot_energy", 1.0) * energy_scale)
 		light.shadow_enabled = bool(entry.get("cast_shadows", true))
 		light.light_indirect_energy = Common.get_num(entry, "indirect_intensity", 1.0)
+		light.light_volumetric_fog_energy = Common.get_num(entry, "volumetric_scattering", 1.0)
 		light.visible = bool(entry.get("visible", true))
 
-		var radius := Common.get_num(entry, "attenuation_radius_m", 10.0)
+		# UE's SpecularScale and Godot's light_specular are both multipliers, but
+		# their defaults differ (Godot omni/spot ship at 0.5, directional at 1.0),
+		# so it is applied RELATIVE to whatever this light type already defaults
+		# to. A UE light left alone therefore keeps Godot's own look, and one an
+		# artist dulled to 0 still goes matte.
+		light.light_specular *= maxf(0.0, Common.get_num(entry, "specular_scale", 1.0))
+
+		# UE's MaxDrawDistance/MaxDistanceFadeRange, pre-converted to metres.
+		var fade_begin = entry.get("distance_fade_begin_m")
+		var fade_length = entry.get("distance_fade_length_m")
+		if (fade_begin is float or fade_begin is int) and (fade_length is float or fade_length is int):
+			light.distance_fade_enabled = true
+			light.distance_fade_begin = maxf(float(fade_begin), 0.0)
+			light.distance_fade_length = maxf(float(fade_length), 0.01)
+
+		var radius := Common.get_num(entry, "attenuation_radius_m", DEFAULT_ATTENUATION_M)
+		# UE SourceRadius -> Godot light_size, which is what drives soft shadows;
+		# it was exported but dropped on the floor before.
+		var source_radius := maxf(0.0, Common.get_num(entry, "source_radius_m", 0.0))
 		if light is OmniLight3D:
 			(light as OmniLight3D).omni_range = maxf(0.01, radius)
+			light.light_size = source_radius
 		elif light is SpotLight3D:
 			var spot := light as SpotLight3D
 			spot.spot_range = maxf(0.01, radius)
+			spot.light_size = source_radius
 			var outer := Common.get_num(entry, "outer_cone_angle_deg", 44.0)
 			var inner := Common.get_num(entry, "inner_cone_angle_deg", 0.0)
-			spot.spot_angle = clampf(outer, 0.5, 89.9)
+			spot.spot_angle = clampf(outer, 0.5, MAX_SPOT_ANGLE_DEG)
 			# Sharper falloff the closer the inner cone is to the outer cone
 			if outer > 0.0 and inner > 0.0 and inner < outer:
 				spot.spot_angle_attenuation = clampf(outer / maxf(outer - inner, 0.5), 0.5, 8.0)
+		elif light is DirectionalLight3D:
+			var sun := light as DirectionalLight3D
+			# UE LightSourceAngle and Godot light_angular_distance are the same
+			# quantity in the same unit: the source's angular diameter in degrees.
+			sun.light_angular_distance = clampf(
+				Common.get_num(entry, "source_angle_deg", 0.0), 0.0, 90.0)
+			var shadow_distance := Common.get_num(entry, "shadow_distance_m", 0.0)
+			if shadow_distance > 0.0:
+				sun.directional_shadow_max_distance = shadow_distance
+
+		# Rect lights have no Godot equivalent, so the panel dimensions ride
+		# along as metadata and drive light_size for a plausibly soft shadow.
+		var rect_size = entry.get("rect_size_m")
+		if rect_size is Array and rect_size.size() >= 2:
+			light.set_meta("unreal_rect_size_m", Vector2(float(rect_size[0]), float(rect_size[1])))
+			if source_radius <= 0.0:
+				light.light_size = maxf(float(rect_size[0]), float(rect_size[1])) * 0.5
+		if entry.get("mobility") != null:
+			light.set_meta("unreal_mobility", Common.get_str(entry, "mobility", ""))
 
 		Common.add_owned_child(container, light, scene_owner)
 		count += 1

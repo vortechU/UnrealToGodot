@@ -609,6 +609,19 @@ check("a colliding texture's uri points at its own exported file",
 
 print("\n=== 6. Decal ORM binding ===")
 u.DecalComponent = type("DecalComponent", (), {})
+
+# The light component hierarchy, mirroring UE 5.7's exactly: SpotLightComponent
+# derives from PointLightComponent (so it must be classified first) while
+# RectLightComponent does NOT, and SkyLightComponent is not a LightComponent at
+# all -- which is what keeps a component scan from swallowing the sky light.
+u.LightComponent = type("LightComponent", (), {})
+u.LocalLightComponent = type("LocalLightComponent", (u.LightComponent,), {})
+u.PointLightComponent = type("PointLightComponent", (u.LocalLightComponent,), {})
+u.SpotLightComponent = type("SpotLightComponent", (u.PointLightComponent,), {})
+u.RectLightComponent = type("RectLightComponent", (u.LocalLightComponent,), {})
+u.DirectionalLightComponent = type("DirectionalLightComponent", (u.LightComponent,), {})
+u.SkyLightComponent = type("SkyLightComponent", (), {})
+
 import export_environment as EE
 
 check("Godot's decal ORM order matches the ORM/ARM layout",
@@ -762,6 +775,243 @@ check("every DecalComponent on an actor is exported, not just the first",
 check("multiple decals on one actor get unique names",
       [e["name"] for e in multi] == ["Decal_0_DecalA", "Decal_0_DecalB"],
       [e["name"] for e in multi])
+
+print("\n=== 8. Light units, components and properties ===")
+import math
+
+# CDO defaults probed off UE 5.7 (see scratchpad probe_light_api.py): a local
+# light ships at 5000 UNITLESS, a directional at 10 lux.
+_LIGHT_DEFAULTS = {
+    "intensity": 5000.0, "intensity_units": "UNITLESS", "light_color": None,
+    "temperature": 6500.0, "use_temperature": False, "cast_shadows": True,
+    "affects_world": True, "visible": True, "hidden_in_game": False,
+    "indirect_lighting_intensity": 1.0, "volumetric_scattering_intensity": 1.0,
+    "specular_scale": 1.0, "max_draw_distance": 0.0, "max_distance_fade_range": 0.0,
+    "attenuation_radius": 1000.0, "source_radius": 0.0, "source_length": 0.0,
+    "mobility": "MOVABLE", "use_inverse_squared_falloff": True,
+}
+_SPOT_DEFAULTS = {"inner_cone_angle": 0.0, "outer_cone_angle": 44.0}
+_RECT_DEFAULTS = {"source_width": 64.0, "source_height": 64.0}
+_DIR_DEFAULTS = {
+    "intensity": 10.0, "light_source_angle": 0.5357,
+    "dynamic_shadow_distance_movable_light": 40000.0,
+    "dynamic_shadow_distance_stationary_light": 0.0,
+}
+
+
+class _FakeEnum:
+    def __init__(self, name):
+        self.name = name
+
+
+class _FakeLightComp:
+    """A light component carrying UE 5.7's real CDO defaults."""
+
+    def __init__(self, kind="point", name="LightComponent0", **overrides):
+        base = dict(_LIGHT_DEFAULTS)
+        if kind == "spot":
+            base.update(_SPOT_DEFAULTS)
+        elif kind == "rect":
+            base.update(_RECT_DEFAULTS)
+        elif kind == "directional":
+            base = dict(base)
+            base.update(_DIR_DEFAULTS)
+            for gone in ("intensity_units", "attenuation_radius", "source_radius",
+                         "source_length", "use_inverse_squared_falloff"):
+                base.pop(gone, None)
+        base.update(overrides)
+        self._props = base
+        self.name = name
+        self.world = _FakeTransform()
+        self.__class__ = _LIGHT_CLASSES[kind]
+
+    def get_editor_property(self, key):
+        if key not in self._props:
+            raise Exception("no property %r" % key)
+        value = self._props[key]
+        if key in ("intensity_units", "mobility") and isinstance(value, str):
+            return _FakeEnum(value)
+        return value
+
+    def get_name(self):
+        return self.name
+
+    def get_world_transform(self):
+        return self.world
+
+
+# _FakeLightComp rebinds __class__ so isinstance() sees the right UE class,
+# which requires the stand-ins to share its layout.
+_LIGHT_CLASSES = {
+    "point": type("_FakePoint", (_FakeLightComp, u.PointLightComponent), {}),
+    "spot": type("_FakeSpot", (_FakeLightComp, u.SpotLightComponent), {}),
+    "rect": type("_FakeRect", (_FakeLightComp, u.RectLightComponent), {}),
+    "directional": type("_FakeDir", (_FakeLightComp, u.DirectionalLightComponent), {}),
+}
+
+
+class _FakeLightActor:
+    def __init__(self, comps, label="PointLight_0"):
+        self._comps = comps
+        self.label = label
+
+    def get_components_by_class(self, cls):
+        return [c for c in self._comps if isinstance(c, cls)]
+
+    def get_actor_label(self):
+        return self.label
+
+    def get_actor_transform(self):
+        return _FakeTransform()
+
+
+def _light(kind="point", **overrides):
+    comp = _FakeLightComp(kind, **overrides)
+    return EE._build_light_entries(_FakeLightActor([comp]))[0]
+
+
+def _near(a, b, tol=1e-6):
+    return a is not None and abs(a - b) <= tol
+
+
+# --- the headline bug: default lights were 625x too bright ------------------
+default_point = _light("point")
+check("UE's default local light (5000 unitless) lands on Godot's default energy",
+      _near(default_point["godot_energy"], 1.0, 1e-6), default_point["godot_energy"])
+check("UE's default directional light (10 lux) lands on Godot's default energy",
+      _near(_light("directional")["godot_energy"], 1.0, 1e-6),
+      _light("directional")["godot_energy"])
+check("5000 unitless normalises to UE's own 8 candelas",
+      _near(default_point["intensity_candelas"], 8.0, 1e-9),
+      default_point["intensity_candelas"])
+
+# The same physical light authored four ways must import at the same energy.
+# 8 cd == 5000 unitless == 8*4pi lm (isotropic point) == 2^3 EV.
+same = {
+    "candela": _light("point", intensity=8.0, intensity_units="CANDELAS"),
+    "unitless": default_point,
+    "lumens": _light("point", intensity=8.0 * 4.0 * math.pi, intensity_units="LUMENS"),
+    "ev": _light("point", intensity=3.0, intensity_units="EV"),
+}
+energies = {k: v["godot_energy"] for k, v in same.items()}
+check("the same light authored in any unit imports at the same energy",
+      all(_near(e, 1.0, 1e-6) for e in energies.values()), energies)
+
+# A spot light's lumen->candela factor depends on its cone, per UE's
+# SpotLightComponent::ComputeLightBrightness.
+spot_lm = _light("spot", intensity=100.0, intensity_units="LUMENS", outer_cone_angle=44.0)
+expected_cd = 100.0 / (2.0 * math.pi * (1.0 - math.cos(math.radians(44.0))))
+check("spot lumens are divided by the cone's solid angle, not 4pi",
+      _near(spot_lm["intensity_candelas"], expected_cd, 1e-6),
+      (spot_lm["intensity_candelas"], expected_cd))
+
+rect_lm = _light("rect", intensity=100.0, intensity_units="LUMENS")
+check("rect lumens use the panel's cosine distribution (/pi)",
+      _near(rect_lm["intensity_candelas"], 100.0 / math.pi, 1e-6),
+      rect_lm["intensity_candelas"])
+
+nits = _light("rect", intensity=100.0, intensity_units="NITS")
+check("nits are scaled by the emissive area instead of falling back to unitless",
+      _near(nits["intensity_candelas"], 100.0 * 0.64 * 0.64, 1e-9),
+      nits["intensity_candelas"])
+
+no_isf = _light("point", intensity=5000.0, intensity_units="CANDELAS",
+                use_inverse_squared_falloff=False)
+check("units are ignored when inverse-square falloff is off, as UE ignores them",
+      _near(no_isf["godot_energy"], 1.0, 1e-6) and no_isf["intensity_units"] == "candela",
+      no_isf["godot_energy"])
+
+# --- component-level collection ---------------------------------------------
+blueprint = _FakeLightActor(
+    [_FakeLightComp("point", name="LampA"), _FakeLightComp("spot", name="LampB")],
+    label="BP_Lamp")
+entries = EE._build_light_entries(blueprint)
+check("every LightComponent on an actor is exported, not just the first",
+      len(entries) == 2, entries)
+check("multiple lights on one actor get unique names",
+      [e["name"] for e in entries] == ["BP_Lamp_LampA", "BP_Lamp_LampB"],
+      [e["name"] for e in entries])
+check("a lone light keeps the plain actor label",
+      default_point["name"] == "PointLight_0", default_point["name"])
+check("a spot component is classified as a spot, not the point light it derives from",
+      [e["type"] for e in entries] == ["point", "spot"], [e["type"] for e in entries])
+check("a rect component is classified as rect",
+      _light("rect")["type"] == "rect")
+check("an actor with no light components yields nothing",
+      EE._build_light_entries(_FakeLightActor([])) == [])
+
+# The transform must come from the COMPONENT, or a light offset inside a
+# Blueprint lands on the actor's origin.
+offset = _FakeLightComp("point")
+offset.world.translation = _Vec(100.0, 200.0, 300.0)
+placed = EE._build_light_entries(_FakeLightActor([offset]))[0]
+check("a light's transform comes from the component, not the actor",
+      placed["godot_transform"]["translation"] == [2.0, 3.0, -1.0],
+      placed["godot_transform"]["translation"])
+
+# --- colour, visibility and the newly mapped properties ---------------------
+class _FakeColor:
+    def __init__(self, r, g, b, a=255):
+        self.r, self.g, self.b, self.a = r, g, b, a
+
+
+u.Color = _FakeColor
+u.LinearColor = lambda r, g, b, a=1.0: type("LC", (), {"r": r, "g": g, "b": b, "a": a})()
+tinted = _light("point", light_color=_FakeColor(255, 128, 50))
+# Expected values are FLinearColor::sRGBToLinearTable[128] and [50] verbatim,
+# read out of UE 5.7's Core/Private/Math/Color.cpp.
+check("an sRGB FColor light tint is decoded to linear, not just divided by 255",
+      _near(tinted["color"][1], 0.2158605, 1e-6)
+      and _near(tinted["color"][2], 0.0318960326156814, 1e-9),
+      tinted["color"])
+
+check("a light hidden in game exports invisible",
+      _light("point", hidden_in_game=True)["visible"] is False)
+check("a light excluded from the world exports invisible",
+      _light("point", affects_world=False)["visible"] is False)
+
+fade = _light("point", max_draw_distance=5000.0, max_distance_fade_range=1000.0)
+check("MaxDrawDistance becomes a Godot distance fade",
+      _near(fade["distance_fade_begin_m"], 40.0) and _near(fade["distance_fade_length_m"], 10.0),
+      (fade["distance_fade_begin_m"], fade["distance_fade_length_m"]))
+check("a light UE never culls gets no distance fade",
+      default_point["distance_fade_begin_m"] is None)
+
+sun = _light("directional")
+check("the sun's angular diameter is carried across for soft shadows",
+      _near(sun["source_angle_deg"], 0.5357, 1e-4), sun["source_angle_deg"])
+check("UE's dynamic shadow distance is converted to metres",
+      _near(sun["shadow_distance_m"], 400.0), sun["shadow_distance_m"])
+check("a directional light reports lux and no candela figure",
+      sun["intensity_units"] == "lux" and sun["intensity_candelas"] is None, sun)
+
+check("source radius is exported in metres for Godot's light_size",
+      _near(_light("point", source_radius=25.0)["source_radius_m"], 0.25),
+      _light("point", source_radius=25.0)["source_radius_m"])
+check("a rect light's panel size is carried as metres",
+      _light("rect")["rect_size_m"] == [0.64, 0.64], _light("rect")["rect_size_m"])
+check("specular and volumetric scattering multipliers are exported",
+      _light("point", specular_scale=0.25, volumetric_scattering_intensity=2.0)["specular_scale"] == 0.25
+      and _light("point", volumetric_scattering_intensity=2.0)["volumetric_scattering"] == 2.0)
+check("mobility is exported for diagnostics",
+      _light("point", mobility="STATIC")["mobility"] == "static")
+
+# Defensiveness: a component that fails every property read must not take the
+# level's export down with it.
+class _HostileComp(u.PointLightComponent):
+    def get_editor_property(self, key):
+        raise Exception("boom")
+
+    def get_name(self):
+        return "Hostile"
+
+    def get_world_transform(self):
+        raise Exception("boom")
+
+
+hostile = EE._build_light_entries(_FakeLightActor([_HostileComp()]))
+check("an unreadable light component still produces an entry rather than raising",
+      len(hostile) == 1 and hostile[0]["type"] == "point", hostile)
 
 print("\n" + "=" * 60)
 if FAIL:

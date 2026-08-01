@@ -119,16 +119,26 @@ def _clamp(value, low, high):
 
 
 # ---------------------------------------------------------------------------
-# Environment constants. These MIRROR addons/unreal_importer/import_environment.gd
-# -- the .tscn writer and the runtime addon build the same WorldEnvironment from
-# the same layout, and they are only consistent because these agree. Change one,
-# change the other; tests/test_tscn_writer.py checks them against each other.
+# Environment and light constants. These MIRROR
+# addons/unreal_importer/import_environment.gd -- the .tscn writer and the
+# runtime addon build the same lights and WorldEnvironment from the same
+# layout, and they are only consistent because these agree. Change one, change
+# the other; tests/test_tscn_writer.py checks them against each other.
 # ---------------------------------------------------------------------------
 _TONEMAP_ACES = 3               # Environment.TONE_MAPPER_ACES
 _UE_DEFAULT_EXPOSURE_BIAS = 1.0
 _MIDDLE_GREY = 0.18
 _ISO_REFERENCE = 100.0
 _EXPOSURE_SPEED_SCALE = 0.5 / 3.0
+
+# UE's own default AttenuationRadius (1000 cm), used when the field is missing.
+DEFAULT_ATTENUATION_M = 10.0
+# Godot rejects spot_angle >= 90; UE's OuterConeAngle clamps at 89.9.
+MAX_SPOT_ANGLE_DEG = 89.9
+# Godot's per-class light_specular defaults. UE's SpecularScale is a multiplier
+# against them, so a default UE light keeps Godot's stock look.
+GODOT_DIRECTIONAL_SPECULAR = 1.0
+GODOT_LOCAL_SPECULAR = 0.5
 
 
 def _exposure_for_settings(settings):
@@ -765,6 +775,12 @@ class _TscnWriter(object):
 
     # --- lights ------------------------------------------------------------------------------
     def _build_lights(self, root_path):
+        """
+        Mirrors import_environment.gd's _apply_lights property for property.
+        The two must agree: exporting a .tscn and importing the same layout
+        through the addon are meant to be interchangeable, and
+        tests/test_tscn_writer.py pins them against each other.
+        """
         for light in self.layout.get("lights") or []:
             if not isinstance(light, dict):
                 continue
@@ -782,24 +798,62 @@ class _TscnWriter(object):
             props.append("light_color = " + _color_literal(color))
 
             energy = _num(light.get("godot_energy"), 1.0) * self.light_energy_scale
-            props.append("light_energy = " + _f(energy))
+            props.append("light_energy = " + _f(max(0.0, energy)))
             props.append("shadow_enabled = %s"
                          % ("true" if light.get("cast_shadows", True) else "false"))
+            props.append("light_indirect_energy = " + _f(_num(light.get("indirect_intensity"), 1.0)))
+            props.append("light_volumetric_fog_energy = "
+                         + _f(_num(light.get("volumetric_scattering"), 1.0)))
+
+            radius = _num(light.get("attenuation_radius_m"), DEFAULT_ATTENUATION_M)
+            source_radius = max(0.0, _num(light.get("source_radius_m"), 0.0))
+            specular = max(0.0, _num(light.get("specular_scale"), 1.0))
 
             metadata = []
             if ltype == "directional":
                 gtype = "DirectionalLight3D"
-            elif ltype == "spot":
-                gtype = "SpotLight3D"
-                props.append("spot_range = " + _f(_num(light.get("attenuation_radius_m"), 5.0)))
-                props.append("spot_angle = " + _f(_num(light.get("outer_cone_angle_deg"), 45.0)))
-            elif ltype == "rect":
-                gtype = "OmniLight3D"
-                props.append("omni_range = " + _f(_num(light.get("attenuation_radius_m"), 5.0)))
-                metadata.append("metadata/unreal_rect_light = true")
-            else:  # point (and unknown)
-                gtype = "OmniLight3D"
-                props.append("omni_range = " + _f(_num(light.get("attenuation_radius_m"), 5.0)))
+                props.append("light_specular = " + _f(specular * GODOT_DIRECTIONAL_SPECULAR))
+                props.append("light_angular_distance = "
+                             + _f(_clamp(_num(light.get("source_angle_deg"), 0.0), 0.0, 90.0)))
+                shadow_distance = _num(light.get("shadow_distance_m"), 0.0)
+                if shadow_distance > 0.0:
+                    props.append("directional_shadow_max_distance = " + _f(shadow_distance))
+            else:
+                props.append("light_specular = " + _f(specular * GODOT_LOCAL_SPECULAR))
+                if source_radius > 0.0:
+                    props.append("light_size = " + _f(source_radius))
+                if ltype == "spot":
+                    gtype = "SpotLight3D"
+                    props.append("spot_range = " + _f(max(0.01, radius)))
+                    outer = _num(light.get("outer_cone_angle_deg"), 44.0)
+                    inner = _num(light.get("inner_cone_angle_deg"), 0.0)
+                    props.append("spot_angle = " + _f(_clamp(outer, 0.5, MAX_SPOT_ANGLE_DEG)))
+                    if outer > 0.0 and inner > 0.0 and inner < outer:
+                        props.append("spot_angle_attenuation = "
+                                     + _f(_clamp(outer / max(outer - inner, 0.5), 0.5, 8.0)))
+                else:  # point, rect (approximated by an omni) and unknown
+                    gtype = "OmniLight3D"
+                    props.append("omni_range = " + _f(max(0.01, radius)))
+                    if ltype == "rect":
+                        metadata.append("metadata/unreal_rect_light = true")
+                        rect_size = light.get("rect_size_m")
+                        if isinstance(rect_size, (list, tuple)) and len(rect_size) >= 2:
+                            metadata.append("metadata/unreal_rect_size_m = Vector2(%s, %s)"
+                                            % (_f(_num(rect_size[0], 0.0)),
+                                               _f(_num(rect_size[1], 0.0))))
+                            if source_radius <= 0.0:
+                                props.append("light_size = " + _f(
+                                    max(_num(rect_size[0], 0.0), _num(rect_size[1], 0.0)) * 0.5))
+
+            fade_begin = light.get("distance_fade_begin_m")
+            fade_length = light.get("distance_fade_length_m")
+            if isinstance(fade_begin, (int, float)) and isinstance(fade_length, (int, float)):
+                props.append("distance_fade_enabled = true")
+                props.append("distance_fade_begin = " + _f(max(0.0, float(fade_begin))))
+                props.append("distance_fade_length = " + _f(max(0.01, float(fade_length))))
+
+            if light.get("mobility"):
+                metadata.append('metadata/unreal_mobility = "%s"' % light.get("mobility"))
 
             if light.get("visible") is False:
                 props.append("visible = false")
