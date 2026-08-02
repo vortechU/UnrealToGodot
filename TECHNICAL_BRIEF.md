@@ -163,11 +163,13 @@ The exported level layout JSON file defines a flat database of meshes and a hier
 When running the import task, the GDScript compiler walks the JSON file and reconstructs the actor hierarchy:
 
 1. **Instancing Logic**:
+   - Every mesh actor is parented under one `UnrealStaticMeshes` node, alongside the `UnrealLights` / `UnrealDecals` / `UnrealFoliage` / `UnrealNavigation` containers the feature modules build. A level is overwhelmingly static meshes; loose at the scene root they bury everything else in the outliner. The container sits at identity, so nothing below it moves.
    - If an actor contains exactly **one** mesh component, the importer directly instances the glTF model and places it at the actor's world transform.
    - If an actor contains **multiple** components (e.g., Blueprint assets), the importer creates a root `Node3D` (named after the actor) and attaches the individual component models at their relative transforms.
 2. **Physics Auto-Generation**:
    - If collision primitive data is present in the `meshes` library for a given mesh, a `StaticBody3D` node is created as the parent, and `CollisionShape3D` nodes are added for each primitive.
    - **Capsule Height Conversion**: Godot capsule heights are defined as total height (including spherical caps), whereas Unreal uses cylinder length. The height is converted via $H_g = (L_{cylinder} + 2R) \cdot 0.01$.
+   - **Non-uniform scale is baked into the shapes, never left on the body.** Jolt cannot apply a non-uniform (or mirrored) scale to a sphere or capsule, nor to a rotated box or hull. It does not fail loudly: it substitutes the arithmetic *mean* of the three axes and logs one error per body on every scene load, leaving each collider a few percent off the mesh it was exported to hug. Unreal level designers scale props non-uniformly routinely, so the importer strips that scale off the `StaticBody3D` (and off a Blueprint's parent `Node3D`, whose scale the bodies would otherwise inherit) and folds it into the shapes: hulls take it exactly, per vertex, via $B^{-1}SB$; a box scales its extents along its own axes; a capsule splits it into axial (Y) and radial (X/Z) factors; a sphere can only take the mean. The mesh instance under the body picks up the same scale so the prop still renders unchanged. Uniformly scaled props take none of this and are emitted exactly as before. Shared helpers live in `import_common.gd` (`physics_body_transform` and friends), mirrored in `tscn_writer.py`.
 3. **Material Assignment**:
    - Compiles default materials and component-level material overrides.
    - Generates a `StandardMaterial3D` for each unique material name, mapping color and scalar parameter overrides.

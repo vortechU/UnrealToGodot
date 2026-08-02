@@ -25,6 +25,11 @@ const Common = preload("res://addons/unreal_importer/import_common.gd")
 # somewhere deep in the actor loop.
 const SUPPORTED_FORMAT_VERSION: int = 2
 
+# Name of the Node3D every mesh actor is parented under. Kept in step with
+# tscn_writer.py's STATIC_MESH_CONTAINER so a .tscn export and an addon import of
+# the same layout produce the same tree.
+const STATIC_MESH_CONTAINER: String = "UnrealStaticMeshes"
+
 # Per-feature import toggles (see docs/SCHEMA_V2.md). The dock passes a matching
 # dictionary; anything omitted falls back to these defaults.
 const DEFAULT_IMPORT_OPTIONS := {
@@ -57,6 +62,10 @@ var import_options: Dictionary = {}
 var report = null
 var _missing_textures: Dictionary = {}
 var _clamped_scalars: Dictionary = {}
+# Meshes whose collision had a Jolt-unsafe scale baked into the shapes, and the
+# subset where that bake could not be exact. See Common.physics_body_transform.
+var _scale_baked: Dictionary = {}
+var _scale_approximated: Dictionary = {}
 
 func _run() -> void:
 	# Standalone EditorScript execution entry point
@@ -74,6 +83,8 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 	report.header(json_path, models_folder, textures_folder)
 	_missing_textures.clear()
 	_clamped_scalars.clear()
+	_scale_baked.clear()
+	_scale_approximated.clear()
 	import_options = DEFAULT_IMPORT_OPTIONS.duplicate()
 	for key in options:
 		import_options[key] = options[key]
@@ -126,6 +137,21 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 	var missing_meshes: Dictionary = {}
 	var gameplay_helper = _load_feature("import_gameplay.gd")
 
+	# Every mesh actor goes under one container, the way lights (UnrealLights),
+	# decals (UnrealDecals), foliage and navigation already do. A level is mostly
+	# static meshes, so leaving them loose at the scene root buries the handful of
+	# nodes a user actually goes looking for. It stays at identity, so nothing
+	# below it moves. Every actor with components produces a node or a placeholder,
+	# so this is created exactly when it would not be left empty.
+	var mesh_root: Node = active_scene_root
+	for actor_data in actors:
+		if (actor_data.get("components", []) as Array).size() > 0:
+			var container := Node3D.new()
+			container.name = STATIC_MESH_CONTAINER
+			Common.add_owned_child(active_scene_root, container, active_scene_root)
+			mesh_root = container
+			break
+
 	# Iterate and instance actors
 	for actor_data in actors:
 		var actor_name: String = actor_data.get("name", "Actor")
@@ -165,34 +191,37 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 			var gltf_path := find_model_for(models_folder, mesh_key, mesh_name)
 			if gltf_path == "":
 				missing_meshes[mesh_key] = true
-				create_placeholder(active_scene_root, actor_name, comp_transform, mesh_key)
+				create_placeholder(mesh_root, actor_name, comp_transform, mesh_key)
 				continue
 
 			# Collision shapes are defined in mesh-local space, so the physics body
 			# sits at the component's (axis-corrected) world transform and the mesh
-			# sits at IDENTITY under it, keeping collision and mesh aligned.
-			var physics_body = setup_physics_body(active_scene_root, actor_name, mesh_place, mesh_key, meshes_lib)
+			# sits under it carrying only whatever scale the body could not keep,
+			# which is nothing at all for a uniformly scaled prop.
+			var physics_body = setup_physics_body(mesh_root, actor_name, mesh_place, mesh_key, meshes_lib)
 			var instanced_mesh = instance_gltf(gltf_path)
-			
+
 			if instanced_mesh:
 				# Apply materials to mesh instance
 				var overrides = comp_data.get("material_overrides", [])
 				apply_materials_to_instance(instanced_mesh, mesh_key, overrides, meshes_lib)
 
 				if physics_body:
-					# Physics body already carries actor * component; the mesh stays at
-					# identity under it so it lines up with the collision shapes.
+					# Physics body already carries actor * component, minus any scale
+					# Jolt could not have applied to the shapes -- which the mesh has
+					# to take instead, or it would render unscaled.
 					instanced_mesh.name = mesh_name
 					physics_body.add_child(instanced_mesh)
 					physics_body.owner = active_scene_root
 					instanced_mesh.owner = active_scene_root
 					_set_owner_recursive(instanced_mesh, active_scene_root)
-					instanced_mesh.transform = Transform3D.IDENTITY
+					instanced_mesh.transform = Transform3D(
+						Basis.from_scale(Common.physics_body_scale(mesh_place)), Vector3.ZERO)
 				else:
 					# Direct visual-only mesh instance at the component's world
 					# transform (axis-corrected, same as the physics-body case).
 					instanced_mesh.name = actor_name
-					active_scene_root.add_child(instanced_mesh)
+					mesh_root.add_child(instanced_mesh)
 					instanced_mesh.owner = active_scene_root
 					_set_owner_recursive(instanced_mesh, active_scene_root)
 					instanced_mesh.transform = mesh_place
@@ -206,14 +235,20 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 			# Multi-mesh Blueprint actor
 			var actor_node := Node3D.new()
 			actor_node.name = actor_name
-			active_scene_root.add_child(actor_node)
+			mesh_root.add_child(actor_node)
 			actor_node.owner = active_scene_root
-			actor_node.global_transform = actor_transform
-			
+			# A scale on the actor is INHERITED by the bodies beneath it, where Jolt
+			# would hit it again -- stripping it at the body would achieve nothing.
+			# Component placements are absolute, so the actor frame is free: drop the
+			# unsafe scale here and it reappears in each component's local transform,
+			# which is where setup_physics_body can bake it into the shapes.
+			var actor_frame := Common.physics_body_transform(actor_transform)
+			actor_node.global_transform = actor_frame
+
 			var any_component_succeeded := false
 			# Components hang off actor_node, so their world placement has to be
 			# expressed relative to the actor rather than to the world.
-			var actor_inverse := actor_transform.affine_inverse()
+			var actor_inverse := actor_frame.affine_inverse()
 			for comp_data in components:
 				var comp_name: String = comp_data.get("name", "Component")
 				var mesh_name: String = comp_data.get("mesh_name", "")
@@ -244,7 +279,8 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 						physics_body.owner = active_scene_root
 						instanced_mesh.owner = active_scene_root
 						_set_owner_recursive(instanced_mesh, active_scene_root)
-						instanced_mesh.transform = Transform3D.IDENTITY
+						instanced_mesh.transform = Transform3D(
+							Basis.from_scale(Common.physics_body_scale(mesh_place)), Vector3.ZERO)
 					else:
 						instanced_mesh.name = comp_name
 						actor_node.add_child(instanced_mesh)
@@ -308,6 +344,15 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 		report.fact("actors in json", actors.size())
 		report.fact("mesh entries in json", meshes_lib.size())
 		report.fact("actors imported", imported_count)
+		if not _scale_baked.is_empty():
+			report.fact("meshes with baked collision scale", _scale_baked.size())
+			report.line("  Their actors are scaled non-uniformly, which Jolt cannot apply to a")
+			report.line("  collision shape: it would replace the scale with the average of the")
+			report.line("  three axes and log an error per body on every load. The scale is baked")
+			report.line("  into the shapes instead, so the bodies carry no scale at all.")
+			for key in _scale_approximated:
+				report.warn(("%s: this shape cannot carry a non-uniform scale exactly, "
+					+ "so the collider is the closest primitive rather than an exact fit.") % key)
 		for line in feature_summary:
 			report.line("  " + line)
 		for w in feature_warnings:
@@ -532,99 +577,138 @@ func setup_physics_body(parent: Node, node_name: String, transform: Transform3D,
 	"""
 	Optionally generates a StaticBody3D node with collision shapes (Box, Sphere, Capsule, Convex)
 	based on the Unreal Engine collision data for the mesh.
+
+	`transform` is the component's full placement. Any scale Jolt cannot apply to a
+	shape is stripped off the body here and baked into the shapes instead (see
+	Common.physics_body_transform); the caller must put the same scale on the mesh
+	instance it parents under the returned body, via Common.physics_body_scale.
 	"""
 	var mesh_data = meshes_lib.get(mesh_name, {})
 	var collision = mesh_data.get("collision", null)
-	
+
 	if collision == null:
 		# No collision data defined for this mesh
 		return null
-		
+
 	# Create the StaticBody3D node
 	var body := StaticBody3D.new()
 	body.name = node_name
 	parent.add_child(body)
 	body.owner = active_scene_root
-	body.transform = transform
-	
+	body.transform = Common.physics_body_transform(transform)
+
+	# Vector3.ONE for a uniformly scaled prop, in which case every shape below is
+	# built exactly as it was before and the body keeps its scale.
+	var scale := Common.physics_body_scale(transform)
+	if scale != Vector3.ONE:
+		_scale_baked[mesh_name] = true
+
 	# 1. Generate Box Colliders
 	if collision.has("boxes"):
 		for box_data in collision["boxes"]:
 			var size_arr: Array = box_data["size"]
 			var local_trans: Dictionary = box_data["godot_local_transform"]
-			
+
 			var shape_node := CollisionShape3D.new()
 			shape_node.name = "BoxCollision"
 			body.add_child(shape_node)
 			shape_node.owner = active_scene_root
-			
+
+			var local := get_transform_from_dict(local_trans)
 			var box_shape := BoxShape3D.new()
 			# Full extents cm -> m, remapped into the glTF axis order (X, Z, Y) so
 			# the box lines up with the mesh it hugs (matches gltf_local_shape_transform).
-			box_shape.size = Vector3(size_arr[0], size_arr[2], size_arr[1]) * 0.01
+			box_shape.size = (Vector3(size_arr[0], size_arr[2], size_arr[1]) * 0.01) \
+				* Common.scaled_axis_factors(local.basis, scale)
 			shape_node.shape = box_shape
-			shape_node.transform = get_transform_from_dict(local_trans)
-			
+			shape_node.transform = Common.scaled_shape_transform(local, scale)
+
 	# 2. Generate Sphere Colliders
 	if collision.has("spheres"):
 		for sphere_data in collision["spheres"]:
 			var radius: float = sphere_data["radius"]
 			var local_trans: Dictionary = sphere_data["godot_local_transform"]
-			
+
 			var shape_node := CollisionShape3D.new()
 			shape_node.name = "SphereCollision"
 			body.add_child(shape_node)
 			shape_node.owner = active_scene_root
-			
+
 			var sphere_shape := SphereShape3D.new()
-			sphere_shape.radius = radius * 0.01
+			# A sphere has no way to express a non-uniform scale, so it settles for
+			# the mean -- the one shape where the baking is still an approximation.
+			sphere_shape.radius = radius * 0.01 * Common.uniform_factor(scale)
+			if scale != Vector3.ONE:
+				_note_approximate_collision(mesh_name, "sphere")
 			shape_node.shape = sphere_shape
-			shape_node.transform = get_transform_from_dict(local_trans)
-			
+			shape_node.transform = Common.scaled_shape_transform(
+				get_transform_from_dict(local_trans), scale)
+
 	# 3. Generate Capsule (Sphyl) Colliders
 	if collision.has("capsules"):
 		for cap_data in collision["capsules"]:
 			var radius: float = cap_data["radius"]
 			var length: float = cap_data["length"]
 			var local_trans: Dictionary = cap_data["godot_local_transform"]
-			
+
 			var shape_node := CollisionShape3D.new()
 			shape_node.name = "CapsuleCollision"
 			body.add_child(shape_node)
 			shape_node.owner = active_scene_root
-			
+
+			var local := get_transform_from_dict(local_trans)
+			# A Godot capsule runs along its local Y, so Y stretches the cylinder
+			# and X/Z stretch the radius -- and the radius can only take one of
+			# them, so unequal X/Z is the second approximate case.
+			var factors := Common.scaled_axis_factors(local.basis, scale)
+			var radial := 0.5 * (factors.x + factors.z)
+			if absf(factors.x - factors.z) > 0.001:
+				_note_approximate_collision(mesh_name, "capsule")
+
 			var capsule_shape := CapsuleShape3D.new()
-			capsule_shape.radius = radius * 0.01
+			capsule_shape.radius = radius * 0.01 * radial
 			# Godot capsule height is cylinder length + 2 * radius
-			capsule_shape.height = (length + 2.0 * radius) * 0.01
+			capsule_shape.height = (length * factors.y + 2.0 * radius * radial) * 0.01
 			shape_node.shape = capsule_shape
-			shape_node.transform = get_transform_from_dict(local_trans)
-			
+			shape_node.transform = Common.scaled_shape_transform(local, scale)
+
 	# 4. Generate Convex Hulls
 	if collision.has("convex_hulls"):
 		for convex_data in collision["convex_hulls"]:
 			var verts_arr: Array = convex_data.get("vertices", [])
 			var local_trans: Dictionary = convex_data["godot_local_transform"]
-			
+
 			if verts_arr.size() == 0:
 				continue
-				
+
 			var shape_node := CollisionShape3D.new()
 			shape_node.name = "ConvexCollision"
 			body.add_child(shape_node)
 			shape_node.owner = active_scene_root
-			
+
+			var local := get_transform_from_dict(local_trans)
+			# A hull is a raw point cloud, so it takes the body scale EXACTLY --
+			# shear, mirror and all -- expressed in the shape's own frame:
+			# B^-1 * S * B, which is identity whenever there is nothing to bake.
+			var point_map := local.basis.inverse() * Basis.from_scale(scale) * local.basis
+
 			var convex_shape := ConvexPolygonShape3D.new()
 			var points = PackedVector3Array()
 			for v in verts_arr:
 				# glTF axis order (X, Z, Y), cm -> m, matching the mesh geometry.
-				points.append(Vector3(v[0], v[2], v[1]) * 0.01)
+				points.append(point_map * (Vector3(v[0], v[2], v[1]) * 0.01))
 			convex_shape.points = points
-			
+
 			shape_node.shape = convex_shape
-			shape_node.transform = get_transform_from_dict(local_trans)
-			
+			shape_node.transform = Common.scaled_shape_transform(local, scale)
+
 	return body
+
+
+func _note_approximate_collision(mesh_name: String, shape_kind: String) -> void:
+	"""Records the two cases where baking a non-uniform scale into a shape cannot
+	be exact, so the report can name them instead of leaving the user to notice."""
+	_scale_approximated["%s (%s)" % [mesh_name, shape_kind]] = true
 
 func apply_materials_to_instance(instanced_mesh: Node3D, mesh_name: String, override_mats: Array, meshes_lib: Dictionary) -> void:
 	"""

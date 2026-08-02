@@ -154,7 +154,7 @@ def make_gltf(with_texture):
     return doc
 
 
-for name in ["SM_Rock", "SM_Crate"]:
+for name in ["SM_Rock", "SM_Crate", "SM_Scaled"]:
     with open(os.path.join(HARNESS, "models", name + ".gltf"), "w", encoding="utf-8") as f:
         json.dump(make_gltf(with_texture=False), f)
 
@@ -172,6 +172,13 @@ shutil.copytree(os.path.join(REPO, "addons"), os.path.join(HARNESS, "addons"))
 # --- layout fixture: exactly the shape export_level_to_json.py emits ----------
 def t(x, y, z, s=1.0):
     return {"translation": [x, y, z], "rotation_quat": [0.0, 0.0, 0.0, 1.0], "scale": [s, s, s]}
+
+
+def ts(x, y, z, sx, sy, sz):
+    """Unrotated placement with a NON-UNIFORM scale -- the shape Jolt refuses to
+    apply to a collision shape."""
+    return {"translation": [x, y, z], "rotation_quat": [0.0, 0.0, 0.0, 1.0],
+            "scale": [sx, sy, sz]}
 
 
 SQRT_HALF = 0.7071067811865476
@@ -195,6 +202,27 @@ layout = {
         # Crate has no collision -> exercises the plain-instance path.
         "SM_Crate": {"path": "/Game/SM_Crate", "export_name": "SM_Crate",
                      "collision": None, "materials": []},
+        # One of every collision primitive, for the non-uniformly scaled actor.
+        # Jolt refuses a non-uniform scale on a sphere or a capsule outright, and
+        # on a rotated box or hull; the importer has to bake the scale into these
+        # shapes and hand the body a scale-free transform. The box is offset so
+        # the offset's own scaling is checked too, and the hull is a unit cube
+        # whose corners make the applied scale readable straight off the points.
+        "SM_Scaled": {
+            "path": "/Game/SM_Scaled", "export_name": "SM_Scaled", "materials": [],
+            "collision": {
+                "boxes": [{"size": [100.0, 100.0, 100.0],
+                           "godot_local_transform": t(1, 0, 0)}],
+                "spheres": [{"radius": 50.0, "godot_local_transform": t(0, 0, 0)}],
+                "capsules": [{"radius": 25.0, "length": 100.0,
+                              "godot_local_transform": t(0, 0, 0)}],
+                "convex_hulls": [{"vertices": [[100.0, 100.0, 100.0], [-100.0, 100.0, 100.0],
+                                               [100.0, -100.0, 100.0], [100.0, 100.0, -100.0],
+                                               [-100.0, -100.0, 100.0], [-100.0, 100.0, -100.0],
+                                               [100.0, -100.0, -100.0], [-100.0, -100.0, -100.0]],
+                                  "godot_local_transform": t(0, 0, 0)}],
+            },
+        },
         # Carries a packed RMA map, as the Old_Buoys pack does. Channel indices
         # match Godot's BaseMaterial3D.TextureChannel (0=RED, 1=GREEN, 2=BLUE).
         "SM_Textured": {
@@ -245,8 +273,13 @@ layout = {
             # Blueprint with a component nested TWO levels deep: its relative
             # transform (1,0,0) is measured against an intermediate component,
             # so only godot_world_transform reaches the true (16, 0, 0).
+            # The actor is also scaled non-uniformly: a scale left on the actor
+            # node is INHERITED by every body under it, so the importer strips it
+            # here too. Component placements are absolute, so the world positions
+            # asserted below must come out identical either way -- that is the
+            # point of the check.
             "name": "BP_Pier", "class": "BP_Pier_C",
-            "godot_transform": t(10, 0, 0),
+            "godot_transform": ts(10, 0, 0, 2.0, 1.0, 0.5),
             "components": [
                 {"name": "Deck", "mesh_key": "SM_Crate", "mesh_name": "SM_Crate",
                  "godot_relative_transform": t(5, 0, 0),
@@ -267,6 +300,19 @@ layout = {
             "components": [{"name": "SM0", "mesh_key": "SM_Crate", "mesh_name": "SM_Crate",
                             "godot_relative_transform": ry90(2.0, 3.0, 5.0),
                             "godot_world_transform": ry90(2.0, 3.0, 5.0),
+                            "material_overrides": []}],
+        },
+        {
+            # Non-uniformly scaled AND carrying collision: the Jolt case. Its
+            # placement basis is diag(2,1,0.5); the glTF axis fix Ry(+90) turns
+            # that into columns (0,0,-0.5)/(0,1,0)/(2,0,0), i.e. a local scale of
+            # (0.5, 1, 2) about a pure Ry(90). The body must end up with the
+            # rotation only and the shapes must absorb the (0.5, 1, 2).
+            "name": "Scaled_1", "class": "StaticMeshActor",
+            "godot_transform": ts(30, 0, 0, 2.0, 1.0, 0.5),
+            "components": [{"name": "SM0", "mesh_key": "SM_Scaled", "mesh_name": "SM_Scaled",
+                            "godot_relative_transform": ts(30, 0, 0, 2.0, 1.0, 0.5),
+                            "godot_world_transform": ts(30, 0, 0, 2.0, 1.0, 0.5),
                             "material_overrides": []}],
         },
         {

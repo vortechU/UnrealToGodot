@@ -293,6 +293,126 @@ def _mat_affine_inverse(mat):
     return (inv, inv_origin)
 
 
+# ----------------------------------------------------------------------------------------------
+# Physics-body scale handling. The exact twin of import_common.gd's block of the same name --
+# read that one for why this exists. In short: Jolt cannot apply a non-uniform (or mirrored)
+# scale to a sphere, a capsule, or any rotated shape. It does not fail loudly; it replaces the
+# scale with the arithmetic MEAN of the three axes and logs an error per body on every scene
+# load, leaving the collider a few percent off the mesh it was exported to hug. So a StaticBody3D
+# emitted here carries rotation and translation only, and the scale is baked into the shapes and
+# the mesh instance underneath it.
+#
+# The two implementations must agree: a .tscn export and an addon import of the same layout are
+# meant to be interchangeable. tests/test_tscn_writer.py pins them against each other.
+# ----------------------------------------------------------------------------------------------
+
+SCALE_UNIFORM_EPSILON = 1e-4
+_UNIT_SCALE = (1.0, 1.0, 1.0)
+
+# Node every mesh actor is emitted under; mirrors STATIC_MESH_CONTAINER in
+# import_unreal_layout.gd. The sibling containers mirror the addon's feature modules.
+STATIC_MESH_CONTAINER = "UnrealStaticMeshes"
+LIGHT_CONTAINER = "UnrealLights"
+DECAL_CONTAINER = "UnrealDecals"
+FOLIAGE_CONTAINER = "UnrealFoliage"
+NAVIGATION_CONTAINER = "UnrealNavigation"
+
+
+def _mat_column(rows, j):
+    return (rows[0][j], rows[1][j], rows[2][j])
+
+
+def _vec_length(v):
+    return math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+
+
+def _rows_determinant(r):
+    return (r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1])
+            - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
+            + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0]))
+
+
+def _basis_local_scale(rows):
+    """The LOCAL scale of a basis: the length of each COLUMN, with a mirrored basis's
+    handedness folded into X (so rotation * diag(scale) reproduces the basis)."""
+    s = [_vec_length(_mat_column(rows, j)) for j in range(3)]
+    if _rows_determinant(rows) < 0.0:
+        s[0] = -s[0]
+    return s
+
+
+def _scale_is_body_safe(scale):
+    """True when a physics body may carry this scale directly: Jolt accepts a uniform,
+    non-mirrored scale on every shape type and nothing else."""
+    if scale[0] < 0.0 or scale[1] < 0.0 or scale[2] < 0.0:
+        return False
+    hi = max(scale)
+    if hi <= 0.0:
+        return True
+    return (hi - min(scale)) / hi <= SCALE_UNIFORM_EPSILON
+
+
+def _physics_body_scale(mat):
+    """The part of a placement's scale that must be baked into the shapes rather than
+    left on the StaticBody3D. (1, 1, 1) means "nothing to bake"."""
+    s = _basis_local_scale(mat[0])
+    if _scale_is_body_safe(s):
+        return list(_UNIT_SCALE)
+    return s
+
+
+def _physics_body_mat(mat):
+    """A placement with the Jolt-unsafe scale stripped off. A uniform scale is returned
+    untouched, so an ordinary prop keeps exactly the transform it had."""
+    scale = _physics_body_scale(mat)
+    if tuple(scale) == _UNIT_SCALE:
+        return mat
+    rows, origin = mat
+    axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    cols = []
+    for j in range(3):
+        col = _mat_column(rows, j)
+        cols.append([c / scale[j] for c in col] if abs(scale[j]) > 1e-9 else axes[j])
+    return ([[cols[j][i] for j in range(3)] for i in range(3)], origin)
+
+
+def _scale_diag(scale):
+    return ([[scale[0], 0.0, 0.0], [0.0, scale[1], 0.0], [0.0, 0.0, scale[2]]], [0.0, 0.0, 0.0])
+
+
+def _scaled_shape_mat(local_mat, scale):
+    """A shape's local transform once `scale` has come off the body: the OFFSET moves
+    with the scale, the rotation does not."""
+    if tuple(scale) == _UNIT_SCALE:
+        return local_mat
+    rows, origin = local_mat
+    return (rows, [origin[i] * scale[i] for i in range(3)])
+
+
+def _scaled_axis_factors(local_rows, scale):
+    """How much each of a shape's OWN axes stretches under a body scale applied in the
+    parent frame. Exact when the shape's rotation is axis-aligned with the scale (what
+    Unreal's simple collision almost always is); otherwise the closest a primitive can
+    get, since the true result is a shear no primitive expresses. Convex hulls skip
+    this and take the shear exactly, per vertex."""
+    if tuple(scale) == _UNIT_SCALE:
+        return list(_UNIT_SCALE)
+    out = []
+    for j in range(3):
+        col = _mat_column(local_rows, j)
+        before = _vec_length(col)
+        if before <= 1e-9:
+            out.append(1.0)
+        else:
+            out.append(_vec_length([col[i] * scale[i] for i in range(3)]) / before)
+    return out
+
+
+def _uniform_factor(scale):
+    """The single factor a shape that cannot scale non-uniformly (a sphere) settles for."""
+    return (abs(scale[0]) + abs(scale[1]) + abs(scale[2])) / 3.0
+
+
 def _component_world_mat(comp, actor_mat):
     """A component's absolute placement, taken from the exporter rather than composed.
 
@@ -595,54 +715,74 @@ class _TscnWriter(object):
         return lines
 
     # --- collision -> shape sub_resources ----------------------------------------------------
-    def _emit_collision(self, parent_path, collision):
+    def _emit_collision(self, parent_path, collision, scale=_UNIT_SCALE):
         """Emit CollisionShape3D child nodes (+ shape sub_resources) mirroring the GDScript
-        importer's setup_physics_body math. `parent_path` is the StaticBody3D."""
+        importer's setup_physics_body math. `parent_path` is the StaticBody3D.
+
+        `scale` is whatever the body could not carry (see _physics_body_scale); it is
+        (1, 1, 1) for a uniformly scaled prop, and then every shape below is built exactly
+        as it was before this existed."""
         if not isinstance(collision, dict):
             return
+        scale = list(scale)
         for box in collision.get("boxes") or []:
             size = box.get("size") or [0.0, 0.0, 0.0]
+            local = _transform_dict_to_mat(box.get("godot_local_transform"))
+            factors = _scaled_axis_factors(local[0], scale)
             # Full extents cm -> m with glTF [x, z, y] axis remap (matches importer BoxShape3D.size)
-            gx = _num(size[0]) * 0.01 if len(size) > 0 else 0.0
-            gy = _num(size[2]) * 0.01 if len(size) > 2 else 0.0
-            gz = _num(size[1]) * 0.01 if len(size) > 1 else 0.0
+            gx = (_num(size[0]) * 0.01 if len(size) > 0 else 0.0) * factors[0]
+            gy = (_num(size[2]) * 0.01 if len(size) > 2 else 0.0) * factors[1]
+            gz = (_num(size[1]) * 0.01 if len(size) > 1 else 0.0) * factors[2]
             sid = self._register_sub("BoxShape3D", ["size = " + _vec3_literal([gx, gy, gz])])
-            self._add_shape_node(parent_path, "BoxCollision",
-                                 box.get("godot_local_transform"), sid)
+            self._add_shape_node(parent_path, "BoxCollision", _scaled_shape_mat(local, scale), sid)
         for sphere in collision.get("spheres") or []:
-            radius = _num(sphere.get("radius")) * 0.01
+            # A sphere cannot express a non-uniform scale, so it settles for the mean --
+            # the one shape where the bake stays an approximation.
+            radius = _num(sphere.get("radius")) * 0.01 * _uniform_factor(scale)
             sid = self._register_sub("SphereShape3D", ["radius = " + _f(radius)])
+            local = _transform_dict_to_mat(sphere.get("godot_local_transform"))
             self._add_shape_node(parent_path, "SphereCollision",
-                                 sphere.get("godot_local_transform"), sid)
+                                 _scaled_shape_mat(local, scale), sid)
         for cap in collision.get("capsules") or []:
-            radius = _num(cap.get("radius")) * 0.01
-            length = _num(cap.get("length"))
-            height = (length + 2.0 * _num(cap.get("radius"))) * 0.01
+            local = _transform_dict_to_mat(cap.get("godot_local_transform"))
+            # A Godot capsule runs along its local Y: Y stretches the cylinder, X and Z
+            # stretch the radius -- and the radius takes only one of them.
+            factors = _scaled_axis_factors(local[0], scale)
+            radial = 0.5 * (factors[0] + factors[2])
+            radius = _num(cap.get("radius")) * 0.01 * radial
+            length = _num(cap.get("length")) * factors[1]
+            height = length * 0.01 + 2.0 * radius
             sid = self._register_sub("CapsuleShape3D",
                                      ["radius = " + _f(radius), "height = " + _f(height)])
             self._add_shape_node(parent_path, "CapsuleCollision",
-                                 cap.get("godot_local_transform"), sid)
+                                 _scaled_shape_mat(local, scale), sid)
         for convex in collision.get("convex_hulls") or []:
             verts = convex.get("vertices") or []
             if not verts:
                 continue
+            local = _transform_dict_to_mat(convex.get("godot_local_transform"))
+            # A hull is a raw point cloud, so it takes the body scale EXACTLY -- shear,
+            # mirror and all -- expressed in the shape's own frame: B^-1 * S * B, which is
+            # identity whenever there is nothing to bake.
+            point_map = _mat_compose(_mat_affine_inverse((local[0], [0.0, 0.0, 0.0])),
+                                     _mat_compose(_scale_diag(scale),
+                                                  (local[0], [0.0, 0.0, 0.0])))[0]
             floats = []
             for v in verts:
                 # per-vertex glTF [x, z, y] * 0.01 remap (matches importer ConvexPolygonShape3D)
                 vx = _num(v[0]) * 0.01 if len(v) > 0 else 0.0
                 vy = _num(v[2]) * 0.01 if len(v) > 2 else 0.0
                 vz = _num(v[1]) * 0.01 if len(v) > 1 else 0.0
-                floats.extend((vx, vy, vz))
+                p = (vx, vy, vz)
+                floats.extend(sum(point_map[i][k] * p[k] for k in range(3)) for i in range(3))
             body = ["points = PackedVector3Array(%s)" % ", ".join(_f(x) for x in floats)]
             sid = self._register_sub("ConvexPolygonShape3D", body)
             self._add_shape_node(parent_path, "ConvexCollision",
-                                 convex.get("godot_local_transform"), sid)
+                                 _scaled_shape_mat(local, scale), sid)
 
-    def _add_shape_node(self, parent_path, name, local_transform, shape_id):
-        props = []
-        if isinstance(local_transform, dict):
-            props.append("transform = " + _mat_to_transform3d(_transform_dict_to_mat(local_transform)))
-        props.append('shape = SubResource("%s")' % shape_id)
+    def _add_shape_node(self, parent_path, name, local_mat, shape_id):
+        props = ["transform = " + _mat_to_transform3d(local_mat),
+                 'shape = SubResource("%s")' % shape_id]
         self._add_node(name, "CollisionShape3D", parent_path, props=props)
 
     # --- mesh instance node / placeholder ----------------------------------------------------
@@ -659,27 +799,41 @@ class _TscnWriter(object):
 
         self._build_actors(root_path)
         if self.options.get("lights"):
-            self._build_lights(root_path)
+            self._build_lights(self._container(root_path, LIGHT_CONTAINER,
+                                               self.layout.get("lights")))
         self._build_environment(root_path)  # post_process/fog/sky are always environment-worthy
         if self.options.get("decals"):
-            self._build_decals(root_path)
+            self._build_decals(self._container(root_path, DECAL_CONTAINER,
+                                               self.layout.get("decals")))
         if self.options.get("foliage"):
-            self._build_foliage(root_path)
+            self._build_foliage(self._container(root_path, FOLIAGE_CONTAINER,
+                                                self.layout.get("foliage")))
         if self.options.get("navigation"):
-            self._build_navigation(root_path)
+            self._build_navigation(self._container(root_path, NAVIGATION_CONTAINER,
+                                                   self.layout.get("navigation")))
         if self.options.get("landscape"):
             self._build_landscapes(root_path)
 
+    def _container(self, root_path, name, entries):
+        """A Node3D grouping one feature's nodes, matching what the Godot addon's feature
+        modules build (UnrealLights, UnrealDecals, UnrealFoliage, UnrealNavigation). A
+        level is mostly static meshes, so without these the handful of nodes a user goes
+        looking for is buried among thousands of props. Emitted at identity, so nothing
+        below moves; skipped entirely when the feature is empty."""
+        if not entries:
+            return root_path
+        return self._add_node(name, "Node3D", root_path)
+
     # --- actors ------------------------------------------------------------------------------
-    def _build_actors(self, root_path):
+    def _build_actors(self, scene_root_path):
         meshes_lib = self.layout.get("meshes") or {}
         emit_meta = bool(self.options.get("metadata"))
-        for actor in self.layout.get("actors") or []:
-            if not isinstance(actor, dict):
-                continue
+        actors = [a for a in (self.layout.get("actors") or [])
+                  if isinstance(a, dict) and (a.get("components") or [])]
+        # Every mesh actor goes under one container -- see _container().
+        root_path = self._container(scene_root_path, STATIC_MESH_CONTAINER, actors)
+        for actor in actors:
             components = actor.get("components") or []
-            if not components:
-                continue
             actor_name = actor.get("name") or "Actor"
             actor_mat = _transform_dict_to_mat(actor.get("godot_transform"))
             actor_meta = self._actor_metadata_lines(actor) if emit_meta else []
@@ -719,13 +873,14 @@ class _TscnWriter(object):
 
         if collision:
             # Collision shapes are mesh-local, so the body carries the component's
-            # (axis-corrected) world transform and the mesh instance sits at
-            # identity under it.
-            body_props = ["transform = " + _mat_to_transform3d(mesh_place)]
+            # (axis-corrected) world transform -- minus any scale Jolt could not have
+            # applied to the shapes, which the mesh instance under it takes instead.
+            scale = _physics_body_scale(mesh_place)
+            body_props = ["transform = " + _mat_to_transform3d(_physics_body_mat(mesh_place))]
             body_path = self._add_node(actor_name, "StaticBody3D", root_path,
                                        props=body_props, metadata=actor_meta)
-            self._emit_collision(body_path, collision)
-            inst_props = ["transform = " + _mat_to_transform3d(_IDENTITY_MAT)]
+            self._emit_collision(body_path, collision, scale)
+            inst_props = ["transform = " + _mat_to_transform3d(_scale_diag(scale))]
             inst_meta = self._component_metadata_lines(comp) if emit_meta else []
             self._add_node(_mesh_node_name(comp, mesh_key), None, body_path,
                            instance_id=ext_id, props=inst_props, metadata=inst_meta)
@@ -740,12 +895,18 @@ class _TscnWriter(object):
 
     def _build_multi_component_actor(self, root_path, actor_name, actor_mat, components,
                                      meshes_lib, actor_meta, emit_meta):
-        parent_props = ["transform = " + _mat_to_transform3d(actor_mat)]
+        # A scale on the actor is INHERITED by the bodies beneath it, where Jolt would
+        # hit it again -- stripping it at the body alone would achieve nothing. Component
+        # placements are absolute, so the actor frame is free: drop the unsafe scale here
+        # and it reappears in each component's local transform, which is where
+        # _emit_collision can bake it into the shapes.
+        actor_frame = _physics_body_mat(actor_mat)
+        parent_props = ["transform = " + _mat_to_transform3d(actor_frame)]
         actor_path = self._add_node(actor_name, "Node3D", root_path,
                                     props=parent_props, metadata=actor_meta)
         # Components are emitted under actor_path, so their world placement has to
         # be re-expressed relative to the actor.
-        actor_inverse = _mat_affine_inverse(actor_mat)
+        actor_inverse = _mat_affine_inverse(actor_frame)
         for comp in components:
             mesh_key = self._component_mesh_key(comp)
             comp_name = comp.get("name") or "Component"
@@ -765,13 +926,16 @@ class _TscnWriter(object):
             # Re-seat the glTF mesh (and its collision) into the placement convention.
             mesh_place = _apply_mesh_axis_fix(comp_mat)
             if collision:
-                body_props = ["transform = " + _mat_to_transform3d(mesh_place)]
+                scale = _physics_body_scale(mesh_place)
+                body_props = ["transform = " + _mat_to_transform3d(_physics_body_mat(mesh_place))]
                 body_path = self._add_node(comp_name, "StaticBody3D", actor_path,
                                            props=body_props, metadata=comp_meta)
-                self._emit_collision(body_path, collision)
-                # mesh instance sits at identity under the body (body already carries comp xform)
+                self._emit_collision(body_path, collision, scale)
+                # The body already carries the component transform, so the mesh instance
+                # under it only takes the scale the body had to give up.
                 self._add_node(_mesh_node_name(comp, mesh_key), None, body_path,
-                               instance_id=ext_id)
+                               instance_id=ext_id,
+                               props=["transform = " + _mat_to_transform3d(_scale_diag(scale))])
             else:
                 props = ["transform = " + _mat_to_transform3d(mesh_place)]
                 self._add_node(comp_name, None, actor_path, instance_id=ext_id,

@@ -17,7 +17,7 @@ os.makedirs(MODELS, exist_ok=True)
 os.makedirs(TEXTURES, exist_ok=True)
 
 # Fake assets on disk so ext_resource existence checks pass
-for f in ["SM_Rock.gltf", "SM_Crate.gltf", "SM_Grass.gltf"]:
+for f in ["SM_Rock.gltf", "SM_Crate.gltf", "SM_Grass.gltf", "SM_Scaled.gltf"]:
     open(os.path.join(MODELS, f), "w").write("{}")
 open(os.path.join(TEXTURES, "T_Blood.png"), "w").write("x")
 
@@ -41,6 +41,20 @@ layout = {
             "materials": [],
         },
         "SM_Crate": {"path": "/Game/SM_Crate.SM_Crate", "export_name": "SM_Crate", "collision": None, "materials": []},
+        # One of every primitive, for the non-uniformly scaled actor below.
+        "SM_Scaled": {
+            "path": "/Game/SM_Scaled.SM_Scaled", "export_name": "SM_Scaled", "materials": [],
+            "collision": {
+                "boxes": [{"size": [100.0, 100.0, 100.0],
+                           "godot_local_transform": {"translation": [1.0, 0.0, 0.0],
+                                                     "rotation_quat": [0.0, 0.0, 0.0, 1.0],
+                                                     "scale": [1.0, 1.0, 1.0]}}],
+                "spheres": [{"radius": 50.0, "godot_local_transform": IDENT}],
+                "capsules": [{"radius": 25.0, "length": 100.0, "godot_local_transform": IDENT}],
+                "convex_hulls": [{"vertices": [[100.0, 100.0, 100.0], [-100.0, -100.0, -100.0]],
+                                  "godot_local_transform": IDENT}],
+            },
+        },
         "SM_Grass": {"path": "/Game/SM_Grass.SM_Grass", "export_name": "SM_Grass", "collision": None, "materials": []},
         "SM_Missing": {"path": "/Game/SM_Missing.SM_Missing", "export_name": "SM_Missing", "collision": None, "materials": []},
     },
@@ -70,6 +84,22 @@ layout = {
                  "godot_relative_transform": t(-0.5, 0, 0, 90.0),
                  "godot_world_transform": t(-5.5, 0, 2, 90.0), "material_overrides": []},
             ],
+        },
+        {
+            # Non-uniformly scaled AND carrying collision -- the Jolt case. The
+            # placement basis is diag(2,1,0.5); the glTF axis fix Ry(+90) turns it
+            # into Ry(90) with a LOCAL scale of (0.5, 1, 2), which the shapes must
+            # absorb so the body can be handed a scale-free transform.
+            "name": "Scaled_1", "class": "StaticMeshActor",
+            "godot_transform": {"translation": [30.0, 0.0, 0.0],
+                                "rotation_quat": [0.0, 0.0, 0.0, 1.0],
+                                "scale": [2.0, 1.0, 0.5]},
+            "components": [{"name": "SM0", "mesh_key": "SM_Scaled", "mesh_name": "SM_Scaled",
+                            "godot_relative_transform": IDENT,
+                            "godot_world_transform": {"translation": [30.0, 0.0, 0.0],
+                                                      "rotation_quat": [0.0, 0.0, 0.0, 1.0],
+                                                      "scale": [2.0, 1.0, 0.5]},
+                            "material_overrides": []}],
         },
         {
             "name": "Missing_1", "class": "StaticMeshActor", "godot_transform": IDENT,
@@ -274,6 +304,132 @@ assert near([inst0[0], inst0[1], inst0[2]], [0.0, 0.0, 1.0]) \
 assert near([inst0[3], inst0[7], inst0[11]], [1.0, 0.0, 1.0]), \
     f"foliage instance 0 origin must be preserved at (1,0,1), got {inst0}"
 print("axis fix OK: Rock_1 basis Ry(135), CrateB basis Ry(180), foliage inst0 Ry(90)")
+
+# ---------------------------------------------------------------------------
+# Scene grouping. A level is overwhelmingly static meshes, so emitting them
+# loose at the scene root buries the handful of nodes anyone actually goes
+# looking for. Each feature gets a container, matching what the Godot addon's
+# feature modules already build (UnrealLights, UnrealDecals, ...), so a .tscn
+# export and an addon import of the same layout still produce the same tree.
+# ---------------------------------------------------------------------------
+NODES = []
+for _m in re.finditer(r'\[node name="([^"]+)"([^\]]*)\](.*?)(?=\n\[|\Z)', text, re.S):
+    _attrs = _m.group(2)
+    _p = re.search(r'parent="([^"]*)"', _attrs)
+    _t = re.search(r'type="([^"]+)"', _attrs)
+    NODES.append({"name": _m.group(1), "parent": _p.group(1) if _p else None,
+                  "type": _t.group(1) if _t else None, "body": _m.group(3)})
+
+
+def node(name, parent=None):
+    for n in NODES:
+        if n["name"] == name and (parent is None or n["parent"] == parent):
+            return n
+    raise AssertionError("no node %r under parent %r" % (name, parent))
+
+
+for container, member in (("UnrealStaticMeshes", "Rock_1"), ("UnrealLights", "Sun"),
+                          ("UnrealDecals", "Blood_1"), ("UnrealFoliage", "Foliage_SM_Grass"),
+                          ("UnrealNavigation", "NavVol_1")):
+    grp = node(container, parent=".")
+    assert grp["type"] == "Node3D", "%s must be a Node3D, got %s" % (container, grp["type"])
+    assert "transform" not in grp["body"], \
+        "%s must sit at identity or it moves everything under it: %s" % (container, grp["body"])
+    assert node(member)["parent"] == container, \
+        "%s must be grouped under %s, found under %r" % (member, container, node(member)["parent"])
+# The scene root must not be left holding loose props.
+assert not any(n["parent"] == "." and n["type"] in (None, "StaticBody3D")
+               for n in NODES if n["name"] not in ("WorldEnvironment",)), \
+    "mesh actors are still emitted at the scene root"
+print("grouping OK: meshes, lights, decals, foliage and navigation each have a container")
+
+# ---------------------------------------------------------------------------
+# Jolt cannot apply a non-uniform (or mirrored) scale to a sphere, a capsule, or
+# a rotated box/hull. It does not fail loudly -- it substitutes the MEAN of the
+# three axes and logs an error per body on every load, leaving every collider a
+# few percent off the mesh it hugs. So a StaticBody3D must carry no such scale;
+# it is baked into the shapes and the mesh instance instead. This is the twin of
+# setup_physics_body in import_unreal_layout.gd, so pin both sides.
+# ---------------------------------------------------------------------------
+GD_LAYOUT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "addons", "unreal_importer", "import_common.gd")
+common_gd = io.open(GD_LAYOUT_PATH, encoding="utf-8").read()
+assert re.search(r"const\s+SCALE_UNIFORM_EPSILON[^\n]*%s" % re.escape("1e-4"), common_gd), \
+    "addon SCALE_UNIFORM_EPSILON changed; tscn_writer's %s no longer matches" \
+    % tscn_writer.SCALE_UNIFORM_EPSILON
+for gd_name in ("physics_body_transform", "physics_body_scale", "scaled_axis_factors",
+                "uniform_factor", "scaled_shape_transform"):
+    assert "func %s(" % gd_name in common_gd, \
+        "import_common.gd no longer defines %s(); tscn_writer would drift" % gd_name
+
+MESHES = "UnrealStaticMeshes"
+scaled = node("Scaled_1", parent=MESHES)
+assert scaled["type"] == "StaticBody3D", "Scaled_1 must be a body: %s" % scaled["type"]
+# diag(2,1,0.5) * Ry(90) decomposes to a bare Ry(90) with a local scale of (0.5,1,2).
+scaled_basis = [float(v) for v in
+                re.search(r"transform = Transform3D\(([^)]*)\)", scaled["body"]).group(1).split(",")]
+assert near(scaled_basis[0:9], Ry(90.0)), \
+    "a scaled body must keep rotation only, got basis %s" % scaled_basis[0:9]
+assert near(scaled_basis[9:12], [30.0, 0.0, 0.0]), "body origin moved: %s" % scaled_basis[9:12]
+
+# The mesh has to take the scale the body gave up, or the prop renders unscaled.
+mesh_inst = node("SM_Scaled", parent=MESHES + "/Scaled_1")
+inst_vals = [float(v) for v in
+             re.search(r"transform = Transform3D\(([^)]*)\)", mesh_inst["body"]).group(1).split(",")]
+assert near(inst_vals[0:9], [0.5, 0, 0, 0, 1.0, 0, 0, 0, 2.0]), \
+    "the mesh instance must carry the scale the body gave up, got %s" % inst_vals[0:9]
+
+
+def shape_of(shape_node_name):
+    """The sub_resource body a CollisionShape3D under Scaled_1 points at."""
+    n = node(shape_node_name, parent=MESHES + "/Scaled_1")
+    sid = re.search(r'shape = SubResource\("([^"]+)"\)', n["body"]).group(1)
+    blk = re.search(r'\[sub_resource type="[^"]+" id="%s"\](.*?)(?=\n\[|\Z)' % re.escape(sid),
+                    text, re.S)
+    assert blk, "dangling shape sub_resource %s" % sid
+    return n, blk.group(1)
+
+
+# Box and hull are the two that come out EXACT.
+box_node, box_blk = shape_of("BoxCollision")
+box_size = [float(v) for v in re.search(r"size = Vector3\(([^)]*)\)", box_blk).group(1).split(",")]
+assert near(box_size, [0.5, 1.0, 2.0]), "box must absorb the body scale, got %s" % box_size
+box_xform = [float(v) for v in
+             re.search(r"transform = Transform3D\(([^)]*)\)", box_node["body"]).group(1).split(",")]
+assert near(box_xform[9:12], [0.5, 0.0, 0.0]), \
+    "the shape OFFSET must scale with the body, got %s" % box_xform[9:12]
+
+_, hull_blk = shape_of("ConvexCollision")
+hull = [float(v) for v in
+        re.search(r"points = PackedVector3Array\(([^)]*)\)", hull_blk).group(1).split(",")]
+# The glTF remap turns the 1 m cube corner into (1,1,1); the bake makes it (0.5,1,2).
+assert near(hull[0:3], [0.5, 1.0, 2.0]) and near(hull[3:6], [-0.5, -1.0, -2.0]), \
+    "hull points must absorb the body scale exactly, got %s" % hull
+
+# Sphere and capsule are the two that cannot be exact, so pin the approximation.
+_, sph_blk = shape_of("SphereCollision")
+sph_r = float(re.search(r"radius = ([0-9.eE+-]+)", sph_blk).group(1))
+assert abs(sph_r - 0.5 * (0.5 + 1.0 + 2.0) / 3.0) < 1e-9, \
+    "a sphere can only take the mean of the three axes, got %s" % sph_r
+
+_, cap_blk = shape_of("CapsuleCollision")
+cap_r = float(re.search(r"radius = ([0-9.eE+-]+)", cap_blk).group(1))
+cap_h = float(re.search(r"height = ([0-9.eE+-]+)", cap_blk).group(1))
+assert abs(cap_r - 0.25 * (0.5 + 2.0) / 2.0) < 1e-9, \
+    "a capsule radius takes the radial X/Z scale, got %s" % cap_r
+assert abs(cap_h - (1.0 + 2.0 * cap_r)) < 1e-9, \
+    "a capsule cylinder takes the axial Y scale, got %s" % cap_h
+
+# And a uniformly scaled prop must be left exactly as it was: Rock_1's body still
+# carries its own transform and its shapes are untouched.
+rock_box_node = node("BoxCollision", parent=MESHES + "/Rock_1")
+rock_sid = re.search(r'shape = SubResource\("([^"]+)"\)', rock_box_node["body"]).group(1)
+rock_blk = re.search(r'\[sub_resource type="[^"]+" id="%s"\](.*?)(?=\n\[|\Z)' % re.escape(rock_sid),
+                     text, re.S).group(1)
+rock_size = [float(v) for v in re.search(r"size = Vector3\(([^)]*)\)", rock_blk).group(1).split(",")]
+assert near(rock_size, [1.0, 0.6, 0.8]), \
+    "an unscaled prop's collision must be untouched, got %s" % rock_size
+print("jolt scale bake OK: body scale-free, box/hull exact, sphere/capsule pinned")
 
 # ---------------------------------------------------------------------------
 # Environment: the .tscn writer and the runtime addon are SEPARATE

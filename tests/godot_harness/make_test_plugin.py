@@ -62,6 +62,20 @@ func _run_tests() -> void:
 	_dump(root, 0)
 	print("")
 
+	# 0. Mesh actors are grouped, the way lights and decals already are. A level is
+	#    mostly static meshes, so loose at the root they bury everything else.
+	var mesh_group := root.get_node_or_null("UnrealStaticMeshes")
+	check("mesh actors are grouped under UnrealStaticMeshes", mesh_group != null,
+		str(root.get_children()))
+	if mesh_group and mesh_group is Node3D:
+		check("the mesh container is at identity (it must not move anything)",
+			(mesh_group as Node3D).transform.is_equal_approx(Transform3D.IDENTITY),
+			str((mesh_group as Node3D).transform))
+		check("mesh actors really live inside the container",
+			mesh_group.get_child_count() > 0 and root.get_node_or_null("Buoy_1") == null,
+			"%d children" % mesh_group.get_child_count())
+	check("lights are still grouped separately", root.get_node_or_null("UnrealLights") != null)
+
 	# 1. StaticMeshActor WITH collision -> StaticBody3D at the true world transform.
 	var buoy := find_node(root, "Buoy_1")
 	check("Buoy_1 exists", buoy != null)
@@ -114,6 +128,107 @@ func _run_tests() -> void:
 			"x=%s y=%s z=%s" % [b.x, b.y, b.z])
 		check("Skewed_1 NOT row-scaled (scale applied in the parent frame)",
 			not near(b.x, Vector3(-2, 0, 0)), str(b.x))
+
+	# 4b. Non-uniformly scaled actor WITH collision -- the Jolt case.
+	#
+	#     Jolt cannot apply a non-uniform scale to a sphere, a capsule, or a
+	#     rotated box/hull. It does not fail loudly: it substitutes the MEAN of
+	#     the three axes and logs an error per body on every single load, leaving
+	#     every collider a few percent off the mesh it was exported to hug. So the
+	#     body must carry rotation only, with the scale baked into the shapes.
+	#
+	#     Scaled_1's placement is diag(2,1,0.5); after the glTF axis fix Ry(+90)
+	#     that is Ry(90) with a LOCAL scale of (0.5, 1, 2) -- so the shapes take
+	#     (0.5, 1, 2) and the body keeps a bare Ry(90).
+	var scaled := find_node(root, "Scaled_1")
+	check("Scaled_1 exists", scaled != null)
+	if scaled and scaled is StaticBody3D:
+		var body := scaled as StaticBody3D
+		var bb: Basis = body.global_transform.basis
+		check("a scaled body carries NO scale (Jolt would reject it)",
+			absf(bb.x.length() - 1.0) < 0.001
+			and absf(bb.y.length() - 1.0) < 0.001
+			and absf(bb.z.length() - 1.0) < 0.001,
+			"column lengths %f/%f/%f" % [bb.x.length(),
+				bb.y.length(), bb.z.length()])
+		check("the scaled body is the bare Ry(90) placement",
+			near(bb.x, Vector3(0, 0, -1)) and near(bb.y, Vector3(0, 1, 0))
+			and near(bb.z, Vector3(1, 0, 0)),
+			"x=%s y=%s z=%s" % [bb.x, bb.y, bb.z])
+
+		# The mesh has to take the scale the body gave up, or the prop renders
+		# unscaled -- a silent visual regression the collision fix must not cause.
+		var mesh_child: Node3D = null
+		for c in body.get_children():
+			if c is Node3D and not (c is CollisionShape3D):
+				mesh_child = c
+		check("the mesh instance takes the scale the body gave up",
+			mesh_child != null and near(mesh_child.transform.basis.get_scale(), Vector3(0.5, 1, 2)),
+			str(mesh_child.transform.basis.get_scale()) if mesh_child else "no mesh child")
+
+		var shapes := {}
+		for c in body.get_children():
+			if c is CollisionShape3D:
+				shapes[(c as CollisionShape3D).shape.get_class()] = c
+
+		# The box is the case that must come out EXACT. Its world centre and its
+		# three world half-extent vectors are what the old (scaled-body) math
+		# produced; if the bake moved any of them, the collider no longer matches
+		# the mesh, which is the whole thing being fixed.
+		var box_node: CollisionShape3D = shapes.get("BoxShape3D")
+		check("box collision shape exists", box_node != null)
+		if box_node:
+			var box := box_node.shape as BoxShape3D
+			check("box size absorbed the body scale",
+				near(box.size, Vector3(0.5, 1.0, 2.0)), str(box.size))
+			var wt: Transform3D = box_node.global_transform
+			check("box world centre is unchanged by the bake",
+				near(wt.origin, Vector3(30, 0, -0.5)), str(wt.origin))
+			check("box world half-extents are unchanged by the bake",
+				near(wt.basis.x * 0.5 * box.size.x, Vector3(0, 0, -0.25))
+				and near(wt.basis.y * 0.5 * box.size.y, Vector3(0, 0.5, 0))
+				and near(wt.basis.z * 0.5 * box.size.z, Vector3(1, 0, 0)),
+				"%s / %s / %s" % [wt.basis.x * 0.5 * box.size.x,
+					wt.basis.y * 0.5 * box.size.y,
+					wt.basis.z * 0.5 * box.size.z])
+
+		# A hull is a raw point cloud, so it takes the scale exactly too: the
+		# unit-cube corner (1,1,1) has to become (0.5, 1, 2).
+		var hull_node: CollisionShape3D = shapes.get("ConvexPolygonShape3D")
+		check("convex collision shape exists", hull_node != null)
+		if hull_node:
+			var pts: PackedVector3Array = (hull_node.shape as ConvexPolygonShape3D).points
+			var found := false
+			for p in pts:
+				if near(p, Vector3(0.5, 1.0, 2.0)):
+					found = true
+			check("hull points absorbed the body scale exactly",
+				found, str(pts))
+			var corner: Vector3 = hull_node.global_transform * Vector3(0.5, 1.0, 2.0)
+			check("hull corner lands where the unscaled-body math put it",
+				near(corner, Vector3(32, 1, -0.5)), str(corner))
+
+		# A sphere has one radius, so it can only take the mean of (0.5, 1, 2).
+		# Approximate by nature -- pinned so the approximation cannot drift.
+		var sph_node: CollisionShape3D = shapes.get("SphereShape3D")
+		check("sphere collision shape exists", sph_node != null)
+		if sph_node:
+			var sph := sph_node.shape as SphereShape3D
+			check("sphere radius takes the mean of the three axes",
+				absf(sph.radius - 0.5 * (0.5 + 1.0 + 2.0) / 3.0) < 0.001, str(sph.radius))
+
+		# A capsule scales its cylinder along local Y and its radius by X/Z.
+		var cap_node: CollisionShape3D = shapes.get("CapsuleShape3D")
+		check("capsule collision shape exists", cap_node != null)
+		if cap_node:
+			var cap := cap_node.shape as CapsuleShape3D
+			# radius 25 cm * (0.5 + 2)/2, cylinder 100 cm * 1.0
+			check("capsule radius takes the radial (X/Z) scale",
+				absf(cap.radius - 0.3125) < 0.001, str(cap.radius))
+			check("capsule height takes the axial (Y) scale",
+				absf(cap.height - (1.0 + 2.0 * 0.3125)) < 0.001, str(cap.height))
+	else:
+		check("Scaled_1 is a StaticBody3D", false, str(scaled))
 
 	# 5. Decal box. Godot renders the half-extent along local axis j as
 	#    0.5 * size[j] * basis column j, so the exported scale has to be in the

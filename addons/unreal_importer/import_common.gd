@@ -60,6 +60,125 @@ static func get_transform_from_dict(t_dict: Dictionary) -> Transform3D:
 	return Transform3D(basis, translation)
 
 
+# ==============================================================================
+# Physics-body scale handling.
+#
+# Jolt (Godot's default 3D physics since 4.4) cannot apply an arbitrary scale to
+# an arbitrary shape. A SphereShape3D and a CapsuleShape3D accept only a uniform
+# scale; a BoxShape3D or ConvexPolygonShape3D accepts a non-uniform one only when
+# the shape itself is not rotated inside the body. Handed anything else, Jolt does
+# NOT fail loudly and does not keep the scale either -- it substitutes the
+# ARITHMETIC MEAN of the three axes and logs one error per body, per load:
+#
+#   Failed to correctly scale body '...'. A scale of (1, 1, 0.9346) is not
+#   supported ... The scale will instead be treated as (0.9782, 0.9782, 0.9782).
+#
+# The collider then no longer matches the mesh it was exported to hug (~5 cm per
+# metre in that example), which is what a player feels as floating above a prop or
+# bumping into air beside it.
+#
+# Unreal level designers scale props non-uniformly all the time, so this is the
+# normal case, not an exotic one. The fix is to keep the scale OFF the physics
+# body -- the body carries rotation and translation only -- and bake it into the
+# shapes and the mesh instance instead. See physics_body_transform().
+# ==============================================================================
+
+# Scales whose spread is under this (relative to the largest axis) are treated as
+# uniform and left on the body untouched -- the overwhelmingly common case, and
+# the one where doing nothing is exactly right.
+const SCALE_UNIFORM_EPSILON: float = 1e-4
+
+
+static func basis_local_scale(basis: Basis) -> Vector3:
+	"""The node's LOCAL scale: the length of each basis COLUMN (Basis.x/y/z are the
+	columns; Godot exposes no get_column() to GDScript), with a mirrored basis's
+	handedness folded into X. Chosen so that
+	basis_without_scale(b) * Basis.from_scale(basis_local_scale(b)) == b."""
+	var s := Vector3(basis.x.length(), basis.y.length(), basis.z.length())
+	if basis.determinant() < 0.0:
+		s.x = -s.x
+	return s
+
+
+static func basis_without_scale(basis: Basis) -> Basis:
+	"""The rotation half of a rotation*scale basis (a proper rotation: any mirror
+	stays behind in basis_local_scale). A degenerate (zero-scale) axis is left as
+	the unit axis rather than dividing by zero."""
+	var s := basis_local_scale(basis)
+	return Basis(
+		basis.x / s.x if absf(s.x) > 1e-9 else Vector3.RIGHT,
+		basis.y / s.y if absf(s.y) > 1e-9 else Vector3.UP,
+		basis.z / s.z if absf(s.z) > 1e-9 else Vector3.BACK)
+
+
+static func scale_is_body_safe(scale: Vector3) -> bool:
+	"""True when a physics body may carry this scale directly. Jolt accepts a
+	uniform, non-mirrored scale on every shape type; anything else it silently
+	replaces with the mean of the three axes."""
+	if scale.x < 0.0 or scale.y < 0.0 or scale.z < 0.0:
+		return false
+	var hi := maxf(scale.x, maxf(scale.y, scale.z))
+	if hi <= 0.0:
+		return true
+	return (hi - minf(scale.x, minf(scale.y, scale.z))) / hi <= SCALE_UNIFORM_EPSILON
+
+
+static func physics_body_scale(placement: Transform3D) -> Vector3:
+	"""The part of a placement's scale that must be baked into the shapes instead
+	of left on the StaticBody3D. Vector3.ONE means "nothing to bake"."""
+	var s := basis_local_scale(placement.basis)
+	if scale_is_body_safe(s):
+		return Vector3.ONE
+	return s
+
+
+static func physics_body_transform(placement: Transform3D) -> Transform3D:
+	"""A placement with the Jolt-unsafe scale stripped off. Uniform scales are
+	returned untouched, so ordinary props keep exactly the transform they had."""
+	if physics_body_scale(placement) == Vector3.ONE:
+		return placement
+	return Transform3D(basis_without_scale(placement.basis), placement.origin)
+
+
+static func scaled_shape_transform(local: Transform3D, scale: Vector3) -> Transform3D:
+	"""A collision shape's local transform once `scale` has been taken off the
+	body: the shape's OFFSET still has to move with the scale, its rotation must
+	not."""
+	if scale == Vector3.ONE:
+		return local
+	return Transform3D(local.basis, local.origin * scale)
+
+
+static func scaled_axis_factors(local_basis: Basis, scale: Vector3) -> Vector3:
+	"""How much each of a shape's OWN axes stretches under a body scale applied in
+	the parent frame.
+
+	Exact whenever the shape's rotation is axis-aligned with the scale, which is
+	what Unreal's simple collision almost always is. When it is not, the true
+	result is a shear that no primitive shape can represent (and that Jolt refuses
+	outright) -- the stretch along each of the shape's own axes is the closest
+	thing a primitive can carry. Convex hulls do not use this: they take the shear
+	exactly, per vertex."""
+	if scale == Vector3.ONE:
+		return Vector3.ONE
+	return Vector3(_axis_factor(local_basis.x, scale),
+				   _axis_factor(local_basis.y, scale),
+				   _axis_factor(local_basis.z, scale))
+
+
+static func _axis_factor(axis: Vector3, scale: Vector3) -> float:
+	var before := axis.length()
+	if before <= 1e-9:
+		return 1.0
+	return (axis * scale).length() / before
+
+
+static func uniform_factor(scale: Vector3) -> float:
+	"""The single factor a shape that cannot be scaled non-uniformly (a sphere)
+	has to settle for."""
+	return (absf(scale.x) + absf(scale.y) + absf(scale.z)) / 3.0
+
+
 static func vec3_from_array(arr, def := Vector3.ZERO) -> Vector3:
 	if arr == null or not (arr is Array):
 		return def
