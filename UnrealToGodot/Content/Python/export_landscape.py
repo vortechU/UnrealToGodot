@@ -7,7 +7,8 @@ WHY THIS IS NOT JUST "RENDER A HEIGHTMAP"
 -----------------------------------------
 Every GPU export route Unreal exposes to Python fails on a landscape that has no
 edit layers -- which is what most marketplace/asset-pack levels ship. Measured on
-UE 5.7.4 against ModularSciFiStation's landscape (1024 components, 4032 m square):
+UE 5.7.4 AND re-measured unchanged on UE 5.8, against ModularSciFiStation's
+landscape (1024 components, 4032 m square):
 
     landscape_export_heightmap_to_render_target  -> returns True, RT stays 0.0
         (all four render-target formats it documents, and both values of the
@@ -37,8 +38,10 @@ Also version-dependent, all probed on 5.7.4 rather than recalled:
     unreadable/absent on 5.7; `get_target_layer_names()`, `target_layers` and
     `get_landscape_actor()` are the live equivalents.
   * RenderingLibrary.export_render_target picks the file format from the
-    render-target format and ignores the requested extension (an RGBA32F RT
-    written as "x.exr" is PNG bytes), so output is sniffed and renamed.
+    render-target format and ignores the requested extension: on 5.7.4 an
+    RGBA32F RT written as "x.exr" comes out as PNG bytes. 5.8 writes a real EXR
+    for the same call, so the sniff-and-rename below is a no-op there -- but it
+    stays, because the exporter has to read whatever the running engine wrote.
   * ReadRenderTargetRawPixel returns linear red (1,0,0,1) as its FAILURE
     sentinel -- constant red means "no data", not "red data".
 
