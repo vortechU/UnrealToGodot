@@ -59,6 +59,34 @@ const ISO_REFERENCE := 100.0
 # adapts at Godot's normal rate.
 const EXPOSURE_SPEED_SCALE := 0.5 / 3.0
 
+# Cropped decal atlas cells, keyed by source path + rect + flips. Lives on the
+# instance, so it is scoped to one import run. See _crop_decal_texture.
+var _decal_crop_cache: Dictionary = {}
+
+# Minimum projection depth (m) for a decal, before the node's own scale.
+#
+# Unreal packs author astonishingly thin decal boxes -- SpaceshipInterior's
+# Demonstration map runs from 16 mm to 400 mm, with DecalSize left at (1,1,1) cm
+# and the actor scale doing all the work. Both engines clip a decal to its box,
+# but a 16 mm slab only reaches surfaces within +/-8 mm of the decal's centre
+# plane, and sci-fi wall panels have more relief than that. Rendered on a real
+# GPU against a plane with 12 mm of relief, the 16 mm box shreds an Exit sign
+# into vertical slivers and lands only 2103 px of decal where a 100 mm box lands
+# 4503 -- less than half. That shredding, swimming as the camera moves over it,
+# is the "decals z-fight constantly" report.
+#
+# 100 mm is the smallest floor that cleared that test outright. It is a
+# deliberate DEVIATION from Unreal, so it is an option rather than a constant:
+# raising a decal's depth lets it reach geometry Unreal would have clipped away,
+# which on a cluttered prop can project the decal onto a neighbour. Set 0 to
+# import Unreal's depths untouched.
+#
+# The floor applies to the EFFECTIVE depth (size.y * the node's Y scale), not to
+# size.y alone: the exporter leaves size_m at UE's DecalSize and puts the rest in
+# the transform, so on this content size.y is 0.02 and the scale carries a factor
+# of several hundred. Flooring size.y by itself would do nothing at all.
+const DEFAULT_DECAL_MIN_DEPTH_M := 0.10
+
 
 func apply(data: Dictionary, root: Node, scene_owner: Node, options: Dictionary) -> Dictionary:
 	var created := 0
@@ -329,7 +357,16 @@ func _apply_decals(decals, root: Node, scene_owner: Node, options: Dictionary, w
 		decal.name = Common.get_str(entry, "name", "Decal")
 		decal.transform = Common.get_transform_from_dict(entry.get("godot_transform", {}))
 		var d_size := Common.vec3_from_array(entry.get("size_m"), Vector3.ONE).abs()
-		decal.size = Vector3(maxf(d_size.x, 0.01), maxf(d_size.y, 0.01), maxf(d_size.z, 0.01))
+		d_size = Vector3(maxf(d_size.x, 0.01), maxf(d_size.y, 0.01), maxf(d_size.z, 0.01))
+		# Thin Unreal boxes shred against surface relief in Godot; see
+		# DEFAULT_DECAL_MIN_DEPTH_M. Applied to the effective depth, so the node's
+		# own Y scale has to be divided back out.
+		var min_depth := float(options.get("decal_min_depth_m", DEFAULT_DECAL_MIN_DEPTH_M))
+		if min_depth > 0.0:
+			var y_scale: float = absf(decal.transform.basis.get_scale().y)
+			if y_scale > 0.0001:
+				d_size.y = maxf(d_size.y, min_depth / y_scale)
+		decal.size = d_size
 		# UE SortOrder and Godot sorting_offset agree on direction: higher draws
 		# on top of decals sharing the same spot.
 		decal.sorting_offset = Common.get_num(entry, "sort_order", 0.0)
@@ -371,8 +408,64 @@ func _bind_decal_texture(decal: Decal, textures: Dictionary, key: String, folder
 	if path == "":
 		return
 	var tex := Common.load_texture_file(path)
-	if tex:
-		decal.set_texture(slot, tex)
+	if tex == null:
+		return
+	# Decal packs share one atlas across many materials and crop to a cell in the
+	# Unreal material graph (see SCHEMA_V2.md "decals" -> uv_rect). Godot's Decal
+	# has no UV transform, and AtlasTexture is no help either -- the decal atlas
+	# keys off the texture's RID and ignores the region -- so the crop has to be
+	# baked into pixels right here or the decal renders the whole sheet.
+	var rect = textures.get("uv_rect")
+	if rect is Array and rect.size() == 4:
+		var cropped := _crop_decal_texture(
+			path, tex, rect,
+			bool(textures.get("flip_u", false)),
+			bool(textures.get("flip_v", false)))
+		if cropped != null:
+			tex = cropped
+	decal.set_texture(slot, tex)
+
+
+func _crop_decal_texture(
+		path: String, tex: Texture2D, rect: Array,
+		flip_u: bool, flip_v: bool) -> Texture2D:
+	"""One atlas cell of `tex` as a standalone texture, or null if it cannot be cut."""
+	# 15 of the sci-fi station's 29 decals share a single cell, and every distinct
+	# ImageTexture costs its own slot in Godot's decal atlas, so caching here is
+	# what keeps that from becoming 15 copies of the same crop.
+	var cache_key := "%s|%s|%s|%s" % [path, str(rect), flip_u, flip_v]
+	if _decal_crop_cache.has(cache_key):
+		return _decal_crop_cache[cache_key]
+
+	var img := tex.get_image()
+	if img == null:
+		return null
+	if img.is_compressed():
+		# A VRAM-compressed import cannot be region-copied as-is.
+		if img.decompress() != OK:
+			return null
+	var w := img.get_width()
+	var h := img.get_height()
+	# UV v and Image row both count from the top, so v maps straight onto y.
+	var region := Rect2i(
+		int(roundf(float(rect[0]) * w)), int(roundf(float(rect[1]) * h)),
+		int(roundf(float(rect[2]) * w)), int(roundf(float(rect[3]) * h))
+	).intersection(Rect2i(0, 0, w, h))
+	if region.size.x <= 0 or region.size.y <= 0:
+		return null
+
+	var out := img.get_region(region)
+	# A negative Unreal tiling walks the axis backwards, which is a mirror.
+	if flip_u:
+		out.flip_x()
+	if flip_v:
+		out.flip_y()
+	if img.has_mipmaps():
+		out.generate_mipmaps()
+
+	var result := ImageTexture.create_from_image(out)
+	_decal_crop_cache[cache_key] = result
+	return result
 
 
 func _find_world_environment(root: Node) -> WorldEnvironment:

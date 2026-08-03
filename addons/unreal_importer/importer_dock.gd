@@ -20,6 +20,7 @@ var navigation_check: CheckBox
 var navigation_bake_check: CheckBox
 var metadata_check: CheckBox
 var energy_scale_spin: SpinBox
+var decal_depth_spin: SpinBox
 var texture_limit_option: OptionButton
 var shrink_files_check: CheckBox
 
@@ -27,6 +28,8 @@ var shrink_files_check: CheckBox
 const ImporterClass = preload("res://addons/unreal_importer/import_unreal_layout.gd")
 const Common = preload("res://addons/unreal_importer/import_common.gd")
 const TextureLimit = preload("res://addons/unreal_importer/texture_import_limit.gd")
+# For DEFAULT_DECAL_MIN_DEPTH_M, so the dock and the importer cannot disagree.
+const EnvironmentClass = preload("res://addons/unreal_importer/import_environment.gd")
 
 const TEXTURE_LIMIT_LABELS := ["No limit (as exported)", "512", "1024", "2048", "4096"]
 const TEXTURE_LIMIT_VALUES := [0, 512, 1024, 2048, 4096]
@@ -181,6 +184,21 @@ func _enter_tree() -> void:
 	energy_scale_spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	energy_row.add_child(energy_scale_spin)
 	features.add_child(energy_row)
+
+	var depth_row := HBoxContainer.new()
+	var depth_lbl := Label.new()
+	depth_lbl.text = "Min decal depth (m):"
+	depth_lbl.tooltip_text = "Unreal packs often author decal boxes only a centimetre or two deep. Godot clips a decal to its box just as Unreal does, so on a wall with any surface relief such a box shreds the decal into slivers. This raises any decal thinner than the given projection depth. Set 0 to keep Unreal's depths exactly, at the cost of that shredding; raise it if decals still look patchy, lower it if a decal bleeds onto neighbouring geometry."
+	depth_row.add_child(depth_lbl)
+	decal_depth_spin = SpinBox.new()
+	decal_depth_spin.min_value = 0.0
+	decal_depth_spin.max_value = 1.0
+	decal_depth_spin.step = 0.01
+	decal_depth_spin.value = EnvironmentClass.DEFAULT_DECAL_MIN_DEPTH_M
+	decal_depth_spin.tooltip_text = depth_lbl.tooltip_text
+	decal_depth_spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	depth_row.add_child(decal_depth_spin)
+	features.add_child(depth_row)
 
 	var sep2 := HSeparator.new()
 	vbox.add_child(sep2)
@@ -490,6 +508,7 @@ func _on_import_pressed() -> void:
 		"navigation_bake": navigation_bake_check.button_pressed,
 		"apply_metadata": metadata_check.button_pressed,
 		"light_energy_scale": energy_scale_spin.value,
+		"decal_min_depth_m": decal_depth_spin.value,
 	}
 
 	# Execute

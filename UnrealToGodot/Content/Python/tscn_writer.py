@@ -314,6 +314,39 @@ _UNIT_SCALE = (1.0, 1.0, 1.0)
 STATIC_MESH_CONTAINER = "UnrealStaticMeshes"
 LIGHT_CONTAINER = "UnrealLights"
 DECAL_CONTAINER = "UnrealDecals"
+
+# Minimum decal projection depth (m), mirroring import_environment.gd's
+# DEFAULT_DECAL_MIN_DEPTH_M -- the two importer paths must build the same Decal.
+# Unreal packs author boxes as thin as 16 mm; Godot clips to the box just as
+# Unreal does, so on a wall with any relief such a box shreds the decal into
+# slivers. Measured on a real GPU: a 16 mm box lands 2103 px of an Exit sign
+# where a 100 mm box lands 4503. Set the decal_min_depth_m option to 0 to keep
+# Unreal's depths untouched.
+DEFAULT_DECAL_MIN_DEPTH_M = 0.10
+
+
+def _decal_size_with_min_depth(size, transform, min_depth):
+    """
+    size_m with its projection depth (index 1) floored at min_depth.
+
+    The floor is on the EFFECTIVE depth -- size[1] times the node's Y scale --
+    because the exporter leaves size_m at Unreal's DecalSize and puts the rest in
+    the transform, so size[1] is routinely 0.02 against a scale of several
+    hundred. Flooring size[1] alone would do nothing.
+    """
+    out = [_num(size[i], 1.0) if len(size) > i else 1.0 for i in range(3)]
+    try:
+        min_depth = float(min_depth)
+    except (TypeError, ValueError):
+        return out
+    if min_depth <= 0.0:
+        return out
+    scale = (transform or {}).get("scale") if isinstance(transform, dict) else None
+    y_scale = abs(_num(scale[1], 1.0)) if isinstance(scale, (list, tuple)) and len(scale) > 1 else 1.0
+    if y_scale <= 1e-4:
+        return out
+    out[1] = max(out[1], min_depth / y_scale)
+    return out
 FOLIAGE_CONTAINER = "UnrealFoliage"
 NAVIGATION_CONTAINER = "UnrealNavigation"
 
@@ -1143,6 +1176,9 @@ class _TscnWriter(object):
             props = ["transform = " + _mat_to_transform3d(mat)]
             size = decal.get("size_m")
             if isinstance(size, (list, tuple)) and size:
+                size = _decal_size_with_min_depth(
+                    size, decal.get("godot_transform"),
+                    self.options.get("decal_min_depth_m", DEFAULT_DECAL_MIN_DEPTH_M))
                 props.append("size = " + _vec3_literal(size))
             if decal.get("sort_order") is not None:
                 props.append("sorting_offset = " + _f(_num(decal.get("sort_order"))))
@@ -1162,6 +1198,15 @@ class _TscnWriter(object):
                 props.append("distance_fade_length = " + _f(max(_num(fade_length), 0.01)))
 
             textures = decal.get("textures") or {}
+            # The addon import bakes an atlas crop into a new ImageTexture
+            # (import_environment.gd's _crop_decal_texture). This writer only
+            # emits references to files that already exist, so it cannot -- the
+            # decal gets the whole sheet. Say so rather than diverge in silence.
+            if textures.get("uv_rect"):
+                _warn("decal '%s': material crops its texture to %s, which the .tscn "
+                      "writer cannot bake -- the whole atlas will be bound. Use the "
+                      "Godot addon importer for this level's decals."
+                      % (name, textures.get("uv_rect")))
             for tex_key, godot_prop in (("albedo", "texture_albedo"), ("normal", "texture_normal"),
                                         ("orm", "texture_orm"), ("emission", "texture_emission")):
                 tex_name = textures.get(tex_key)

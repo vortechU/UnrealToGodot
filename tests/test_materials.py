@@ -65,6 +65,14 @@ class _FakeMEL:
     def get_material_default_vector_parameter_value(material, name):
         return getattr(material, "_vectorparams", {}).get(str(name))
 
+    # The decal atlas crop lives in the expression graph, not in any parameter.
+    # This is the ONLY route into it: Material.expressions has been protected
+    # since UE 5.7, and MaterialEditorOnlyData exposes no expression list either
+    # (both confirmed against UE 5.8 on 2026-08-03).
+    @staticmethod
+    def get_material_expressions(material):
+        return list(getattr(material, "_expressions", []))
+
 
 u.MaterialEditingLibrary = _FakeMEL
 u.StaticMesh = type("StaticMesh", (), {})
@@ -703,6 +711,230 @@ rough = _decal_textures(_packed_mi("T_Splat3_D", "Roughness", "T_Splat3_R"))
 check("a greyscale roughness map is NOT bound as ORM (would read 90% metallic)",
       rough["orm"] is None, rough)
 check("but its albedo still binds", rough["albedo"] == "T_Splat3_D")
+
+
+print("\n=== 6b. Decal atlas cropping (uv_rect) ===")
+# Values below are the REAL ones read out of UE 5.8 on 2026-08-03 for
+# SpaceshipInterior's decal materials -- four TextureCoordinate nodes cutting
+# four quadrants out of one 1024x1024 T_Scifi_Signs_Decal_BC sheet. Before this,
+# every one of them bound the whole sheet and the "Exit" decal showed all four
+# signs at once.
+
+
+class _FakeTexCoord:
+    """unreal.MaterialExpressionTextureCoordinate -- matched by CLASS NAME."""
+
+    def __init__(self, u_tiling=1.0, v_tiling=1.0):
+        self._p = {"u_tiling": u_tiling, "v_tiling": v_tiling, "coordinate_index": 0}
+
+    def get_editor_property(self, key):
+        if key not in self._p:
+            raise Exception("no property %r" % key)
+        return self._p[key]
+
+
+# Named so type(ex).__name__ contains "TextureCoordinate", as the engine's does.
+_FakeTexCoord.__name__ = "MaterialExpressionTextureCoordinate"
+
+
+class _FakeOtherExpr:
+    pass
+
+
+_FakeOtherExpr.__name__ = "MaterialExpressionConstant3Vector"
+
+
+class _BaseMat:
+    """A base unreal.Material carrying an expression graph."""
+
+    def __init__(self, expressions, name="M_Scifi_Signs_Decal"):
+        self._expressions = expressions
+        self._name = name
+
+    def get_editor_property(self, key):
+        raise Exception("no property %r" % key)
+
+    def get_name(self):
+        return self._name
+
+
+def _uv(u_tiling, v_tiling, extra=()):
+    mat = _BaseMat([_FakeOtherExpr(), _FakeTexCoord(u_tiling, v_tiling)] + list(extra))
+    return EE._decal_uv_rect(mat)
+
+
+def _close(a, b, eps=1e-9):
+    return a is not None and b is not None and all(abs(x - y) < eps for x, y in zip(a, b))
+
+
+rect, fu, fv = _uv(0.5, 0.5)          # M_Scifi_Signs_Decal_01 -- the Exit sign
+check("+0.5/+0.5 crops to the top-LEFT quadrant, upright",
+      _close(rect, [0.0, 0.0, 0.5, 0.5]) and not fu and not fv, (rect, fu, fv))
+
+rect, fu, fv = _uv(-0.5, 0.5)         # M_Scifi_Signs_Decal_02
+check("-0.5/+0.5 crops to the top-RIGHT quadrant, mirrored in U",
+      _close(rect, [0.5, 0.0, 0.5, 0.5]) and fu and not fv, (rect, fu, fv))
+
+rect, fu, fv = _uv(0.5, -0.5)         # M_Scifi_Signs_Decal_03
+check("+0.5/-0.5 crops to the bottom-LEFT quadrant, mirrored in V",
+      _close(rect, [0.0, 0.5, 0.5, 0.5]) and not fu and fv, (rect, fu, fv))
+
+rect, fu, fv = _uv(-0.5, -0.5)        # M_Scifi_Signs_Decal_04
+check("-0.5/-0.5 crops to the bottom-RIGHT quadrant, mirrored in both",
+      _close(rect, [0.5, 0.5, 0.5, 0.5]) and fu and fv, (rect, fu, fv))
+
+rect, fu, fv = _uv(1.0, 0.5)          # M_Scifi_Stripe_Decal_01 -- the plain bar
+check("1.0/+0.5 crops to the TOP HALF, full width",
+      _close(rect, [0.0, 0.0, 1.0, 0.5]) and not fu and not fv, (rect, fu, fv))
+
+rect, fu, fv = _uv(1.0, -0.5)         # M_Scifi_Stripe_Decal_02 -- the chevron
+check("1.0/-0.5 crops to the BOTTOM HALF, mirrored in V",
+      _close(rect, [0.0, 0.5, 1.0, 0.5]) and not fu and fv, (rect, fu, fv))
+
+# The whole point of omitting the field: an ordinary decal's entry must not
+# change at all just because this feature exists.
+check("1.0/1.0 records NO crop (samples the whole sheet)",
+      _uv(1.0, 1.0) == (None, False, False), _uv(1.0, 1.0))
+
+# Refusals. A Godot Decal cannot repeat a texture inside its box, and guessing
+# which of several TextureCoordinate nodes feeds albedo would bind a wrong cell.
+check("tiling > 1 is refused, not approximated", _uv(2.0, 1.0)[0] is None, _uv(2.0, 1.0))
+check("tiling < -1 is refused too", _uv(-4.0, 1.0)[0] is None, _uv(-4.0, 1.0))
+check("a 0 tiling (degenerate) is refused", _uv(0.0, 1.0)[0] is None, _uv(0.0, 1.0))
+check("two TextureCoordinate nodes -> refused rather than guessed",
+      _uv(0.5, 0.5, extra=[_FakeTexCoord(0.25, 0.25)])[0] is None)
+check("a graph with no TextureCoordinate at all records no crop",
+      EE._decal_uv_rect(_BaseMat([_FakeOtherExpr()])) == (None, False, False))
+check("a null material is handled", EE._decal_uv_rect(None) == (None, False, False))
+
+# -1 mirrors the whole texture: a real crop even though the rect is full.
+rect, fu, fv = _uv(-1.0, 1.0)
+check("-1.0 is a full-width MIRROR, and is still recorded",
+      _close(rect, [0.0, 0.0, 1.0, 1.0]) and fu and not fv, (rect, fu, fv))
+
+# End to end: the rect has to reach the schema entry the importer reads.
+_atlas_mi = _MI({"texture_parameter_values": [_TexParam("Diff", _Tex("T_Signs_BC"))],
+                 "scalar_parameter_values": [], "vector_parameter_values": [],
+                 "parent": _BaseMat([_FakeTexCoord(-0.5, 0.5)])})
+_at = _decal_textures(_atlas_mi)
+check("the crop reaches textures.uv_rect through a MaterialInstance's parent",
+      _close(_at.get("uv_rect"), [0.5, 0.0, 0.5, 0.5]), _at.get("uv_rect"))
+check("...along with its flips", _at.get("flip_u") is True and _at.get("flip_v") is False, _at)
+check("an uncropped decal has no uv_rect key at all",
+      "uv_rect" not in _decal_textures(_packed_mi("T_P_D", "ORM", "T_P_ORM")))
+
+
+print("\n=== 6c. Decal atlas cropping via scalar parameters (M_decal shape) ===")
+# ModularSciFiStation's M_decal crops with TextureCoordinate(1,1) -> Divide ->
+# Add -> sampler, choosing the cell per INSTANCE with scalar parameters. Every
+# expression INPUT is protected in Python (probed on UE 5.8: A/B on
+# Divide/Add/AppendVector and Coordinates on the sampler all raise), so the
+# formula was pinned down from the values instead -- UV Divide is 4.0 on all 16
+# instances and U/V Tile only ever take {0, .25, .5, .75}, i.e. fractions, which
+# fits uv/divide + (u,v). Confirmed cell by cell against T_numbers_01_basecolor:
+# the 4x4 grid puts MI_numbers_01_red on "1" and MI_shape_u_white on the "U".
+
+
+def _expr(class_name):
+    cls = type("E", (), {})
+    cls.__name__ = class_name
+    return cls()
+
+
+def _atlas_graph():
+    """The M_decal node set: a (1,1) TexCoord plus the divide/offset trio."""
+    return [_FakeTexCoord(1.0, 1.0),
+            _expr("MaterialExpressionDivide"),
+            _expr("MaterialExpressionAdd"),
+            _expr("MaterialExpressionAppendVector")]
+
+
+class _ParamBaseMat(_BaseMat):
+    """A base Material exposing scalar parameters, as _FakeMEL reads them."""
+
+    def __init__(self, expressions, scalars, name="M_decal"):
+        _BaseMat.__init__(self, expressions, name)
+        self._scalarparams = dict(scalars)
+
+
+def _atlas_mat(u, v, divide, names=("U Tile", "V Tile", "UV Divide"),
+               expressions=None):
+    scalars = {names[0]: u, names[1]: v, names[2]: divide}
+    return _ParamBaseMat(
+        _atlas_graph() if expressions is None else expressions, scalars)
+
+
+rect, fu, fv = EE._decal_uv_rect(_atlas_mat(0.0, 0.0, 4.0))     # MI_numbers_01_red
+check("U/V Tile 0,0 over UV Divide 4 is the top-left cell of a 4x4 grid",
+      _close(rect, [0.0, 0.0, 0.25, 0.25]) and not fu and not fv, (rect, fu, fv))
+
+rect, _, _ = EE._decal_uv_rect(_atlas_mat(0.75, 0.5, 4.0))      # MI_shape_u_white
+check("0.75,0.5 is the 'U' cell (row 3, column 4)",
+      _close(rect, [0.75, 0.5, 0.25, 0.25]), rect)
+
+rect, _, _ = EE._decal_uv_rect(_atlas_mat(0.0, 0.75, 4.0))      # MI_stripes_red
+check("0,0.75 is the bottom-left cell", _close(rect, [0.0, 0.75, 0.25, 0.25]), rect)
+
+check("a 1x1 grid is not a crop",
+      EE._decal_uv_rect(_atlas_mat(0.0, 0.0, 1.0)) == (None, False, False))
+check("a zero divide is refused rather than dividing by zero",
+      EE._decal_uv_rect(_atlas_mat(0.0, 0.0, 0.0)) == (None, False, False))
+check("a cell running off the edge is refused",
+      EE._decal_uv_rect(_atlas_mat(0.9, 0.0, 4.0)) == (None, False, False))
+
+# The two gates. Names alone must not be enough, and neither must shape alone.
+check("the parameters WITHOUT the divide/offset graph shape are ignored",
+      EE._decal_uv_rect(_atlas_mat(0.25, 0.25, 4.0,
+                                   expressions=[_FakeTexCoord(1.0, 1.0)]))
+      == (None, False, False))
+check("the graph shape WITHOUT the parameters is ignored",
+      EE._decal_uv_rect(_ParamBaseMat(_atlas_graph(), {"Roughness": 0.5}))
+      == (None, False, False))
+check("only two of the three parameters is not enough",
+      EE._decal_uv_rect(_ParamBaseMat(_atlas_graph(),
+                                      {"U Tile": 0.25, "UV Divide": 4.0}))
+      == (None, False, False))
+check("an unrelated 'Tile' scalar is not read as a cell index",
+      EE._decal_uv_rect(_ParamBaseMat(_atlas_graph(),
+                                      {"Tile Amount": 4.0, "UV Divide Strength": 2.0,
+                                       "Detail Tiling": 3.0}))
+      == (None, False, False))
+
+# A TextureCoordinate crop is the more specific signal and must win.
+both = _ParamBaseMat(
+    [_FakeTexCoord(0.5, 0.5), _expr("MaterialExpressionDivide"),
+     _expr("MaterialExpressionAdd"), _expr("MaterialExpressionAppendVector")],
+    {"U Tile": 0.75, "V Tile": 0.75, "UV Divide": 4.0})
+rect, _, _ = EE._decal_uv_rect(both)
+check("a real TextureCoordinate crop wins over the parameter path",
+      _close(rect, [0.0, 0.0, 0.5, 0.5]), rect)
+
+
+class _AtlasMI(u.MaterialInstance):
+    """A MaterialInstance overriding the cell its parent defaults to."""
+
+    def __init__(self, parent, overrides):
+        self._parent = parent
+        self._overrides = overrides
+
+    def get_editor_property(self, key):
+        if key == "parent":
+            return self._parent
+        return None
+
+    def get_name(self):
+        return "MI_shape_u_white"
+
+
+_prev_instance_getter = getattr(_FakeMEL, "get_material_instance_scalar_parameter_value", None)
+_FakeMEL.get_material_instance_scalar_parameter_value = staticmethod(
+    lambda mi, name: getattr(mi, "_overrides", {}).get(str(name)))
+
+_parent = _atlas_mat(0.0, 0.0, 4.0)
+rect, _, _ = EE._decal_uv_rect(
+    _AtlasMI(_parent, {"U Tile": 0.75, "V Tile": 0.5, "UV Divide": 4.0}))
+check("an instance's OWN cell wins over the parent's default",
+      _close(rect, [0.75, 0.5, 0.25, 0.25]), rect)
 
 
 print("\n=== 7. Decal modulate, visibility and distance fade ===")

@@ -740,6 +740,294 @@ def _decal_transform(u_transform):
 # in export_level_to_json; any other packing (RMA, MRA) cannot be bound to a Decal.
 _GODOT_DECAL_ORM_CHANNELS = {"ao": 0, "roughness": 1, "metallic": 2}
 
+
+# ---------------------------------------------------------------------------
+# Decal atlas cropping (see docs/SCHEMA_V2.md "decals" -> uv_rect)
+# ---------------------------------------------------------------------------
+#
+# Decal packs routinely ship ONE atlas texture and cut a different cell out of
+# it per material, so a single T_Signs_BC.png serves four different signs. Unreal
+# does that crop in the material graph. Godot's Decal has no UV transform of any
+# kind, so unless the rect travels in the schema the importer binds the whole
+# sheet and every decal renders as the entire atlas -- measured on
+# SpaceshipInterior's M_Scifi_Signs_Decal_01..04, four TextureCoordinate nodes
+# over one 1024x1024 sheet, where the "Exit sign" decal came into Godot showing
+# all four signs at once.
+#
+# The form read here is the plain `TextureCoordinate` node: UV = uv * (U, V).
+# With Unreal's default wrap addressing and |tiling| <= 1 that is a sub-rect, and
+# the SIGN picks which end of the axis plus a mirror:
+#     t > 0:  uv travels 0 -> t                  => rect [0, t],     upright
+#     t < 0:  uv travels 0 -> -|t|, which wrap
+#             sends to 1.0 -> 1-|t|              => rect [1-|t|, 1], MIRRORED
+# |t| > 1 is genuine repetition, which a Godot Decal cannot express at all, so it
+# is refused and logged rather than approximated into a wrong crop.
+#
+# The second form read here is the parameter-driven one, where the base material
+# holds TextureCoordinate(1,1) -> Divide -> Add -> sampler and the cell is chosen
+# per INSTANCE by scalar parameters (ModularSciFiStation's M_decal: "UV Divide",
+# "U Tile", "V Tile"). Expression INPUTS are protected in Python -- every pin on
+# Divide/Add/AppendVector raises "is protected and cannot be read" on UE 5.8, so
+# the wiring genuinely cannot be walked. What pinned the formula down instead was
+# the VALUES: across all 16 MI_* instances UV Divide is 4.0 and U/V Tile take only
+# {0, 0.25, 0.5, 0.75}, i.e. fractions rather than integer cell indices, which
+# fits uv/divide + (u,v) and not (uv + (u,v))/divide. Rendering the 4x4 grid over
+# T_numbers_01_basecolor confirmed it cell by cell -- MI_numbers_01_red lands on
+# "1", MI_shape_u_white on the "U", MI_triangle_red on the triangle, all 16.
+#
+# Because that inference rests on names and graph SHAPE rather than on wiring, it
+# is gated on both: the three parameters must all be present under known names AND
+# the graph must carry Divide + Add + AppendVector with a TextureCoordinate left
+# at (1,1). A material that misses any of those falls through uncropped.
+
+# Tolerance for "is this tiling value 1.0" and friends. Tiling comes out of the
+# engine as float32, so an exact == against 1.0 is not safe.
+_UV_EPS = 1e-6
+
+# The rect meaning "sample the whole texture", i.e. no crop to record.
+_DECAL_UV_FULL_RECT = [0.0, 0.0, 1.0, 1.0]
+
+
+def _tiling_to_span(value):
+    """
+    One axis of a TextureCoordinate tiling value as (offset, size, mirrored).
+
+    Returns None when the value is not a crop at all: 0 (degenerate) or |t| > 1
+    (real repetition, which a Godot Decal has no way to reproduce).
+    """
+    try:
+        t = float(value)
+    except (TypeError, ValueError):
+        return None
+    if t == 0.0 or abs(t) > 1.0 + _UV_EPS:
+        return None
+    size = min(abs(t), 1.0)
+    if t > 0.0:
+        return 0.0, size, False
+    return 1.0 - size, size, True
+
+
+def _base_material_of(material):
+    """
+    The base unreal.Material behind any MaterialInterface, or None.
+
+    MaterialEditingLibrary.get_material_expressions only accepts a base Material,
+    but a decal is just as likely to carry a MaterialInstance (or a chain of
+    them), and the TextureCoordinate crop always lives in the base graph.
+    """
+    if material is None:
+        return None
+    getter = getattr(material, "get_base_material", None)
+    if getter is not None:
+        try:
+            base = getter()
+            if base is not None:
+                return base
+        except Exception:
+            pass
+    # Fall back to walking the parent chain; the bound is paranoia against a
+    # cyclic .parent rather than a real depth limit (chains are 1-2 deep).
+    node = material
+    for _ in range(8):
+        parent = ue2g_common.safe_get_prop(node, "parent", None)
+        if parent is None:
+            break
+        node = parent
+    return node
+
+
+# Scalar parameter names understood as an atlas cell selector. Deliberately an
+# EXACT-match whitelist after normalising case/spaces/underscores, like
+# _DECAL_OPACITY_PARAM_NAMES: a substring test would read "UV Divide Strength" or
+# a "Tile" tiling control as a cell index and crop every decal to a wrong corner.
+_ATLAS_DIVIDE_PARAM_NAMES = frozenset((
+    "uvdivide", "uvdivisions", "uvdiv", "atlasdivide", "atlasdivisions",
+))
+_ATLAS_U_PARAM_NAMES = frozenset(("utile", "uoffset", "atlasu", "ucell"))
+_ATLAS_V_PARAM_NAMES = frozenset(("vtile", "voffset", "atlasv", "vcell"))
+
+# The node set that makes a graph the "divide then offset" atlas shape.
+_ATLAS_GRAPH_CLASSES = frozenset((
+    "MaterialExpressionDivide", "MaterialExpressionAdd",
+    "MaterialExpressionAppendVector",
+))
+
+
+def _normalise_param_name(name):
+    return str(name or "").lower().replace(" ", "").replace("_", "")
+
+
+def _decal_scalar_param(material, base, name):
+    """A scalar parameter's value, taking a MaterialInstance's override if there
+    is one and falling back to the base material's default. None when unreadable."""
+    mel = getattr(unreal, "MaterialEditingLibrary", None)
+    if mel is None:
+        return None
+    key = name
+    name_type = getattr(unreal, "Name", None)
+    if name_type is not None:
+        try:
+            key = name_type(name)
+        except Exception:
+            key = name
+
+    instance_getter = getattr(mel, "get_material_instance_scalar_parameter_value", None)
+    mi_type = getattr(unreal, "MaterialInstance", None)
+    if instance_getter is not None and mi_type is not None and isinstance(material, mi_type):
+        try:
+            value = instance_getter(material, key)
+            if value is not None:
+                return float(value)
+        except Exception:
+            pass
+
+    default_getter = getattr(mel, "get_material_default_scalar_parameter_value", None)
+    if default_getter is not None:
+        try:
+            value = default_getter(base, key)
+            if value is not None:
+                return float(value)
+        except Exception:
+            pass
+    return None
+
+
+def _uv_rect_from_atlas_params(material, base, expressions, actor=None):
+    """
+    The atlas cell chosen by "UV Divide"/"U Tile"/"V Tile" style scalars, as
+    ([u0, v0, w, h], False, False), or None when this material is not that shape.
+
+    Gated on graph shape as well as parameter names because the wiring itself is
+    unreadable -- see the block comment above.
+    """
+    classes = set(type(ex).__name__ for ex in expressions)
+    if not _ATLAS_GRAPH_CLASSES.issubset(classes):
+        return None
+
+    mel = getattr(unreal, "MaterialEditingLibrary", None)
+    lister = getattr(mel, "get_scalar_parameter_names", None) if mel else None
+    if lister is None:
+        return None
+    try:
+        names = lister(base) or []
+    except Exception:
+        return None
+
+    wanted = (("divide", _ATLAS_DIVIDE_PARAM_NAMES), ("u", _ATLAS_U_PARAM_NAMES),
+              ("v", _ATLAS_V_PARAM_NAMES))
+    found = {}
+    for raw in names:
+        key = _normalise_param_name(raw)
+        for slot, allowed in wanted:
+            if key in allowed and slot not in found:
+                found[slot] = raw
+    if len(found) != 3:
+        return None
+
+    values = {}
+    for slot, raw in found.items():
+        value = _decal_scalar_param(material, base, raw)
+        if value is None:
+            return None
+        values[slot] = value
+
+    divide, u0, v0 = values["divide"], values["u"], values["v"]
+    if divide <= 0.0:
+        return None
+    size = 1.0 / divide
+    if size >= 1.0 - _UV_EPS:
+        # A 1x1 grid is the whole texture; nothing to crop.
+        return None
+    if not (-_UV_EPS <= u0 <= 1.0 and -_UV_EPS <= v0 <= 1.0):
+        return None
+    if u0 + size > 1.0 + _UV_EPS or v0 + size > 1.0 + _UV_EPS:
+        # The cell would run off the edge and wrap, which is not a sub-rect.
+        _log_actor_warning(
+            actor, "decal atlas crop skipped",
+            "'{}' selects a cell at ({}, {}) of size {} that runs past the "
+            "texture edge".format(ue2g_common.safe_get_name(base), u0, v0, size))
+        return None
+    return [max(u0, 0.0), max(v0, 0.0), size, size], False, False
+
+
+def _decal_uv_rect(material, actor=None):
+    """
+    The atlas sub-rect a decal material samples, as ([u0, v0, w, h], flip_u,
+    flip_v), or (None, False, False) when it samples the texture whole or crops
+    in a way that cannot be read.
+
+    u0/v0/w/h are normalised 0..1 with v measured from the TOP of the image,
+    which is where both Unreal's UV origin and Godot's Image row 0 already sit --
+    no flip is needed to move between them.
+    """
+    base = _base_material_of(material)
+    if base is None:
+        return None, False, False
+
+    mel = getattr(unreal, "MaterialEditingLibrary", None)
+    getter = getattr(mel, "get_material_expressions", None) if mel else None
+    if getter is None:
+        # Pre-5.x engines without the library: no supported way in, and the
+        # `expressions` property has been protected since 5.7.
+        return None, False, False
+
+    try:
+        expressions = getter(base) or []
+    except Exception as e:
+        _log_actor_warning(actor, "could not read decal material expressions", e)
+        return None, False, False
+
+    found = _uv_rect_from_texcoord(base, expressions, actor)
+    if found is not None:
+        return found
+    found = _uv_rect_from_atlas_params(material, base, expressions, actor)
+    if found is not None:
+        return found
+    return None, False, False
+
+
+def _uv_rect_from_texcoord(base, expressions, actor=None):
+    """
+    The crop a bare TextureCoordinate node applies, as ([u0, v0, w, h], flip_u,
+    flip_v), or None when there is none to read.
+    """
+    coords = [ex for ex in expressions if "TextureCoordinate" in type(ex).__name__]
+    if not coords:
+        return None
+    if len(coords) > 1:
+        # Which node feeds the albedo sampler is not something Python can see --
+        # expression INPUTS are not exposed -- so with more than one the crop
+        # would be a guess. The whole sheet is wrong but at least predictable.
+        _log_actor_warning(
+            actor, "decal atlas crop skipped",
+            "'{}' has {} TextureCoordinate nodes; cannot tell which one feeds "
+            "the albedo sampler".format(ue2g_common.safe_get_name(base), len(coords)))
+        return None
+
+    node = coords[0]
+    raw_u = ue2g_common.safe_get_prop(node, "u_tiling", 1.0)
+    raw_v = ue2g_common.safe_get_prop(node, "v_tiling", 1.0)
+    u_span = _tiling_to_span(raw_u)
+    v_span = _tiling_to_span(raw_v)
+    if u_span is None or v_span is None:
+        _log_actor_warning(
+            actor, "decal atlas crop skipped",
+            "'{}' repeats its texture (U={}, V={}); a Godot Decal cannot tile a "
+            "texture inside its box".format(
+                ue2g_common.safe_get_name(base), raw_u, raw_v))
+        return None
+
+    u0, width, flip_u = u_span
+    v0, height, flip_v = v_span
+    if (not flip_u and not flip_v
+            and width >= 1.0 - _UV_EPS and height >= 1.0 - _UV_EPS):
+        # Samples the whole sheet. This is also the M_decal case -- its
+        # TextureCoordinate sits at (1,1) and the crop lives in the parameters --
+        # so falling through here is what lets the parameter path run.
+        return None
+    return [u0, v0, width, height], flip_u, flip_v
+
+
 # UE fades a decal out once its projected size drops below FadeScreenSize (a
 # fraction of the view's half-height; default 0.01). Godot has no screen-size
 # fade, only a distance one, so the exporter converts: an object of world radius
@@ -989,6 +1277,18 @@ def _build_decal_entry(actor, comp, name, collected_textures):
                             packed, params.get("packed_channels")))
         except Exception as e:
             _log_actor_warning(actor, "failed to extract decal material parameters", e)
+
+        # The atlas crop, when the material has one. Emitted only when it is a
+        # real crop, so an ordinary one-texture-per-decal material's entry is
+        # byte-for-byte what it was before this existed.
+        try:
+            uv_rect, flip_u, flip_v = _decal_uv_rect(material, actor)
+            if uv_rect is not None:
+                textures["uv_rect"] = uv_rect
+                textures["flip_u"] = flip_u
+                textures["flip_v"] = flip_v
+        except Exception as e:
+            _log_actor_warning(actor, "failed to read decal atlas crop", e)
 
     godot_transform = _decal_transform(_component_world_transform(actor, comp))
     fade_begin, fade_length = _decal_distance_fade(

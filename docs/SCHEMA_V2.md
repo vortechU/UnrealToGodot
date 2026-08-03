@@ -353,6 +353,8 @@ ambient light energy.
     "distance_fade_length_m": 47.6 | null,
     "material_name": "...", "material_path": "...",
     "textures": { "albedo": "T_Blood" | null, "normal": null, "orm": null, "emission": null,
+                  "uv_rect": [u0, v0, w, h],   // atlas crop; ABSENT when the whole texture is used
+                  "flip_u": false, "flip_v": false,
                   "texture_paths": { "albedo": "/Game/Pack/T_Blood.T_Blood", ... } }
 }
 ```
@@ -377,9 +379,95 @@ from the **lateral** extent (`size_m[0]`/`size_m[2]` times their scale) — proj
 does not affect on-screen size. Both fields are `null` when `fade_screen_size <= 0` or the
 result exceeds 100 km (indistinguishable from "never fades").
 
+### `uv_rect` — atlas cropping
+
+Decal packs routinely ship **one atlas texture** and cut a different cell out of it per
+material, so a single `T_Signs_BC.png` serves four different signs. Unreal does that crop
+in the material graph; Godot's `Decal` has no UV transform of any kind. Without this
+field the importer binds the whole sheet, and a decal that reads "Exit" in Unreal arrives
+in Godot showing all four signs at once (measured on `SpaceshipInterior`'s
+`M_Scifi_Signs_Decal_01..04`, four `TextureCoordinate` nodes over one 1024×1024 sheet).
+
+`uv_rect` is `[u0, v0, w, h]`, normalised 0..1, with **v measured from the top** of the
+image — the origin Unreal's UVs and Godot's `Image` row 0 already share, so no flip is
+needed to move between them. It applies to every slot of that decal, and is **omitted
+entirely** when the material samples the texture whole, so an ordinary
+one-texture-per-decal entry is unchanged by this field's existence.
+
+The exporter reads the plain `TextureCoordinate` form, `UV = uv * (U, V)`. With Unreal's
+default wrap addressing and `|tiling| <= 1` that is a sub-rect, and the **sign** picks
+which end of the axis, plus a mirror:
+
+| `u_tiling` | rect on that axis | `flip_u` |
+| --- | --- | --- |
+| `t > 0` | `[0, t]` | `false` |
+| `t < 0` | `[1-\|t\|, 1]` — wrap walks it backwards | `true` |
+
+`\|t\| > 1` is genuine repetition, which a Godot `Decal` cannot express at all; the
+exporter refuses it and logs which material it skipped rather than approximating a wrong
+crop. Same for a graph with more than one `TextureCoordinate` node — Python cannot see
+expression *inputs*, so which node feeds the albedo sampler would be a guess.
+
+The second form is the **parameter-driven** one: the base material holds
+`TextureCoordinate(1,1) → Divide → Add → sampler` and each *instance* picks its cell with
+scalar parameters (`ModularSciFiStation`'s `M_decal`: `UV Divide`, `U Tile`, `V Tile`),
+giving `uv_rect = [U Tile, V Tile, 1/UV Divide, 1/UV Divide]` and no flips.
+
+Expression **inputs** cannot be read from Python — every pin on `Divide`/`Add`/
+`AppendVector`, and `Coordinates` on the sampler, raises *"is protected and cannot be
+read"* on UE 5.8 — so the wiring is genuinely unwalkable and this formula was inferred
+from the values: across all 16 `MI_*` instances `UV Divide` is `4.0` and `U`/`V Tile` take
+only `{0, 0.25, 0.5, 0.75}`, i.e. fractions rather than integer cell indices, which fits
+`uv/divide + (u,v)` and not `(uv + (u,v))/divide`. Rendering the 4×4 grid over
+`T_numbers_01_basecolor` confirmed it cell by cell: `MI_numbers_01_red` lands on "1",
+`MI_shape_u_white` on the "U", `MI_triangle_red` on the triangle, all sixteen.
+
+Because that rests on names and graph **shape** rather than on wiring, it is gated on
+both — all three parameters present under known names **and** `Divide` + `Add` +
+`AppendVector` in the graph with the `TextureCoordinate` left at `(1,1)`. A material
+missing either gate falls through uncropped. A real `TextureCoordinate` crop is the more
+specific signal and wins when both are present.
+
+Importers must bake the crop into pixels — `AtlasTexture` does **not** work here, because
+Godot's decal atlas keys off the texture's RID and ignores the region. The addon does this
+in `import_environment.gd`'s `_crop_decal_texture`, caching by (path, rect, flips) so decals
+sharing a cell share one texture. The `.tscn` writer cannot bake pixels and warns instead.
+
 Deliberately **not** mapped: Godot's `upper_fade`/`lower_fade` are left at their engine
-defaults. UE clips hard at the decal box, so a faithful import would zero them, but the
-soft falloff is what keeps projections onto curved geometry from showing a hard seam.
+defaults (0.3 each, confirmed against 4.7.1). UE clips hard at the decal box, so a faithful
+import would zero them, but the soft falloff is what keeps projections onto curved geometry
+from showing a hard seam. Zeroing them was tested on a GPU as a fix for the shredding
+described below and made **no measurable difference** (2103 px of decal vs 2107), so they
+are not the lever they look like.
+
+### Minimum projection depth (import option, not a schema field)
+
+Unreal packs author astonishingly thin decal boxes: every decal in `SpaceshipInterior`'s
+Demonstration map leaves `DecalSize` at `(1,1,1)` cm and lets the actor scale do the work,
+giving projection depths from **16 mm to 400 mm**. Both engines clip a decal to its box,
+but in Godot a 16 mm slab only reaches surfaces within ±8 mm of the decal's centre plane —
+less than the relief on a typical sci-fi wall panel — so the decal survives only in the
+slivers that fall inside, and *which* slivers survive shifts with the viewing angle. That
+is what "the decals z-fight constantly" looks like.
+
+Measured on a real GPU against a plane with 12 mm of relief, sweeping camera elevation:
+
+| Projection depth | Result |
+| --- | --- |
+| 16 mm (Unreal exact) | shredded into slivers at every angle |
+| 50 mm | mostly intact; artefacts return at grazing angles |
+| **100 mm** | intact at every angle |
+| 200 mm | intact at every angle |
+
+So both importer paths floor the projection depth at `decal_min_depth_m`, default **0.10**.
+This is a deliberate **deviation from Unreal** — a deeper box reaches geometry Unreal would
+have clipped away, which on a cluttered prop can project a decal onto its neighbour — so it
+is an option rather than a constant. Set it to `0` to import Unreal's depths exactly.
+
+The floor applies to the **effective** depth (`size_m[1]` × the node's Y scale), not to
+`size_m[1]` alone: the exporter leaves `size_m` at Unreal's `DecalSize` and puts the rest in
+the transform, so `size_m[1]` is routinely `0.02` against a scale of several hundred, and
+flooring it directly would do nothing at all.
 
 **`orm` is only ever set when the source map is genuinely ORM-ordered**
 (R=AO, G=roughness, B=metallic — the `ORM`/`ARM` row of the packed-map table

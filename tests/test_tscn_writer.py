@@ -483,6 +483,34 @@ for gd_prop in ("decal.modulate = Common.color_from_array", "decal.visible = boo
     assert gd_prop in gd, "addon no longer sets %r; tscn_writer would drift" % gd_prop
 print("decal properties agree with import_environment.gd")
 
+# --- minimum decal projection depth -------------------------------------------
+# Unreal packs author decal boxes as thin as 16 mm (SpaceshipInterior's
+# DecalActor9), which Godot clips into slivers against any surface relief. Both
+# importer paths raise them, and both must raise them by the same amount.
+assert "DEFAULT_DECAL_MIN_DEPTH_M := 0.10" in gd, \
+    "addon's decal depth floor changed; tscn_writer's DEFAULT_DECAL_MIN_DEPTH_M would drift"
+assert tscn_writer.DEFAULT_DECAL_MIN_DEPTH_M == 0.10, "tscn_writer's depth floor drifted from the addon's"
+
+# The floor is on the EFFECTIVE depth: the exporter leaves size_m at UE's
+# DecalSize and puts the rest in the transform, so size_m[1] is 0.02 against a
+# scale of hundreds. Numbers are the real DecalActor9 / DecalActor5.
+thin = tscn_writer._decal_size_with_min_depth([0.02, 0.02, 0.02], {"scale": [32.2, 0.8126, 34.9]}, 0.10)
+assert abs(thin[1] * 0.8126 - 0.10) < 1e-6, \
+    "a 16 mm decal was not raised to the floor: %s" % thin
+assert thin[0] == 0.02 and thin[2] == 0.02, "the floor must not touch width or height: %s" % thin
+
+deep = tscn_writer._decal_size_with_min_depth([0.02, 0.02, 0.02], {"scale": [50.2, 8.87, 49.3]}, 0.10)
+assert deep == [0.02, 0.02, 0.02], "a decal already deeper than the floor must be untouched: %s" % deep
+
+off = tscn_writer._decal_size_with_min_depth([0.02, 0.02, 0.02], {"scale": [32.2, 0.8126, 34.9]}, 0.0)
+assert off == [0.02, 0.02, 0.02], "a floor of 0 must import Unreal's depth exactly: %s" % off
+
+degenerate = tscn_writer._decal_size_with_min_depth([0.02, 0.02, 0.02], {"scale": [1.0, 0.0, 1.0]}, 0.10)
+assert degenerate == [0.02, 0.02, 0.02], "a zero Y scale must not divide by zero: %s" % degenerate
+
+assert "decal_min_depth_m" in gd, "addon no longer reads the decal_min_depth_m option"
+print("decal minimum projection depth agrees across both importer paths")
+
 # Lights are the third two-implementation feature, and the one that had drifted
 # furthest: the addon set light_indirect_energy and spot_angle_attenuation and
 # clamped spot_angle, none of which this writer did, and the two disagreed on
