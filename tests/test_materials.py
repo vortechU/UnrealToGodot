@@ -2047,6 +2047,108 @@ check("inspect_world_streaming detects World Partition and separates loaded/unlo
       and ws["loaded_sublevels"] == ["/Game/Maps/Sub_Loaded"]
       and ws["unloaded_sublevels"] == ["/Game/Maps/Sub_Unloaded"], ws)
 
+print("\n=== 16. UE 5.8 live-probe regression checks ===")
+# 1) HDR Emissive Color > 1.0 (e.g. Downtown_Alley MI_Windows_Emissive (3.5, 3.354, 2.8))
+_hdr_vec_param = types.SimpleNamespace(
+    parameter_info=types.SimpleNamespace(name="Emissive Color"),
+    parameter_value=types.SimpleNamespace(r=3.5, g=3.354, b=2.8, a=1.0),
+)
+hdr_mi = _MI({
+    "vector_parameter_values": [_hdr_vec_param],
+    "scalar_parameter_values": [],
+    "texture_parameter_values": [],
+    "parent": None,
+})
+hdr_params = EL.extract_material_parameters(hdr_mi, set())
+check("HDR emissive_color > 1.0 is normalized into [0,1] RGB and peak folded into emissive_energy",
+      abs(hdr_params["emissive_energy"] - 3.5) < 1e-3
+      and abs(hdr_params["emissive_color"][0] - 1.0) < 1e-3
+      and abs(hdr_params["emissive_color"][2] - 0.8) < 1e-3, hdr_params)
+
+# 2) BodyInstance.collisionEnabled == "NoCollision" (without underscore, as in UE 5.8 CDO)
+nocol_body = types.SimpleNamespace(get_editor_property=lambda k: "NoCollision" if k == "collision_enabled" else None)
+nocol_comp = types.SimpleNamespace(get_editor_property=lambda k: nocol_body if k == "body_instance" else None)
+check("BodyInstance collision_enabled 'NoCollision' (no underscore) maps to collision_enabled=False",
+      EL.extract_component_render_flags(nocol_comp)["collision_enabled"] is False)
+
+# 3) UE 5.8 World Partition lives on AWorldSettings.world_partition (and world.is_partitioned_world())
+fake_ws_actor = types.SimpleNamespace(get_editor_property=lambda k: object() if k == "world_partition" else None)
+fake_sub_wa = types.SimpleNamespace(
+    get_editor_property=lambda k: types.SimpleNamespace(get_name=lambda: "Sub_ViaWorldAsset") if k == "world_asset" else None,
+    is_level_loaded=lambda: False,
+)
+fake_ue58_world = types.SimpleNamespace(
+    get_editor_property=lambda k: None,
+    get_world_settings=lambda: fake_ws_actor,
+    get_streaming_levels=lambda: [fake_sub_wa],
+)
+ws58 = EL.inspect_world_streaming(fake_ue58_world)
+check("inspect_world_streaming reads world_partition from AWorldSettings and world_asset from LevelStreaming",
+      ws58 is not None and ws58["is_world_partition"] is True
+      and ws58["unloaded_sublevels"] == ["Sub_ViaWorldAsset"], ws58)
+
+# 4) UE 5.8 AudioComponent.attenuation_overrides is a non-null struct; override_attenuation=False must use attenuation_settings
+default_override_struct = types.SimpleNamespace(
+    get_editor_property=lambda k: {"falloff_distance": 3600.0, "attenuation_shape_extents": _Vec(400.0, 0.0, 0.0), "spatialize": True}.get(k)
+)
+custom_att_struct = types.SimpleNamespace(
+    get_editor_property=lambda k: {"falloff_distance": 1100.0, "attenuation_shape_extents": _Vec(200.0, 0.0, 0.0), "spatialize": True}.get(k)
+)
+custom_att_asset = types.SimpleNamespace(get_editor_property=lambda k: custom_att_struct if k == "attenuation" else None)
+
+
+class _FakeUE58AudioComp(u.AudioComponent):
+    def get_editor_property(self, k):
+        return {
+            "sound": _fake_sw,
+            "volume_multiplier": 1.0,
+            "pitch_multiplier": 1.0,
+            "auto_activate": True,
+            "allow_spatialization": True,
+            "override_attenuation": False,
+            "attenuation_overrides": default_override_struct,
+            "attenuation_settings": custom_att_asset,
+            "is_editor_only": False,
+        }.get(k)
+
+    def get_world_transform(self):
+        return _FakeTransform()
+
+
+ue58_aud = EE.collect_environment(
+    [_FakeP3Actor("AssetAttAudio", {u.AudioComponent: [_FakeUE58AudioComp()]})],
+    set(),
+)["audio"]
+check("AudioComponent with override_attenuation=False uses attenuation_settings (13m) over default struct (40m)",
+      len(ue58_aud) == 1 and abs(ue58_aud[0]["attenuation_radius_m"] - 13.0) < 0.01, ue58_aud)
+
+
+# 5) CineCameraComponent prefers current_horizontal_fov and perspective camera uses 4000m far default
+class _FakeCineCamComp(u.CameraComponent):
+    def get_editor_property(self, k):
+        return {
+            "projection_mode": _EnumVal("Perspective"),
+            "field_of_view": 90.0,
+            "current_horizontal_fov": 52.6708,
+            "ortho_near_clip_plane": -768.0,
+            "ortho_far_clip_plane": 2097152.0,
+            "aspect_ratio": 1.777778,
+            "is_editor_only": False,
+        }.get(k)
+
+    def get_world_transform(self):
+        return _FakeTransform()
+
+
+ue58_cams = EE.collect_environment(
+    [_FakeP3Actor("CineCam", {u.CameraComponent: [_FakeCineCamComp()]})],
+    set(),
+)["cameras"]
+check("CineCameraComponent reads current_horizontal_fov and uses clean 0.05..4000m perspective clip planes",
+      len(ue58_cams) == 1 and abs(ue58_cams[0]["fov_deg"] - 52.6708) < 1e-3
+      and abs(ue58_cams[0]["near_clip_m"] - 0.05) < 1e-4
+      and abs(ue58_cams[0]["far_clip_m"] - 4000.0) < 1e-3, ue58_cams)
+
 print("\n" + "=" * 60)
 if FAIL:
     print("FAILURES (%d): %s" % (len(FAIL), FAIL))

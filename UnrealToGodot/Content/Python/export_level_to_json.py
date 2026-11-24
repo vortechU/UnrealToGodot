@@ -878,6 +878,24 @@ def extract_material_parameters(material, collected_textures=None):
     if parameters["metallic_texture"] and "metallic" not in assigned:
         parameters["metallic"] = 1.0
 
+    # Unreal artists routinely author HDR emissive colors with components > 1.0
+    # directly on Emissive Color (e.g. (3.5, 3.35, 2.8) with no separate scalar
+    # intensity). Normalize into [0, 1] RGB and fold peak intensity into
+    # emissive_energy so Godot's emission color picker and glTF emissiveFactor
+    # preserve both hue and luminance instead of clipping to white.
+    ec = parameters.get("emissive_color")
+    if isinstance(ec, list) and len(ec) >= 3:
+        peak = max(float(ec[0]), float(ec[1]), float(ec[2]))
+        if peak > 1.0:
+            parameters["emissive_color"] = [
+                round(max(0.0, float(ec[0])) / peak, 4),
+                round(max(0.0, float(ec[1])) / peak, 4),
+                round(max(0.0, float(ec[2])) / peak, 4),
+            ]
+            parameters["emissive_energy"] = round(
+                max(0.0, float(parameters.get("emissive_energy", 1.0))) * peak, 4
+            )
+
     return parameters
 
 def extract_mesh_materials(mesh, collected_textures=None):
@@ -1008,16 +1026,16 @@ def extract_component_render_flags(comp, actor=None):
     try:
         if hasattr(comp, "get_collision_enabled"):
             ce = comp.get_collision_enabled()
-            ce_name = str(getattr(ce, "name", ce)).upper()
-            if "NO_COLLISION" in ce_name or ce_name == "0":
+            ce_name = str(getattr(ce, "name", ce)).upper().replace("_", "")
+            if "NOCOLLISION" in ce_name or ce_name == "0":
                 collision_enabled = False
         else:
             body_inst = ue2g_common.safe_get_prop(comp, "body_instance", None)
             if body_inst is not None:
                 ce = ue2g_common.safe_get_prop(body_inst, "collision_enabled", None)
                 if ce is not None:
-                    ce_name = str(getattr(ce, "name", ce)).upper()
-                    if "NO_COLLISION" in ce_name or ce_name == "0":
+                    ce_name = str(getattr(ce, "name", ce)).upper().replace("_", "")
+                    if "NOCOLLISION" in ce_name or ce_name == "0":
                         collision_enabled = False
             if collision_enabled and hasattr(comp, "get_collision_profile_name"):
                 prof = str(comp.get_collision_profile_name() or "").lower()
@@ -1174,18 +1192,33 @@ def inspect_world_streaming(world):
         return None
     is_wp = False
     try:
-        wp = ue2g_common.safe_get_prop(world, "world_partition", None)
-        if wp is not None:
-            is_wp = True
+        if hasattr(world, "is_partitioned_world"):
+            is_wp = bool(world.is_partitioned_world())
     except Exception:
         pass
+    if not is_wp:
+        # In UE 5.x, world_partition is a property on AWorldSettings (not UWorld).
+        try:
+            ws = world.get_world_settings() if hasattr(world, "get_world_settings") else None
+            if ws is not None and ue2g_common.safe_get_prop(ws, "world_partition", None) is not None:
+                is_wp = True
+        except Exception:
+            pass
+    if not is_wp:
+        try:
+            if ue2g_common.safe_get_prop(world, "world_partition", None) is not None:
+                is_wp = True
+        except Exception:
+            pass
 
     loaded = []
     unloaded = []
     try:
-        levels = ue2g_common.safe_get_prop(world, "streaming_levels", None)
-        if levels is None and hasattr(world, "get_streaming_levels"):
+        levels = None
+        if hasattr(world, "get_streaming_levels"):
             levels = world.get_streaming_levels()
+        if levels is None:
+            levels = ue2g_common.safe_get_prop(world, "streaming_levels", None)
         for lvl in (levels or []):
             if lvl is None:
                 continue
@@ -1195,6 +1228,10 @@ def inspect_world_streaming(world):
                     pkg = lvl.get_world_asset_package_f_name()
                 except Exception:
                     pkg = None
+            if not pkg:
+                wa = ue2g_common.safe_get_prop(lvl, "world_asset", None)
+                if wa is not None:
+                    pkg = ue2g_common.safe_get_name(wa) if hasattr(wa, "get_name") else str(wa)
             name = str(pkg or ue2g_common.safe_get_name(lvl))
             is_loaded = False
             if hasattr(lvl, "is_level_loaded"):

@@ -1444,10 +1444,23 @@ def _build_camera_entries(actor):
             proj_raw = ue2g_common.safe_get_prop(comp, "projection_mode", None)
             proj_str = str(getattr(proj_raw, "name", proj_raw) or "PERSPECTIVE").upper()
             projection = "orthogonal" if ("ORTHO" in proj_str or proj_str == "1") else "perspective"
-            fov_deg = max(1.0, min(179.0, _f(ue2g_common.safe_get_prop(comp, "field_of_view", 90.0), 90.0)))
+            # CineCameraComponent derives horizontal FOV from focal length + filmback;
+            # prefer current_horizontal_fov when present and positive.
+            cine_fov = _f(ue2g_common.safe_get_prop(comp, "current_horizontal_fov", 0.0), 0.0)
+            raw_fov = cine_fov if cine_fov > 0.0 else _f(ue2g_common.safe_get_prop(comp, "field_of_view", 90.0), 90.0)
+            fov_deg = max(1.0, min(179.0, raw_fov))
             ortho_width_m = max(0.05, _f(ue2g_common.safe_get_prop(comp, "ortho_width", 512.0), 512.0) * ue2g_common.CM_TO_M)
-            near_cm = _f(ue2g_common.safe_get_prop(comp, "ortho_near_clip_plane", 10.0), 10.0)
-            far_cm = _f(ue2g_common.safe_get_prop(comp, "ortho_far_clip_plane", 100000.0), 100000.0)
+            # In Unreal, ortho_near_clip_plane / ortho_far_clip_plane (default -768 / 2097152 cm)
+            # only govern Orthographic mode; perspective cameras use an infinite reverse-Z frustum,
+            # so use Godot's clean 0.05..4000 m defaults for perspective cameras.
+            if projection == "orthogonal":
+                near_cm = _f(ue2g_common.safe_get_prop(comp, "ortho_near_clip_plane", 10.0), 10.0)
+                far_cm = _f(ue2g_common.safe_get_prop(comp, "ortho_far_clip_plane", 100000.0), 100000.0)
+                near_m = max(0.01, near_cm * ue2g_common.CM_TO_M) if near_cm > 0.0 else 0.05
+                far_m = max(1.0, far_cm * ue2g_common.CM_TO_M) if far_cm > 0.0 else 4000.0
+            else:
+                near_m = 0.05
+                far_m = 4000.0
             aspect = max(0.1, _f(ue2g_common.safe_get_prop(comp, "aspect_ratio", 1.777778), 1.777778))
             entries.append({
                 "name": name,
@@ -1455,8 +1468,8 @@ def _build_camera_entries(actor):
                 "projection": projection,
                 "fov_deg": fov_deg,
                 "ortho_width_m": ortho_width_m,
-                "near_clip_m": max(0.01, near_cm * ue2g_common.CM_TO_M) if near_cm > 0.0 else 0.05,
-                "far_clip_m": max(1.0, far_cm * ue2g_common.CM_TO_M) if far_cm > 0.0 else 4000.0,
+                "near_clip_m": near_m,
+                "far_clip_m": far_m,
                 "aspect_ratio": aspect,
             })
         except Exception as e:
@@ -1510,16 +1523,28 @@ def _build_audio_entries(actor, collected_sounds=None):
             is_spatial = _b(ue2g_common.safe_get_prop(comp, "allow_spatialization", True), True)
 
             att_radius_m = 40.0
-            att_settings = ue2g_common.safe_get_prop(comp, "attenuation_overrides", None)
+            # In Unreal, attenuation_overrides is a value struct (never None), so
+            # override_attenuation (bOverrideAttenuation) decides whether it takes
+            # precedence over the component/SoundWave SoundAttenuation asset.
+            override_att = _b(ue2g_common.safe_get_prop(comp, "override_attenuation", False), False)
+            att_settings = None
+            if override_att:
+                att_settings = ue2g_common.safe_get_prop(comp, "attenuation_overrides", None)
             if att_settings is None:
                 att_asset = ue2g_common.safe_get_prop(comp, "attenuation_settings", None)
+                if att_asset is None and sound is not None:
+                    att_asset = ue2g_common.safe_get_prop(sound, "attenuation_settings", None)
                 if att_asset is not None:
                     att_settings = ue2g_common.safe_get_prop(att_asset, "attenuation", None)
+            if att_settings is None:
+                att_settings = ue2g_common.safe_get_prop(comp, "attenuation_overrides", None)
             if att_settings is not None:
                 falloff = _f(ue2g_common.safe_get_prop(att_settings, "falloff_distance", 3600.0), 3600.0)
                 ext = ue2g_common.safe_get_prop(att_settings, "attenuation_shape_extents", None)
                 inner = _f(ext.x, 400.0) if ext is not None else 400.0
                 att_radius_m = max(0.1, (inner + falloff) * ue2g_common.CM_TO_M)
+                if not _b(ue2g_common.safe_get_prop(att_settings, "spatialize", True), True):
+                    is_spatial = False
 
             entries.append({
                 "name": name,
