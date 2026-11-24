@@ -13,9 +13,9 @@ This document tracks the planned feature additions across the Unreal exporter pl
 
 ## Overall Progress
 
-- **Completed:** 6 / 15
+- **Completed:** 11 / 15
 - **In Progress:** 0 / 15
-- **Pending:** 9 / 15
+- **Pending:** 4 / 15
 
 ---
 
@@ -70,37 +70,35 @@ Features whose Unreal export side already exists, waiting on full Godot consumpt
 
 Closing the remaining structural gaps between Unreal levels and Godot scenes.
 
-- [ ] **7. Per-Component Visibility, Shadow Casting & Collision Flags on Static Meshes**
+- [x] **7. Per-Component Visibility, Shadow Casting & Collision Flags on Static Meshes**
   - **Goal:** Stop decorative `NoCollision` props from getting physics bodies and stop `HiddenInGame` blockers/proxies from rendering.
-  - **Exporter:** Export `visible` (`Visible && !HiddenInGame`), `cast_shadow`, `collision_enabled`, and `max_draw_distance` on regular mesh components in `export_level_to_json.py`.
-  - **Godot Importer & `.tscn` Writer:** Apply `visible`, `cast_shadow`, `visibility_range_end`, and skip `StaticBody3D` generation when `collision_enabled` is false.
-  - **Tests:** `test_layout.py`, `test_tscn_writer.py`, and Godot harness assertions.
+  - **Exporter:** Export `visible`, `cast_shadow`, `collision_enabled`, and `max_draw_distance_m` on regular mesh components in `export_level_to_json.py`.
+  - **Godot Importer & `.tscn` Writer:** Apply `visible`, `cast_shadow`, `visibility_range_end`, and skip `StaticBody3D` when `collision_enabled` is false.
+  - **Tests:** `test_materials.py`, `test_tscn_writer.py`, and real headless Godot assertions.
 
-- [ ] **8. Reflection Captures → `ReflectionProbe`**
+- [x] **8. Reflection Captures → `ReflectionProbe`**
   - **Goal:** Give metallic/interior scenes accurate local reflections out of the box.
-  - **Exporter:** Collect `BoxReflectionCaptureComponent` and `SphereReflectionCaptureComponent` (including Blueprint components) in `export_environment.py`: bounds/radius, brightness/intensity, box projection, and interior flag.
-  - **Godot Importer & `.tscn` Writer:** Create `ReflectionProbe` nodes under `UnrealReflectionProbes` (or `UnrealEnvironment` group).
-  - **Tests:** `test_materials.py` / `test_tscn_writer.py` + headless Godot `env_test.gd` / harness assertions.
+  - **Exporter:** Collect `BoxReflectionCaptureComponent` and `SphereReflectionCaptureComponent` in `export_environment.py`.
+  - **Godot Importer & `.tscn` Writer:** Build `ReflectionProbe` nodes under `UnrealReflectionProbes`.
+  - **Tests:** `test_materials.py`, `test_tscn_writer.py`, and headless Godot assertions.
 
-- [ ] **9. Preserve Unreal World Outliner Folders**
+- [x] **9. Preserve Unreal World Outliner Folders**
   - **Goal:** Turn thousands of flat nodes under `UnrealStaticMeshes` into a navigable hierarchy matching Unreal's World Outliner.
-  - **Exporter:** Export `folder_path` (`actor.get_folder_path()`) on actors (and optionally lights/decals).
-  - **Godot Importer & `.tscn` Writer:** Add an optional **"Mirror Unreal Outliner Folders"** toggle creating nested `Node3D` folder containers.
-  - **Tests:** `test_layout.py`, `test_tscn_writer.py`, and Godot harness hierarchy check.
+  - **Exporter:** Export normalized `folder_path` (`actor.get_folder_path()`) per actor.
+  - **Godot Importer & `.tscn` Writer:** Optional **"Mirror Unreal Outliner Folders"** (`preserve_folders`) toggle creating nested identity `Node3D` folder containers.
+  - **Tests:** `test_materials.py`, `test_tscn_writer.py`, and headless Godot hierarchy assertions.
 
-- [ ] **10. Spline Meshes (`SplineMeshComponent`)**
+- [x] **10. Spline Meshes (`SplineMeshComponent`)**
   - **Goal:** Properly migrate spline-deformed roads, pipes, cables, curbs, and fences instead of leaving them unbent or missing.
-  - **Exporter:** Probe Unreal Python API for `SplineMeshComponent` (evaluate baking deformed geometry vs. exporting start/end positions, tangents, roll, scale, and forward axis).
-  - **Godot Importer:** Reconstruct deformed meshes (baked glTF or Godot `MeshDataTool` cubic Hermite deformation along the spline axis).
-  - **Tests:** Math/deformation unit tests + real Unreal spline probe + Godot harness check.
+  - **Exporter:** Extract `SplineMeshComponent` cubic Hermite parameters (endpoints, tangents, scale, roll, forward axis, up dir) into glTF mesh-local space in `export_level_to_json.py`.
+  - **Godot Importer:** Added `addons/unreal_importer/import_spline_mesh.gd` deforming mesh vertices and normals along the Hermite curve via `MeshDataTool` (and warning in `tscn_writer.py`).
+  - **Tests:** `test_materials.py` + real headless Godot spline vertex deformation assertions.
 
-- [ ] **11. Opt-In `CameraActor` & `AmbientSound` Export**
+- [x] **11. Opt-In `CameraActor` & `AmbientSound` Export**
   - **Goal:** Quickly reproduce Unreal showcase/demo camera framing and spatial ambient audio beds.
-  - **Exporter:** Add opt-in toggles for:
-    - `CameraComponent` / `CineCameraComponent` → FOV, projection, near/far clip, transform.
-    - `AudioComponent` / `AmbientSound` → transform, attenuation radius, volume, pitch, and `.wav` export via `SoundWave`.
+  - **Exporter:** Collect `CameraComponent` (horizontal FOV via `KEEP_WIDTH`, perspective/ortho, clip planes) and `AudioComponent` (volume dB, pitch, attenuation radius, auto `.wav` export for `SoundWave` + auto-transfer to `audio/`).
   - **Godot Importer & `.tscn` Writer:** Build `Camera3D` under `UnrealCameras` and `AudioStreamPlayer3D` under `UnrealAudio`.
-  - **Tests:** Unit tests, `.tscn` pinning, and Godot harness checks.
+  - **Tests:** `test_materials.py`, `test_tscn_writer.py`, and headless Godot assertions.
 
 ---
 

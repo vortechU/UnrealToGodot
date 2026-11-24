@@ -99,6 +99,12 @@ func apply(data: Dictionary, root: Node, scene_owner: Node, options: Dictionary)
 		created += _apply_environment(data, root, scene_owner, warnings)
 	if options.get("apply_decals", true):
 		created += _apply_decals(data.get("decals", []), root, scene_owner, options, warnings)
+	if options.get("apply_reflection_probes", true):
+		created += _apply_reflection_probes(data.get("reflection_probes", []), root, scene_owner)
+	if options.get("apply_cameras", true):
+		created += _apply_cameras(data.get("cameras", []), root, scene_owner)
+	if options.get("apply_audio", true):
+		created += _apply_audio(data.get("audio", []), root, scene_owner, options)
 
 	return {"created": created, "warnings": warnings}
 
@@ -466,6 +472,111 @@ func _crop_decal_texture(
 	var result := ImageTexture.create_from_image(out)
 	_decal_crop_cache[cache_key] = result
 	return result
+
+
+func _apply_reflection_probes(probes, root: Node, scene_owner: Node) -> int:
+	if probes == null or not (probes is Array) or probes.is_empty():
+		return 0
+	var container := Node3D.new()
+	container.name = "UnrealReflectionProbes"
+	Common.add_owned_child(root, container, scene_owner)
+
+	var count := 0
+	for entry in probes:
+		if not (entry is Dictionary):
+			continue
+		var probe := ReflectionProbe.new()
+		probe.name = Common.get_str(entry, "name", "ReflectionProbe")
+		probe.transform = Common.get_transform_from_dict(entry.get("godot_transform", {}))
+		var sz := Common.vec3_from_array(entry.get("size_m"), Vector3(10.0, 10.0, 10.0)).abs()
+		probe.size = Vector3(maxf(sz.x, 0.1), maxf(sz.y, 0.1), maxf(sz.z, 0.1))
+		probe.intensity = clampf(Common.get_num(entry, "intensity", 1.0), 0.0, 16.0)
+		probe.box_projection = bool(entry.get("box_projection", true))
+		probe.update_mode = ReflectionProbe.UPDATE_ONCE
+		probe.visible = bool(entry.get("visible", true))
+		probe.set_meta("unreal_probe_shape", Common.get_str(entry, "shape", "box"))
+		Common.add_owned_child(container, probe, scene_owner)
+		count += 1
+
+	if count == 0:
+		container.queue_free()
+	return count
+
+
+func _apply_cameras(cameras, root: Node, scene_owner: Node) -> int:
+	if cameras == null or not (cameras is Array) or cameras.is_empty():
+		return 0
+	var container := Node3D.new()
+	container.name = "UnrealCameras"
+	Common.add_owned_child(root, container, scene_owner)
+
+	var count := 0
+	for entry in cameras:
+		if not (entry is Dictionary):
+			continue
+		var cam := Camera3D.new()
+		cam.name = Common.get_str(entry, "name", "Camera")
+		cam.transform = Common.get_transform_from_dict(entry.get("godot_transform", {}))
+		# Unreal FieldOfView is horizontal; Godot's KEEP_WIDTH interprets fov as horizontal.
+		cam.keep_aspect = Camera3D.KEEP_WIDTH
+		var proj := Common.get_str(entry, "projection", "perspective").to_lower()
+		if proj == "orthogonal":
+			cam.projection = Camera3D.PROJECTION_ORTHOGONAL
+			cam.size = maxf(0.05, Common.get_num(entry, "ortho_width_m", 5.12))
+		else:
+			cam.projection = Camera3D.PROJECTION_PERSPECTIVE
+			cam.fov = clampf(Common.get_num(entry, "fov_deg", 90.0), 1.0, 179.0)
+		cam.near = maxf(0.001, Common.get_num(entry, "near_clip_m", 0.05))
+		cam.far = maxf(cam.near + 0.1, Common.get_num(entry, "far_clip_m", 4000.0))
+		Common.add_owned_child(container, cam, scene_owner)
+		count += 1
+
+	if count == 0:
+		container.queue_free()
+	return count
+
+
+func _apply_audio(entries, root: Node, scene_owner: Node, options: Dictionary) -> int:
+	if entries == null or not (entries is Array) or entries.is_empty():
+		return 0
+	var container := Node3D.new()
+	container.name = "UnrealAudio"
+	Common.add_owned_child(root, container, scene_owner)
+
+	var json_dir := str(options.get("json_dir", "res://"))
+	var audio_folders := ["res://audio/", json_dir.path_join("audio")]
+	var count := 0
+	for entry in entries:
+		if not (entry is Dictionary):
+			continue
+		var player := AudioStreamPlayer3D.new()
+		player.name = Common.get_str(entry, "name", "Audio")
+		player.transform = Common.get_transform_from_dict(entry.get("godot_transform", {}))
+		player.volume_db = clampf(Common.get_num(entry, "volume_db", 0.0), -80.0, 24.0)
+		player.pitch_scale = clampf(Common.get_num(entry, "pitch_scale", 1.0), 0.01, 4.0)
+		player.max_distance = maxf(0.1, Common.get_num(entry, "attenuation_radius_m", 40.0))
+		player.autoplay = bool(entry.get("auto_play", true))
+		var sound_file := Common.get_str(entry, "sound_file", "")
+		if sound_file != "":
+			var stream_path := ""
+			for folder in audio_folders:
+				var found := Common.find_file_case_insensitive(str(folder), sound_file.get_basename(), [".wav", ".ogg", ".mp3"])
+				if found != "":
+					stream_path = found
+					break
+			if stream_path != "" and stream_path.begins_with("res://") and ResourceLoader.exists(stream_path):
+				var stream = ResourceLoader.load(stream_path)
+				if stream is AudioStream:
+					player.stream = stream as AudioStream
+		var sound_name := Common.get_str(entry, "sound_name", "")
+		if sound_name != "":
+			player.set_meta("unreal_sound_name", sound_name)
+		Common.add_owned_child(container, player, scene_owner)
+		count += 1
+
+	if count == 0:
+		container.queue_free()
+	return count
 
 
 func _find_world_environment(root: Node) -> WorldEnvironment:

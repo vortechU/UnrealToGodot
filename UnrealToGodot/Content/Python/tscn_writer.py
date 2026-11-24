@@ -314,6 +314,9 @@ _UNIT_SCALE = (1.0, 1.0, 1.0)
 STATIC_MESH_CONTAINER = "UnrealStaticMeshes"
 LIGHT_CONTAINER = "UnrealLights"
 DECAL_CONTAINER = "UnrealDecals"
+REFLECTION_PROBE_CONTAINER = "UnrealReflectionProbes"
+CAMERA_CONTAINER = "UnrealCameras"
+AUDIO_CONTAINER = "UnrealAudio"
 
 # Minimum decal projection depth (m), mirroring import_environment.gd's
 # DEFAULT_DECAL_MIN_DEPTH_M -- the two importer paths must build the same Decal.
@@ -579,6 +582,7 @@ class _TscnWriter(object):
         self.models_res = self._norm_res_dir(self.res_paths.get("models", "res://models/"))
         self.textures_res = self._norm_res_dir(self.res_paths.get("textures", "res://textures/"))
         self.terrain_res = self._norm_res_dir(self.res_paths.get("terrain", "res://terrain/"))
+        self.audio_res = self._norm_res_dir(self.res_paths.get("audio", "res://audio/"))
 
         self._token_counter = 0
         self._ext_index = 0
@@ -890,6 +894,15 @@ class _TscnWriter(object):
         if self.options.get("decals"):
             self._build_decals(self._container(root_path, DECAL_CONTAINER,
                                                self.layout.get("decals")))
+        if self.options.get("reflection_probes", True):
+            self._build_reflection_probes(self._container(root_path, REFLECTION_PROBE_CONTAINER,
+                                                          self.layout.get("reflection_probes")))
+        if self.options.get("cameras", True):
+            self._build_cameras(self._container(root_path, CAMERA_CONTAINER,
+                                                self.layout.get("cameras")))
+        if self.options.get("audio", True):
+            self._build_audio(self._container(root_path, AUDIO_CONTAINER,
+                                              self.layout.get("audio")))
         if self.options.get("foliage"):
             self._build_foliage(self._container(root_path, FOLIAGE_CONTAINER,
                                                 self.layout.get("foliage")))
@@ -912,24 +925,47 @@ class _TscnWriter(object):
         return self._add_node(name, "Node3D", root_path)
 
     # --- actors ------------------------------------------------------------------------------
+    def _resolve_folder_parent(self, root_path, folder_path, folder_cache):
+        """Creates or reuses nested identity Node3D folders mirroring Unreal's World Outliner."""
+        clean = str(folder_path or "").replace("\\", "/").strip()
+        if not clean:
+            return root_path
+        parent = root_path
+        key = ""
+        for seg in clean.split("/"):
+            seg = seg.strip()
+            if not seg:
+                continue
+            key = seg if not key else (key + "/" + seg)
+            if key in folder_cache:
+                parent = folder_cache[key]
+            else:
+                parent = self._add_node(seg, "Node3D", parent)
+                folder_cache[key] = parent
+        return parent
+
     def _build_actors(self, scene_root_path):
         meshes_lib = self.layout.get("meshes") or {}
         emit_meta = bool(self.options.get("metadata"))
+        preserve_folders = bool(self.options.get("preserve_folders", True))
         actors = [a for a in (self.layout.get("actors") or [])
                   if isinstance(a, dict) and (a.get("components") or [])]
         # Every mesh actor goes under one container -- see _container().
         root_path = self._container(scene_root_path, STATIC_MESH_CONTAINER, actors)
+        folder_cache = {}
         for actor in actors:
             components = actor.get("components") or []
             actor_name = actor.get("name") or "Actor"
             actor_mat = _transform_dict_to_mat(actor.get("godot_transform"))
             actor_meta = self._actor_metadata_lines(actor) if emit_meta else []
+            actor_parent = (self._resolve_folder_parent(root_path, actor.get("folder_path"), folder_cache)
+                            if preserve_folders and actor.get("folder_path") else root_path)
 
             if len(components) == 1:
-                self._build_single_component_actor(root_path, actor_name, actor_mat,
+                self._build_single_component_actor(actor_parent, actor_name, actor_mat,
                                                    components[0], meshes_lib, actor, actor_meta, emit_meta)
             else:
-                self._build_multi_component_actor(root_path, actor_name, actor_mat,
+                self._build_multi_component_actor(actor_parent, actor_name, actor_mat,
                                                   components, meshes_lib, actor_meta, emit_meta)
 
     def _component_mesh_key(self, comp):
@@ -951,7 +987,14 @@ class _TscnWriter(object):
             return
 
         ext_id = self._register_ext("PackedScene", res_path)
-        collision = (meshes_lib.get(mesh_key) or {}).get("collision")
+        want_collision = comp.get("collision_enabled", True) is not False
+        has_spline = isinstance(comp.get("spline_mesh"), dict) and bool(comp.get("spline_mesh"))
+        collision = (meshes_lib.get(mesh_key) or {}).get("collision") if (want_collision and not has_spline) else None
+        extra_meta = self._mesh_extra_metadata_lines(mesh_key, meshes_lib)
+        if has_spline:
+            extra_meta.append("metadata/unreal_spline_mesh = true")
+            _warn("actor '%s': spline mesh deformation cannot be baked into a static .tscn; "
+                  "use the Godot addon importer for deformed spline geometry." % actor_name)
 
         # Re-seat the glTF mesh from the glTF axis order into the placement
         # convention (see _apply_mesh_axis_fix). Applied at the body, it carries
@@ -964,12 +1007,13 @@ class _TscnWriter(object):
             # applied to the shapes, which the mesh instance under it takes instead.
             scale = _physics_body_scale(mesh_place)
             body_props = ["transform = " + _mat_to_transform3d(_physics_body_mat(mesh_place))]
+            if comp.get("visible") is False:
+                body_props.append("visible = false")
             body_path = self._add_node(actor_name, "StaticBody3D", root_path,
                                        props=body_props, metadata=actor_meta)
             self._emit_collision(body_path, collision, scale)
             inst_props = ["transform = " + _mat_to_transform3d(_scale_diag(scale))]
-            inst_meta = (self._component_metadata_lines(comp) if emit_meta else []) \
-                + self._mesh_extra_metadata_lines(mesh_key, meshes_lib)
+            inst_meta = (self._component_metadata_lines(comp) if emit_meta else []) + extra_meta
             self._add_node(_mesh_node_name(comp, mesh_key), None, body_path,
                            instance_id=ext_id, props=inst_props, metadata=inst_meta)
         else:
@@ -977,8 +1021,9 @@ class _TscnWriter(object):
             # Merge actor + component tags into a single metadata/unreal_tags line
             # so Godot never sees duplicate keys in the same [node] block.
             props = ["transform = " + _mat_to_transform3d(mesh_place)]
-            meta = (self._actor_metadata_lines(actor, extra_tags=comp.get("tags")) if emit_meta else []) \
-                + self._mesh_extra_metadata_lines(mesh_key, meshes_lib)
+            if comp.get("visible") is False:
+                props.append("visible = false")
+            meta = (self._actor_metadata_lines(actor, extra_tags=comp.get("tags")) if emit_meta else []) + extra_meta
             self._add_node(actor_name, None, root_path, instance_id=ext_id,
                            props=props, metadata=meta)
 
@@ -1278,6 +1323,76 @@ class _TscnWriter(object):
                 props.append('%s = ExtResource("%s")' % (godot_prop, tid))
 
             self._add_node(name, "Decal", root_path, props=props)
+
+    # --- reflection probes / cameras / audio -------------------------------------------------
+    def _build_reflection_probes(self, root_path):
+        for entry in self.layout.get("reflection_probes") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name") or "ReflectionProbe"
+            mat = _transform_dict_to_mat(entry.get("godot_transform"))
+            sz = entry.get("size_m") or [10.0, 10.0, 10.0]
+            size = [max(0.1, abs(_num(sz[i], 10.0)) if len(sz) > i else 10.0) for i in range(3)]
+            props = [
+                "transform = " + _mat_to_transform3d(mat),
+                "update_mode = 0",
+                "intensity = " + _f(_clamp(_num(entry.get("intensity"), 1.0), 0.0, 16.0)),
+                "size = " + _vec3_literal(size),
+                "box_projection = %s" % ("true" if entry.get("box_projection", True) else "false"),
+            ]
+            if entry.get("visible") is False:
+                props.append("visible = false")
+            meta = ['metadata/unreal_probe_shape = "%s"' % _escape_string(entry.get("shape") or "box")]
+            self._add_node(name, "ReflectionProbe", root_path, props=props, metadata=meta)
+
+    def _build_cameras(self, root_path):
+        for entry in self.layout.get("cameras") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name") or "Camera"
+            mat = _transform_dict_to_mat(entry.get("godot_transform"))
+            proj = str(entry.get("projection") or "perspective").lower()
+            near = max(0.001, _num(entry.get("near_clip_m"), 0.05))
+            far = max(near + 0.1, _num(entry.get("far_clip_m"), 4000.0))
+            # keep_aspect = 0 (KEEP_WIDTH) matches Unreal's horizontal FieldOfView.
+            props = [
+                "transform = " + _mat_to_transform3d(mat),
+                "keep_aspect = 0",
+            ]
+            if proj == "orthogonal":
+                props.append("projection = 1")
+                props.append("size = " + _f(max(0.05, _num(entry.get("ortho_width_m"), 5.12))))
+            else:
+                props.append("fov = " + _f(_clamp(_num(entry.get("fov_deg"), 90.0), 1.0, 179.0)))
+            props.append("near = " + _f(near))
+            props.append("far = " + _f(far))
+            self._add_node(name, "Camera3D", root_path, props=props)
+
+    def _build_audio(self, root_path):
+        for entry in self.layout.get("audio") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name") or "Audio"
+            mat = _transform_dict_to_mat(entry.get("godot_transform"))
+            props = [
+                "transform = " + _mat_to_transform3d(mat),
+                "volume_db = " + _f(_clamp(_num(entry.get("volume_db"), 0.0), -80.0, 24.0)),
+                "pitch_scale = " + _f(_clamp(_num(entry.get("pitch_scale"), 1.0), 0.01, 4.0)),
+                "max_distance = " + _f(max(0.1, _num(entry.get("attenuation_radius_m"), 40.0))),
+            ]
+            if entry.get("auto_play", True):
+                props.append("autoplay = true")
+            sound_file = entry.get("sound_file")
+            if sound_file:
+                stem = os.path.splitext(str(sound_file))[0]
+                res_path = self._resolve_existing_res(self.audio_res, stem, (".wav", ".ogg", ".mp3"))
+                if res_path:
+                    aid = self._register_ext("AudioStream", res_path)
+                    props.append('stream = ExtResource("%s")' % aid)
+            meta = []
+            if entry.get("sound_name"):
+                meta.append('metadata/unreal_sound_name = "%s"' % _escape_string(entry.get("sound_name")))
+            self._add_node(name, "AudioStreamPlayer3D", root_path, props=props, metadata=meta)
 
     # --- foliage -----------------------------------------------------------------------------
     def _build_foliage(self, root_path):

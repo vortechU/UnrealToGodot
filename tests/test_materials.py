@@ -1870,6 +1870,149 @@ check("screen_size_to_switch_distance_m matches 75-deg FOV formula",
       abs(EL.screen_size_to_switch_distance_m(2.0, 0.5) - 5.213) < 0.01,
       EL.screen_size_to_switch_distance_m(2.0, 0.5))
 
+print("\n=== 14. Phase 3: render flags, Outliner folders, splines, probes, cameras, audio ===")
+
+
+class _FakeRenderComp:
+    def __init__(self, visible=True, hidden_in_game=False, cast_shadow=True,
+                 collision="QUERY_AND_PHYSICS", max_draw=0.0):
+        self._p = {
+            "visible": visible, "hidden_in_game": hidden_in_game,
+            "cast_shadow": cast_shadow, "ld_max_draw_distance": max_draw,
+        }
+        self._col = _EnumVal(collision)
+
+    def get_editor_property(self, key):
+        return self._p.get(key)
+
+    def get_collision_enabled(self):
+        return self._col
+
+
+rf_off = EL.extract_component_render_flags(
+    _FakeRenderComp(visible=True, hidden_in_game=True, cast_shadow=False,
+                    collision="NO_COLLISION", max_draw=4500.0))
+check("hidden_in_game + NoCollision + shadowless + max_draw_distance extracted",
+      rf_off["visible"] is False and rf_off["cast_shadow"] is False
+      and rf_off["collision_enabled"] is False
+      and abs(rf_off["max_draw_distance_m"] - 45.0) < 1e-6, rf_off)
+
+folder_actor = types.SimpleNamespace(get_folder_path=lambda: "\\Architecture\\Interior/")
+check("Outliner folder path normalized",
+      EL.extract_actor_folder_path(folder_actor) == "Architecture/Interior")
+
+u.SplineMeshComponent = type("SplineMeshComponent", (), {})
+
+
+class _FakeSplineComp(u.SplineMeshComponent):
+    def __init__(self):
+        self._params = types.SimpleNamespace(
+            start_pos=_Vec(0.0, 0.0, 0.0), start_tangent=_Vec(400.0, 0.0, 0.0),
+            start_scale=types.SimpleNamespace(x=1.0, y=1.0), start_roll=0.0,
+            end_pos=_Vec(400.0, 0.0, 200.0), end_tangent=_Vec(400.0, 0.0, 0.0),
+            end_scale=types.SimpleNamespace(x=1.0, y=1.0), end_roll=0.0,
+        )
+        self._params.get_editor_property = lambda k: getattr(self._params, k)
+        self._p = {
+            "spline_params": self._params,
+            "forward_axis": _EnumVal("X"),
+            "spline_up_dir": _Vec(0.0, 0.0, 1.0),
+        }
+
+    def get_editor_property(self, key):
+        return self._p.get(key)
+
+
+sp = EL.extract_spline_mesh_params(_FakeSplineComp())
+check("SplineMeshComponent converts endpoints to glTF (x, z, y) meters",
+      sp is not None and sp["end_pos"] == [4.0, 2.0, 0.0]
+      and sp["forward_axis"] == "x" and sp["up_dir"] == [0.0, 1.0, 0.0], sp)
+
+# Reflection probes, cameras, and audio components
+u.BoxReflectionCaptureComponent = type("BoxReflectionCaptureComponent", (), {})
+u.SphereReflectionCaptureComponent = type("SphereReflectionCaptureComponent", (), {})
+u.CameraComponent = type("CameraComponent", (), {})
+u.AudioComponent = type("AudioComponent", (), {})
+u.SoundWave = type("SoundWave", (), {})
+
+
+class _FakeBoxProbeComp(u.BoxReflectionCaptureComponent):
+    def get_editor_property(self, k):
+        return {"box_extent": _Vec(400.0, 600.0, 300.0), "box_transition_distance": 100.0,
+                "brightness": 1.5, "visible": True, "hidden_in_game": False,
+                "is_editor_only": False}.get(k)
+
+    def get_world_transform(self):
+        return _FakeTransform()
+
+
+class _FakeCamComp(u.CameraComponent):
+    def get_editor_property(self, k):
+        return {"projection_mode": _EnumVal("PERSPECTIVE"), "field_of_view": 85.0,
+                "ortho_width": 512.0, "ortho_near_clip_plane": 10.0,
+                "ortho_far_clip_plane": 200000.0, "aspect_ratio": 1.7777,
+                "is_editor_only": False}.get(k)
+
+    def get_world_transform(self):
+        return _FakeTransform()
+
+
+class _FakeSoundWave(u.SoundWave):
+    def get_name(self):
+        return "S_Wind"
+
+    def get_editor_property(self, k):
+        return {"looping": True}.get(k)
+
+
+_fake_sw = _FakeSoundWave()
+
+
+class _FakeAudioComp(u.AudioComponent):
+    def get_editor_property(self, k):
+        att = types.SimpleNamespace(falloff_distance=3100.0, attenuation_shape_extents=_Vec(400.0, 0.0, 0.0))
+        att.get_editor_property = lambda key: getattr(att, key)
+        return {"sound": _fake_sw, "volume_multiplier": 0.5, "pitch_multiplier": 1.1,
+                "auto_activate": True, "allow_spatialization": True,
+                "attenuation_overrides": att, "is_editor_only": False}.get(k)
+
+    def get_world_transform(self):
+        return _FakeTransform()
+
+
+class _FakeP3Actor:
+    def __init__(self, label, comp_map):
+        self._label = label
+        self._map = comp_map
+
+    def get_actor_label(self):
+        return self._label
+
+    def get_actor_transform(self):
+        return _FakeTransform()
+
+    def get_components_by_class(self, cls):
+        return self._map.get(cls, [])
+
+
+p3_sounds = set()
+p3_env = EE.collect_environment([
+    _FakeP3Actor("BoxProbe_1", {u.BoxReflectionCaptureComponent: [_FakeBoxProbeComp()]}),
+    _FakeP3Actor("ShowcaseCam", {u.CameraComponent: [_FakeCamComp()]}),
+    _FakeP3Actor("AmbientWind", {u.AudioComponent: [_FakeAudioComp()]}),
+], set(), collected_sounds=p3_sounds)
+check("reflection probe collected with Godot-swizzled full size",
+      len(p3_env["reflection_probes"]) == 1
+      and p3_env["reflection_probes"][0]["size_m"] == [12.0, 6.0, 8.0]
+      and p3_env["reflection_probes"][0]["box_projection"] is True, p3_env["reflection_probes"])
+check("camera collected with horizontal FOV and clip planes",
+      len(p3_env["cameras"]) == 1 and abs(p3_env["cameras"][0]["fov_deg"] - 85.0) < 1e-6,
+      p3_env["cameras"])
+check("audio collected with dB conversion, attenuation radius, and SoundWave queued",
+      len(p3_env["audio"]) == 1 and abs(p3_env["audio"][0]["volume_db"] - (-6.021)) < 0.05
+      and abs(p3_env["audio"][0]["attenuation_radius_m"] - 35.0) < 0.01
+      and _fake_sw in p3_sounds, p3_env["audio"])
+
 print("\n" + "=" * 60)
 if FAIL:
     print("FAILURES (%d): %s" % (len(FAIL), FAIL))

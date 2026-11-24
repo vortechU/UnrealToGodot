@@ -101,6 +101,7 @@ DecalActor, so Blueprint props with decal components export too.
 """
 
 import math
+import os
 
 import unreal
 
@@ -1351,18 +1352,237 @@ def _component_world_transform(actor, comp):
 
 
 # ---------------------------------------------------------------------------
+# Reflection Captures (BoxReflectionCapture / SphereReflectionCapture)
+# ---------------------------------------------------------------------------
+
+def _build_reflection_probe_entries(actor):
+    """Collects BoxReflectionCaptureComponent and SphereReflectionCaptureComponent
+    from an actor (including Blueprint props)."""
+    entries = []
+    box_cls = getattr(unreal, "BoxReflectionCaptureComponent", None)
+    sph_cls = getattr(unreal, "SphereReflectionCaptureComponent", None)
+    comps = []
+    for cls, shape in ((box_cls, "box"), (sph_cls, "sphere")):
+        if cls is None:
+            continue
+        try:
+            for c in (actor.get_components_by_class(cls) or []):
+                comps.append((c, shape))
+        except Exception:
+            continue
+
+    label = _safe_label(actor)
+    for comp, shape in comps:
+        if comp is None or _b(ue2g_common.safe_get_prop(comp, "is_editor_only", False), False):
+            continue
+        name = label if len(comps) == 1 else "{}_{}".format(label, ue2g_common.safe_get_name(comp))
+        try:
+            godot_transform = ue2g_common.unreal_to_godot_transform(_component_world_transform(actor, comp))
+            if shape == "box":
+                # UE BoxTransitionDistance (cm) + actor/component extents; BoxReflectionCaptureComponent
+                # has a default 1000cm (10m) box scaled by component scale, or box_extent if exposed.
+                box_ext = ue2g_common.safe_get_prop(comp, "box_extent", None)
+                if box_ext is not None:
+                    size_m = [
+                        max(0.1, abs(_f(box_ext.y, 100.0)) * 2.0 * ue2g_common.CM_TO_M),
+                        max(0.1, abs(_f(box_ext.z, 100.0)) * 2.0 * ue2g_common.CM_TO_M),
+                        max(0.1, abs(_f(box_ext.x, 100.0)) * 2.0 * ue2g_common.CM_TO_M),
+                    ]
+                else:
+                    # UE's UBoxReflectionCaptureComponent box is a 2000cm cube (half-extent 1000cm)
+                    # scaled by component world scale; fold scale into size_m and reset scale to 1.
+                    sc = godot_transform.get("scale") or [1.0, 1.0, 1.0]
+                    size_m = [max(0.1, abs(_f(sc[i], 1.0)) * 20.0) for i in range(3)]
+                    godot_transform["scale"] = [1.0, 1.0, 1.0]
+                blend_m = max(0.0, _f(ue2g_common.safe_get_prop(comp, "box_transition_distance", 100.0), 100.0) * ue2g_common.CM_TO_M)
+                box_proj = True
+            else:
+                radius_cm = _f(ue2g_common.safe_get_prop(comp, "influence_radius", 3000.0), 3000.0)
+                diam_m = max(0.2, abs(radius_cm) * 2.0 * ue2g_common.CM_TO_M)
+                size_m = [diam_m, diam_m, diam_m]
+                blend_m = 0.0
+                box_proj = False
+
+            brightness = max(0.0, _f(ue2g_common.safe_get_prop(comp, "brightness", 1.0), 1.0))
+            visible = (_b(ue2g_common.safe_get_prop(comp, "visible", True), True)
+                       and not _b(ue2g_common.safe_get_prop(comp, "hidden_in_game", False), False))
+            entries.append({
+                "name": name,
+                "shape": shape,
+                "godot_transform": godot_transform,
+                "size_m": size_m,
+                "intensity": brightness,
+                "box_projection": box_proj,
+                "blend_distance_m": blend_m,
+                "visible": visible,
+            })
+        except Exception as e:
+            _log_actor_warning(actor, "failed to build reflection probe entry", e)
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# Cameras (CameraComponent / CineCameraComponent)
+# ---------------------------------------------------------------------------
+
+def _build_camera_entries(actor):
+    """Collects CameraComponent (including CineCameraComponent) from an actor."""
+    cam_cls = getattr(unreal, "CameraComponent", None)
+    if cam_cls is None:
+        return []
+    try:
+        comps = list(actor.get_components_by_class(cam_cls) or [])
+    except Exception:
+        return []
+    label = _safe_label(actor)
+    entries = []
+    for comp in comps:
+        if comp is None or _b(ue2g_common.safe_get_prop(comp, "is_editor_only", False), False):
+            continue
+        name = label if len(comps) == 1 else "{}_{}".format(label, ue2g_common.safe_get_name(comp))
+        try:
+            proj_raw = ue2g_common.safe_get_prop(comp, "projection_mode", None)
+            proj_str = str(getattr(proj_raw, "name", proj_raw) or "PERSPECTIVE").upper()
+            projection = "orthogonal" if ("ORTHO" in proj_str or proj_str == "1") else "perspective"
+            fov_deg = max(1.0, min(179.0, _f(ue2g_common.safe_get_prop(comp, "field_of_view", 90.0), 90.0)))
+            ortho_width_m = max(0.05, _f(ue2g_common.safe_get_prop(comp, "ortho_width", 512.0), 512.0) * ue2g_common.CM_TO_M)
+            near_cm = _f(ue2g_common.safe_get_prop(comp, "ortho_near_clip_plane", 10.0), 10.0)
+            far_cm = _f(ue2g_common.safe_get_prop(comp, "ortho_far_clip_plane", 100000.0), 100000.0)
+            aspect = max(0.1, _f(ue2g_common.safe_get_prop(comp, "aspect_ratio", 1.777778), 1.777778))
+            entries.append({
+                "name": name,
+                "godot_transform": ue2g_common.unreal_to_godot_transform(_component_world_transform(actor, comp)),
+                "projection": projection,
+                "fov_deg": fov_deg,
+                "ortho_width_m": ortho_width_m,
+                "near_clip_m": max(0.01, near_cm * ue2g_common.CM_TO_M) if near_cm > 0.0 else 0.05,
+                "far_clip_m": max(1.0, far_cm * ue2g_common.CM_TO_M) if far_cm > 0.0 else 4000.0,
+                "aspect_ratio": aspect,
+            })
+        except Exception as e:
+            _log_actor_warning(actor, "failed to build camera entry", e)
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# Spatial Audio (AudioComponent / AmbientSound)
+# ---------------------------------------------------------------------------
+
+def _volume_linear_to_db(mult):
+    m = max(0.0, _f(mult, 1.0))
+    if m <= 1e-5:
+        return -80.0
+    return round(20.0 * math.log10(m), 3)
+
+
+def _build_audio_entries(actor, collected_sounds=None):
+    """Collects AudioComponent (AmbientSound actors + Blueprint audio components)."""
+    aud_cls = getattr(unreal, "AudioComponent", None)
+    if aud_cls is None:
+        return []
+    try:
+        comps = list(actor.get_components_by_class(aud_cls) or [])
+    except Exception:
+        return []
+    label = _safe_label(actor)
+    entries = []
+    sound_wave_cls = getattr(unreal, "SoundWave", None)
+    for comp in comps:
+        if comp is None or _b(ue2g_common.safe_get_prop(comp, "is_editor_only", False), False):
+            continue
+        name = label if len(comps) == 1 else "{}_{}".format(label, ue2g_common.safe_get_name(comp))
+        try:
+            sound = ue2g_common.safe_get_prop(comp, "sound", None)
+            sound_name = None
+            sound_file = None
+            looping = False
+            if sound is not None:
+                sound_name = ue2g_common.sanitize_name(ue2g_common.safe_get_name(sound))
+                if sound_wave_cls is not None and isinstance(sound, sound_wave_cls):
+                    sound_file = "%s.wav" % sound_name
+                    looping = _b(ue2g_common.safe_get_prop(sound, "looping", False), False)
+                    if collected_sounds is not None:
+                        collected_sounds.add(sound)
+
+            vol_mult = _f(ue2g_common.safe_get_prop(comp, "volume_multiplier", 1.0), 1.0)
+            pitch = max(0.01, _f(ue2g_common.safe_get_prop(comp, "pitch_multiplier", 1.0), 1.0))
+            auto_play = _b(ue2g_common.safe_get_prop(comp, "auto_activate", True), True)
+            is_spatial = _b(ue2g_common.safe_get_prop(comp, "allow_spatialization", True), True)
+
+            att_radius_m = 40.0
+            att_settings = ue2g_common.safe_get_prop(comp, "attenuation_overrides", None)
+            if att_settings is None:
+                att_asset = ue2g_common.safe_get_prop(comp, "attenuation_settings", None)
+                if att_asset is not None:
+                    att_settings = ue2g_common.safe_get_prop(att_asset, "attenuation", None)
+            if att_settings is not None:
+                falloff = _f(ue2g_common.safe_get_prop(att_settings, "falloff_distance", 3600.0), 3600.0)
+                ext = ue2g_common.safe_get_prop(att_settings, "attenuation_shape_extents", None)
+                inner = _f(ext.x, 400.0) if ext is not None else 400.0
+                att_radius_m = max(0.1, (inner + falloff) * ue2g_common.CM_TO_M)
+
+            entries.append({
+                "name": name,
+                "godot_transform": ue2g_common.unreal_to_godot_transform(_component_world_transform(actor, comp)),
+                "sound_name": sound_name,
+                "sound_file": sound_file,
+                "volume_db": _volume_linear_to_db(vol_mult),
+                "pitch_scale": pitch,
+                "attenuation_radius_m": round(att_radius_m, 3),
+                "is_spatialized": is_spatial,
+                "auto_play": auto_play,
+                "looping": looping,
+            })
+        except Exception as e:
+            _log_actor_warning(actor, "failed to build audio entry", e)
+    return entries
+
+
+def export_sound_waves(sounds, audio_dir):
+    """Exports collected Unreal SoundWave assets to <audio_dir>/<name>.wav."""
+    if not sounds:
+        return {"exported": [], "failed": []}
+    os.makedirs(audio_dir, exist_ok=True)
+    tasks = []
+    for snd in sounds:
+        if snd is None:
+            continue
+        name = ue2g_common.sanitize_name(ue2g_common.safe_get_name(snd))
+        filename = os.path.join(audio_dir, "%s.wav" % name)
+        task = unreal.AssetExportTask()
+        task.object = snd
+        task.filename = filename
+        task.automated = True
+        task.prompt = False
+        task.replace_identical = True
+        tasks.append((name, filename, task))
+    result = {"exported": [], "failed": []}
+    if tasks:
+        unreal.Exporter.run_asset_export_tasks([t[2] for t in tasks])
+        for name, filename, _t in tasks:
+            if os.path.isfile(filename):
+                result["exported"].append(name)
+            else:
+                result["failed"].append(name)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def collect_environment(all_actors, collected_textures,
-                        include_lights=True, include_decals=True):
+                        include_lights=True, include_decals=True,
+                        include_reflection_probes=True,
+                        include_cameras=True,
+                        include_audio=True,
+                        collected_sounds=None):
     """
     Scans all_actors and returns:
         {"lights": [...], "post_process": [...], "height_fog": {...} | None,
-         "sky_light": {...} | None, "has_sky_atmosphere": bool, "decals": [...]}
+         "sky_light": {...} | None, "has_sky_atmosphere": bool, "decals": [...],
+         "reflection_probes": [...], "cameras": [...], "audio": [...]}
 
-    include_lights / include_decals allow callers to skip disabled categories so
-    decal textures are not added to collected_textures when decals are off.
     Never raises and never shows dialogs: failures are logged via
     unreal.log_warning and the affected actor/feature is simply skipped.
     """
@@ -1373,6 +1593,9 @@ def collect_environment(all_actors, collected_textures,
         "sky_light": None,
         "has_sky_atmosphere": False,
         "decals": [],
+        "reflection_probes": [],
+        "cameras": [],
+        "audio": [],
     }
 
     try:
@@ -1384,13 +1607,17 @@ def collect_environment(all_actors, collected_textures,
                 if actor is None:
                     continue
 
-                # Decals and lights first and unconditionally: both are
-                # components, not actor classes, so keying off
-                # unreal.DecalActor / unreal.PointLight dropped every one of
-                # them riding on a Blueprint prop -- and every branch below
-                # continues, which would have kept skipping them.
+                # Component-level scans run BEFORE any actor-class branch that
+                # continues, so Blueprint props carrying decals, lights, probes,
+                # cameras, or audio components are never dropped.
                 if include_decals:
                     result["decals"].extend(_build_decal_entries(actor, collected_textures))
+                if include_reflection_probes:
+                    result["reflection_probes"].extend(_build_reflection_probe_entries(actor))
+                if include_cameras:
+                    result["cameras"].extend(_build_camera_entries(actor))
+                if include_audio:
+                    result["audio"].extend(_build_audio_entries(actor, collected_sounds))
                 if not include_lights:
                     continue
                 result["lights"].extend(_build_light_entries(actor))

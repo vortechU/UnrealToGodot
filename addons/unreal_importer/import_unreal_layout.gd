@@ -44,6 +44,11 @@ const DEFAULT_IMPORT_OPTIONS := {
 	"apply_metadata": true,
 	"apply_lods": true,
 	"apply_skeletal_physics": true,
+	"apply_reflection_probes": true,
+	"apply_cameras": true,
+	"apply_audio": true,
+	"apply_spline_meshes": true,
+	"preserve_folders": true,
 	"flip_normal_green": true,
 	"save_external_materials": false,
 	"materials_folder": "res://materials/",
@@ -56,6 +61,7 @@ var USE_GDSCRIPT_TRANSFORM_CONVERSION: bool = false
 
 const ImportReport = preload("res://addons/unreal_importer/import_report.gd")
 const TextureLimit = preload("res://addons/unreal_importer/texture_import_limit.gd")
+const SplineMeshHelper = preload("res://addons/unreal_importer/import_spline_mesh.gd")
 
 # Material sharing cache
 var material_cache: Dictionary = {}
@@ -179,6 +185,8 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 	# below it moves. Every actor with components produces a node or a placeholder,
 	# so this is created exactly when it would not be left empty.
 	var mesh_root: Node = active_scene_root
+	var folder_nodes: Dictionary = {}
+	var preserve_folders := bool(import_options.get("preserve_folders", true))
 	for actor_data in actors:
 		if not (actor_data is Dictionary):
 			continue
@@ -201,6 +209,12 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 		
 		if components.size() == 0:
 			continue # No meshes to instance
+
+		var actor_parent: Node = mesh_root
+		if preserve_folders:
+			var folder_path := Common.get_str(actor_data, "folder_path", "")
+			if folder_path != "":
+				actor_parent = _resolve_folder_parent(mesh_root, folder_path, folder_nodes)
 			
 		# Resolve the parent actor's transform
 		var actor_transform: Transform3D = Transform3D.IDENTITY
@@ -236,14 +250,17 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 			var gltf_path := find_model_for(models_folder, mesh_key, mesh_name)
 			if gltf_path == "":
 				missing_meshes[mesh_key] = true
-				create_placeholder(mesh_root, actor_name, comp_transform, mesh_key)
+				create_placeholder(actor_parent, actor_name, comp_transform, mesh_key)
 				continue
 
 			# Collision shapes are defined in mesh-local space, so the physics body
 			# sits at the component's (axis-corrected) world transform and the mesh
 			# sits under it carrying only whatever scale the body could not keep,
 			# which is nothing at all for a uniformly scaled prop.
-			var physics_body = setup_physics_body(mesh_root, actor_name, mesh_place, mesh_key, meshes_lib)
+			var want_collision := bool(comp_data.get("collision_enabled", true))
+			var spline_raw = comp_data.get("spline_mesh")
+			var has_spline := bool(import_options.get("apply_spline_meshes", true)) and (spline_raw is Dictionary) and not (spline_raw as Dictionary).is_empty()
+			var physics_body = setup_physics_body(actor_parent, actor_name, mesh_place, mesh_key, meshes_lib) if (want_collision and not has_spline) else null
 			var instanced_mesh = instance_gltf(gltf_path)
 
 			if instanced_mesh:
@@ -251,6 +268,8 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 				var overrides_raw = comp_data.get("material_overrides", [])
 				var overrides: Array = overrides_raw if overrides_raw is Array else []
 				apply_materials_to_instance(instanced_mesh, mesh_key, overrides, meshes_lib)
+				if has_spline:
+					SplineMeshHelper.deform_instance(instanced_mesh, spline_raw as Dictionary)
 
 				if physics_body:
 					# Physics body already carries actor * component, minus any scale
@@ -267,23 +286,24 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					# Direct visual-only mesh instance at the component's world
 					# transform (axis-corrected, same as the physics-body case).
 					instanced_mesh.name = actor_name
-					mesh_root.add_child(instanced_mesh)
+					actor_parent.add_child(instanced_mesh)
 					instanced_mesh.owner = active_scene_root
 					_set_owner_recursive(instanced_mesh, active_scene_root)
 					instanced_mesh.transform = mesh_place
 
-				if bool(import_options.get("apply_lods", true)):
+				var target_node: Node = physics_body if physics_body else instanced_mesh
+				if bool(import_options.get("apply_lods", true)) and not has_spline:
 					var lod_parent: Node = physics_body if physics_body else instanced_mesh
 					var lod_xform: Transform3D = instanced_mesh.transform if physics_body else Transform3D.IDENTITY
 					if _apply_lod_chain(instanced_mesh, lod_parent, lod_xform, mesh_key, mesh_name, overrides, meshes_lib) > 0:
 						lod_chains_wired += 1
+				_apply_component_render_flags(target_node, instanced_mesh, comp_data)
 				if bool(import_options.get("apply_skeletal_physics", true)) and skel_physics_helper:
 					skel_physics_bones += int(skel_physics_helper.attach_to_instance(
 						instanced_mesh, mesh_key, models_folder, active_scene_root, meshes_lib))
 
 				imported_count += 1
 				if gameplay_helper:
-					var target_node: Node = physics_body if physics_body else instanced_mesh
 					gameplay_helper.apply_actor_metadata(target_node, actor_data, import_options)
 					if gameplay_helper.has_method("apply_component_metadata"):
 						gameplay_helper.apply_component_metadata(instanced_mesh if physics_body else target_node, comp_data, import_options)
@@ -294,7 +314,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 			# Multi-mesh Blueprint actor
 			var actor_node := Node3D.new()
 			actor_node.name = actor_name
-			mesh_root.add_child(actor_node)
+			actor_parent.add_child(actor_node)
 			actor_node.owner = active_scene_root
 			# A scale on the actor is INHERITED by the bodies beneath it, where Jolt
 			# would hit it again -- stripping it at the body would achieve nothing.
@@ -327,13 +347,18 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					create_placeholder(actor_node, comp_name, comp_transform, mesh_key)
 					continue
 
-				var physics_body = setup_physics_body(actor_node, comp_name, mesh_place, mesh_key, meshes_lib)
+				var want_collision := bool(comp_data.get("collision_enabled", true))
+				var spline_raw = comp_data.get("spline_mesh")
+				var has_spline := bool(import_options.get("apply_spline_meshes", true)) and (spline_raw is Dictionary) and not (spline_raw as Dictionary).is_empty()
+				var physics_body = setup_physics_body(actor_node, comp_name, mesh_place, mesh_key, meshes_lib) if (want_collision and not has_spline) else null
 				var instanced_mesh = instance_gltf(gltf_path)
 				if instanced_mesh:
 					# Apply materials to mesh instance
 					var overrides_raw = comp_data.get("material_overrides", [])
 					var overrides: Array = overrides_raw if overrides_raw is Array else []
 					apply_materials_to_instance(instanced_mesh, mesh_key, overrides, meshes_lib)
+					if has_spline:
+						SplineMeshHelper.deform_instance(instanced_mesh, spline_raw as Dictionary)
 					
 					if physics_body:
 						instanced_mesh.name = mesh_name if mesh_name != "" else (mesh_key if mesh_key != "" else "Mesh")
@@ -350,17 +375,19 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 						_set_owner_recursive(instanced_mesh, active_scene_root)
 						instanced_mesh.transform = mesh_place
 
-					if bool(import_options.get("apply_lods", true)):
+					var comp_target: Node = physics_body if physics_body else instanced_mesh
+					if bool(import_options.get("apply_lods", true)) and not has_spline:
 						var lod_parent: Node = physics_body if physics_body else instanced_mesh
 						var lod_xform: Transform3D = instanced_mesh.transform if physics_body else Transform3D.IDENTITY
 						if _apply_lod_chain(instanced_mesh, lod_parent, lod_xform, mesh_key, mesh_name, overrides, meshes_lib) > 0:
 							lod_chains_wired += 1
+					_apply_component_render_flags(comp_target, instanced_mesh, comp_data)
 					if bool(import_options.get("apply_skeletal_physics", true)) and skel_physics_helper:
 						skel_physics_bones += int(skel_physics_helper.attach_to_instance(
 							instanced_mesh, mesh_key, models_folder, active_scene_root, meshes_lib))
 
 					if gameplay_helper and gameplay_helper.has_method("apply_component_metadata"):
-						gameplay_helper.apply_component_metadata(physics_body if physics_body else instanced_mesh, comp_data, import_options)
+						gameplay_helper.apply_component_metadata(comp_target, comp_data, import_options)
 				else:
 					if physics_body:
 						physics_body.queue_free()
@@ -897,6 +924,47 @@ func _find_mesh_instances_recursive(node: Node, list: Array[MeshInstance3D]) -> 
 		list.append(node)
 	for child in node.get_children():
 		_find_mesh_instances_recursive(child, list)
+
+
+func _resolve_folder_parent(root_container: Node, folder_path: String, cache: Dictionary) -> Node:
+	"""Creates or reuses nested identity Node3D folders mirroring Unreal's World Outliner."""
+	var clean := folder_path.replace("\\", "/").strip_edges()
+	var parts := clean.split("/", false)
+	var parent: Node = root_container
+	var key := ""
+	for seg in parts:
+		var seg_clean := str(seg).strip_edges()
+		if seg_clean == "":
+			continue
+		key = seg_clean if key == "" else (key + "/" + seg_clean)
+		if cache.has(key):
+			parent = cache[key]
+		else:
+			var folder_node := Node3D.new()
+			folder_node.name = seg_clean
+			Common.add_owned_child(parent, folder_node, active_scene_root)
+			cache[key] = folder_node
+			parent = folder_node
+	return parent
+
+
+func _apply_component_render_flags(target_node: Node, instanced_mesh: Node, comp_data: Dictionary) -> void:
+	"""Applies per-component visibility, shadow casting, and max draw distance."""
+	if comp_data.has("visible") and not bool(comp_data.get("visible", true)):
+		if target_node is Node3D:
+			(target_node as Node3D).visible = false
+	var cast_shadow := bool(comp_data.get("cast_shadow", true))
+	var max_draw = comp_data.get("max_draw_distance_m")
+	var has_max_draw: bool = (max_draw is float or max_draw is int) and float(max_draw) > 0.0
+	if not cast_shadow or has_max_draw:
+		var instances: Array[MeshInstance3D] = []
+		_find_mesh_instances_recursive(target_node if target_node != null else instanced_mesh, instances)
+		for mi in instances:
+			if not cast_shadow:
+				mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			# Only set visibility_range_end when no LOD band already capped it.
+			if has_max_draw and absf(mi.visibility_range_end) < 1e-4:
+				mi.visibility_range_end = float(max_draw)
 
 
 func _set_visibility_range_recursive(node: Node, range_begin: float, range_end: float) -> void:

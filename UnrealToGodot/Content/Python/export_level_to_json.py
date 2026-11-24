@@ -33,6 +33,9 @@ DEFAULT_EXPORT_OPTIONS = {
     "foliage": True,
     "navigation": True,
     "metadata": True,
+    "reflection_probes": True,
+    "cameras": True,
+    "audio": True,
     "write_tscn": False,
     "tscn_scene_name": "",
     # Landscape CPU-sampling grid caps. They only bite when Unreal's GPU
@@ -984,6 +987,148 @@ def _expand_instanced_component(foliage_mod, comp, comp_name, mesh_key, mesh_nam
     return placements
 
 
+def extract_component_render_flags(comp, actor=None):
+    """Reads per-component visibility, shadow casting, collision enabled, and
+    max draw distance from a StaticMeshComponent / SkeletalMeshComponent."""
+    comp_vis = bool(ue2g_common.safe_get_prop(comp, "visible", True))
+    comp_hidden = bool(ue2g_common.safe_get_prop(comp, "hidden_in_game", False))
+    actor_hidden = False
+    if actor is not None:
+        try:
+            actor_hidden = bool(actor.is_hidden_ed()) if hasattr(actor, "is_hidden_ed") else False
+        except Exception:
+            actor_hidden = False
+        if not actor_hidden:
+            actor_hidden = bool(ue2g_common.safe_get_prop(actor, "hidden", False))
+    visible = comp_vis and (not comp_hidden) and (not actor_hidden)
+
+    cast_shadow = bool(ue2g_common.safe_get_prop(comp, "cast_shadow", True))
+
+    collision_enabled = True
+    try:
+        if hasattr(comp, "get_collision_enabled"):
+            ce = comp.get_collision_enabled()
+            ce_name = str(getattr(ce, "name", ce)).upper()
+            if "NO_COLLISION" in ce_name or ce_name == "0":
+                collision_enabled = False
+        else:
+            body_inst = ue2g_common.safe_get_prop(comp, "body_instance", None)
+            if body_inst is not None:
+                ce = ue2g_common.safe_get_prop(body_inst, "collision_enabled", None)
+                if ce is not None:
+                    ce_name = str(getattr(ce, "name", ce)).upper()
+                    if "NO_COLLISION" in ce_name or ce_name == "0":
+                        collision_enabled = False
+            if collision_enabled and hasattr(comp, "get_collision_profile_name"):
+                prof = str(comp.get_collision_profile_name() or "").lower()
+                if prof == "nocollision":
+                    collision_enabled = False
+    except Exception:
+        pass
+
+    max_draw_m = None
+    for prop in ("ld_max_draw_distance", "cached_max_draw_distance"):
+        val = ue2g_common.safe_get_prop(comp, prop, None)
+        if val is not None:
+            try:
+                fval = float(val)
+                if fval > 0.0:
+                    max_draw_m = round(fval * ue2g_common.CM_TO_M, 3)
+                    break
+            except (TypeError, ValueError):
+                pass
+
+    return {
+        "visible": visible,
+        "cast_shadow": cast_shadow,
+        "collision_enabled": collision_enabled,
+        "max_draw_distance_m": max_draw_m,
+    }
+
+
+def extract_spline_mesh_params(comp):
+    """Extracts cubic Hermite spline deformation data from a SplineMeshComponent,
+    converted into glTF mesh-local space ((ux, uz, uy) * 0.01). Returns None for
+    ordinary non-spline components."""
+    spline_cls = getattr(unreal, "SplineMeshComponent", None)
+    if spline_cls is None or not isinstance(comp, spline_cls):
+        return None
+    params = ue2g_common.safe_get_prop(comp, "spline_params", None)
+    if params is None:
+        return None
+
+    def _gltf_vec_m(v, default=(0.0, 0.0, 0.0)):
+        if v is None:
+            return list(default)
+        try:
+            return [float(v.x) * ue2g_common.CM_TO_M,
+                    float(v.z) * ue2g_common.CM_TO_M,
+                    float(v.y) * ue2g_common.CM_TO_M]
+        except Exception:
+            return list(default)
+
+    def _vec2(v, default=(1.0, 1.0)):
+        if v is None:
+            return list(default)
+        try:
+            return [float(v.x), float(v.y)]
+        except Exception:
+            return list(default)
+
+    def _num_p(obj, prop, default=0.0):
+        val = ue2g_common.safe_get_prop(obj, prop, default)
+        try:
+            return float(val) if val is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    fwd_raw = ue2g_common.safe_get_prop(comp, "forward_axis", None)
+    fwd_name = str(getattr(fwd_raw, "name", fwd_raw) or "X").upper()
+    # Map Unreal local axis -> glTF mesh-local axis (X->X, Y->Z, Z->Y)
+    if "Y" in fwd_name or fwd_name == "1":
+        forward_axis = "z"
+    elif "Z" in fwd_name or fwd_name == "2":
+        forward_axis = "y"
+    else:
+        forward_axis = "x"
+
+    up_raw = ue2g_common.safe_get_prop(comp, "spline_up_dir", None)
+    if up_raw is not None:
+        try:
+            up_dir = [float(up_raw.x), float(up_raw.z), float(up_raw.y)]
+        except Exception:
+            up_dir = [0.0, 1.0, 0.0]
+    else:
+        up_dir = [0.0, 1.0, 0.0]
+
+    return {
+        "start_pos": _gltf_vec_m(ue2g_common.safe_get_prop(params, "start_pos", None)),
+        "start_tangent": _gltf_vec_m(ue2g_common.safe_get_prop(params, "start_tangent", None), (1.0, 0.0, 0.0)),
+        "start_scale": _vec2(ue2g_common.safe_get_prop(params, "start_scale", None)),
+        "start_roll_rad": _num_p(params, "start_roll", 0.0),
+        "end_pos": _gltf_vec_m(ue2g_common.safe_get_prop(params, "end_pos", None), (1.0, 0.0, 0.0)),
+        "end_tangent": _gltf_vec_m(ue2g_common.safe_get_prop(params, "end_tangent", None), (1.0, 0.0, 0.0)),
+        "end_scale": _vec2(ue2g_common.safe_get_prop(params, "end_scale", None)),
+        "end_roll_rad": _num_p(params, "end_roll", 0.0),
+        "forward_axis": forward_axis,
+        "up_dir": up_dir,
+    }
+
+
+def extract_actor_folder_path(actor):
+    """Returns normalized World Outliner folder path (e.g. 'Architecture/Walls') or ''."""
+    if actor is None or not hasattr(actor, "get_folder_path"):
+        return ""
+    try:
+        raw = str(actor.get_folder_path() or "").strip()
+    except Exception:
+        return ""
+    if not raw or raw.lower() == "none":
+        return ""
+    parts = [p.strip() for p in raw.replace("\\", "/").split("/") if p.strip()]
+    return "/".join(parts)
+
+
 def extract_component_material_overrides(comp, collected_textures=None):
     """
     Extracts material overrides from a component.
@@ -1057,7 +1202,9 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
     # list of instanced component classes and the per-instance transform reader,
     # and the fallback path below needs the second even when the first is unused.
     foliage_mod = _try_import("export_foliage")
-    environment_mod = _try_import("export_environment") if (opts.get("lights") or opts.get("decals")) else None
+    need_env = (opts.get("lights") or opts.get("decals")
+                or opts.get("reflection_probes") or opts.get("cameras") or opts.get("audio"))
+    environment_mod = _try_import("export_environment") if need_env else None
     landscape_mod = _try_import("export_landscape") if opts.get("landscape") else None
     gameplay_mod = _try_import("export_gameplay") if (opts.get("navigation") or opts.get("metadata")) else None
 
@@ -1264,6 +1411,9 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                     "godot_transform": unreal_to_godot_transform(actor_transform),
                     "components": []
                 }
+                folder_path = extract_actor_folder_path(actor)
+                if folder_path:
+                    actor_data["folder_path"] = folder_path
 
                 if gameplay_mod and opts.get("metadata"):
                     try:
@@ -1305,6 +1455,7 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                     comp_relative_transform = comp.get_relative_transform()
                     comp_world_transform = comp.get_world_transform()
 
+                    render_flags = extract_component_render_flags(comp, actor)
                     comp_data = {
                         "name": comp_name,
                         "mesh_key": mesh_key,
@@ -1314,8 +1465,15 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                         "godot_relative_transform": unreal_to_godot_transform(comp_relative_transform),
                         "unreal_world_transform": unreal_transform_to_dict(comp_world_transform),
                         "godot_world_transform": unreal_to_godot_transform(comp_world_transform),
+                        "visible": render_flags["visible"],
+                        "cast_shadow": render_flags["cast_shadow"],
+                        "collision_enabled": render_flags["collision_enabled"],
+                        "max_draw_distance_m": render_flags["max_draw_distance_m"],
                         "material_overrides": extract_component_material_overrides(comp, collected_textures)
                     }
+                    spline_data = extract_spline_mesh_params(comp)
+                    if spline_data is not None:
+                        comp_data["spline_mesh"] = spline_data
 
                     if comp_tags:
                         comp_data["tags"] = comp_tags
@@ -1328,18 +1486,26 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
             except Exception as actor_err:
                 unreal.log_warning(f"Failed to export actor '{ue2g_common.safe_get_name(actor)}': {str(actor_err)}")
  
-    # 5. Collect feature data (lights, post-process, decals, terrain, foliage, navigation)
+    # 5. Collect feature data (lights, post-process, decals, probes, cameras, audio, terrain, foliage, navigation)
     environment_data = {}
+    collected_sounds = set()
     if environment_mod:
         try:
             want_lights = bool(opts.get("lights"))
             want_decals = bool(opts.get("decals"))
+            want_probes = bool(opts.get("reflection_probes", True))
+            want_cameras = bool(opts.get("cameras", True))
+            want_audio = bool(opts.get("audio", True))
             try:
                 environment_data = environment_mod.collect_environment(
                     all_actors, collected_textures,
-                    include_lights=want_lights, include_decals=want_decals) or {}
+                    include_lights=want_lights, include_decals=want_decals,
+                    include_reflection_probes=want_probes,
+                    include_cameras=want_cameras,
+                    include_audio=want_audio,
+                    collected_sounds=collected_sounds) or {}
             except TypeError:
-                # Backward compatibility with custom/legacy 2-arg collect_environment.
+                # Backward compatibility with custom/legacy collect_environment signatures.
                 tex_sink = collected_textures if want_decals else set()
                 environment_data = environment_mod.collect_environment(all_actors, tex_sink) or {}
         except Exception as e:
@@ -1352,6 +1518,12 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
         environment_data["has_sky_atmosphere"] = False
     if not opts.get("decals"):
         environment_data["decals"] = []
+    if not opts.get("reflection_probes", True):
+        environment_data["reflection_probes"] = []
+    if not opts.get("cameras", True):
+        environment_data["cameras"] = []
+    if not opts.get("audio", True):
+        environment_data["audio"] = []
 
     landscapes_data = []
     if landscape_mod:
@@ -1391,6 +1563,9 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
         "sky_light": environment_data.get("sky_light"),
         "has_sky_atmosphere": environment_data.get("has_sky_atmosphere", False),
         "decals": environment_data.get("decals", []),
+        "reflection_probes": environment_data.get("reflection_probes", []),
+        "cameras": environment_data.get("cameras", []),
+        "audio": environment_data.get("audio", []),
         "landscapes": landscapes_data,
         "foliage": foliage_data,
         "navigation": navigation_data
@@ -1430,6 +1605,14 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                 exported_textures_count = len(result["exported"]) + len(result["reused"])
             except Exception as tex_err:
                 unreal.log_warning(f"Failed to export level textures: {str(tex_err)}")
+
+        # Export collected SoundWave audio assets to sibling audio/ folder
+        if collected_sounds and environment_mod and hasattr(environment_mod, "export_sound_waves"):
+            try:
+                audio_dir = os.path.join(os.path.dirname(save_path), "audio")
+                environment_mod.export_sound_waves(collected_sounds, audio_dir)
+            except Exception as aud_err:
+                unreal.log_warning(f"Failed to export level audio: {str(aud_err)}")
 
         if godot_project_dir and os.path.isdir(godot_project_dir):
             try:
@@ -1471,6 +1654,18 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                         if os.path.isfile(src_t) and os.path.abspath(src_t) != os.path.abspath(dest_t):
                             shutil.copy2(src_t, dest_t)
                     unreal.log(f"Transferred terrain data -> {godot_terrain_dir}")
+
+                # Copy exported audio (.wav) files
+                local_audio_dir = os.path.join(os.path.dirname(save_path), "audio")
+                if os.path.isdir(local_audio_dir):
+                    godot_audio_dir = os.path.join(godot_project_dir, "audio")
+                    os.makedirs(godot_audio_dir, exist_ok=True)
+                    for audio_file in os.listdir(local_audio_dir):
+                        src_a = os.path.join(local_audio_dir, audio_file)
+                        dest_a = os.path.join(godot_audio_dir, audio_file)
+                        if os.path.isfile(src_a) and os.path.abspath(src_a) != os.path.abspath(dest_a):
+                            shutil.copy2(src_a, dest_a)
+                    unreal.log(f"Transferred audio data -> {godot_audio_dir}")
             except Exception as copy_err:
                 unreal.log_warning(f"Failed to auto-transfer level layout to Godot: {str(copy_err)}")
         
@@ -1482,13 +1677,22 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                 try:
                     scene_name = ue2g_common.sanitize_name(opts.get("tscn_scene_name") or f"{world_name}_imported")
                     tscn_path = os.path.join(godot_project_dir, f"{scene_name}.tscn")
-                    res_paths = {"models": "res://models/", "textures": "res://textures/", "terrain": "res://terrain/"}
+                    res_paths = {
+                        "models": "res://models/",
+                        "textures": "res://textures/",
+                        "terrain": "res://terrain/",
+                        "audio": "res://audio/",
+                    }
                     tscn_options = {
                         "scene_name": scene_name,
                         "godot_project_dir": godot_project_dir,
                         "light_energy_scale": 1.0,
                         "lights": bool(opts.get("lights")),
                         "decals": bool(opts.get("decals")),
+                        "reflection_probes": bool(opts.get("reflection_probes", True)),
+                        "cameras": bool(opts.get("cameras", True)),
+                        "audio": bool(opts.get("audio", True)),
+                        "preserve_folders": True,
                         "foliage": bool(opts.get("foliage")),
                         "navigation": bool(opts.get("navigation")),
                         "metadata": bool(opts.get("metadata")),

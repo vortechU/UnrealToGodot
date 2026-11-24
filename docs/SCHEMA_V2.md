@@ -55,6 +55,9 @@ read and write exactly these structures.
     "sky_light": { ... } | null,
     "has_sky_atmosphere": false,
     "decals": [ ... ],
+    "reflection_probes": [ ... ],
+    "cameras": [ ... ],
+    "audio": [ ... ],
     "landscapes": [ ... ],
     "foliage": [ ... ],
     "navigation": { ... } | null
@@ -159,10 +162,15 @@ only ever resolves as a sibling of the `.gltf`. Verified: Godot loads a
 ```json
 {
     "name": "...", "class": "...",
+    "folder_path": "Architecture/Interior",        // optional World Outliner folder path
     "unreal_transform": { ... }, "godot_transform": { ... },
     "tags": ["patrol_point"],                      // actor.tags, stringified
     "properties": { "health": 100.0, "is_interactable": true },  // best-effort BP vars
-    "components": [ { "name": "...", "mesh_key": "...", "mesh_name": "...", ... , "tags": [...] } ]
+    "components": [ { "name": "...", "mesh_key": "...", "mesh_name": "...", ...,
+                      "visible": true, "cast_shadow": true,
+                      "collision_enabled": true, "max_draw_distance_m": null,
+                      "spline_mesh": { ... },      // optional; present on SplineMeshComponent
+                      "tags": [...] } ]
 }
 ```
 

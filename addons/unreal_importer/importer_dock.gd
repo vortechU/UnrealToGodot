@@ -21,6 +21,11 @@ var navigation_bake_check: CheckBox
 var metadata_check: CheckBox
 var lods_check: CheckBox
 var skel_physics_check: CheckBox
+var probes_check: CheckBox
+var cameras_check: CheckBox
+var audio_check: CheckBox
+var splines_check: CheckBox
+var preserve_folders_check: CheckBox
 var flip_normal_green_check: CheckBox
 var save_external_mats_check: CheckBox
 var energy_scale_spin: SpinBox
@@ -175,6 +180,11 @@ func _enter_tree() -> void:
 	metadata_check = _make_check(features,"Tags & Metadata", "Copy Unreal actor tags, classes and Blueprint variables onto nodes as metadata (get_meta()).")
 	lods_check = _make_check(features,"LOD Chains (_LOD<n>.gltf)", "Instance exported _LOD1..N glTF meshes alongside LOD0 and wire Godot visibility_range switching from Unreal screen-size thresholds.", true)
 	skel_physics_check = _make_check(features,"Skeletal Physics (_physics.json)", "Attach PhysicalBoneSimulator3D + PhysicalBone3D colliders onto imported Skeleton3D nodes from exported <mesh>_physics.json files.", true)
+	probes_check = _make_check(features,"Reflection Probes", "Create ReflectionProbe nodes from exported BoxReflectionCapture and SphereReflectionCapture components.", true)
+	cameras_check = _make_check(features,"Cameras", "Create Camera3D nodes from exported CameraActor / CineCameraActor components with matching horizontal FOV.", true)
+	audio_check = _make_check(features,"Ambient Audio", "Create AudioStreamPlayer3D nodes from exported AmbientSound / AudioComponent actors and bind exported audio/*.wav streams.", true)
+	splines_check = _make_check(features,"Spline Meshes (Hermite deform)", "Deform SplineMeshComponent meshes along their exported Unreal cubic Hermite splines (roads, pipes, cables).", true)
+	preserve_folders_check = _make_check(features,"Mirror Unreal Outliner Folders", "Recreate Unreal World Outliner folders as nested Node3D containers under UnrealStaticMeshes.", true)
 	flip_normal_green_check = _make_check(features,"Flip normal map green channel (DX -> GL)", "Converts Unreal DirectX (-Y) normal maps to Godot OpenGL (+Y) via Godot's non-destructive process/normal_map_invert_y import flag (skipping maps whose Unreal Flip Green Channel flag was already enabled).", true)
 	save_external_mats_check = _make_check(features,"Save shared materials as .tres files", "Writes shared StandardMaterial3D resources to res://materials/ and reuses existing .tres files on re-import, keeping .tscn files smaller and allowing cross-scene material edits.", false)
 
@@ -553,6 +563,11 @@ func _on_import_pressed() -> void:
 		"apply_metadata": metadata_check.button_pressed,
 		"apply_lods": lods_check.button_pressed,
 		"apply_skeletal_physics": skel_physics_check.button_pressed,
+		"apply_reflection_probes": probes_check.button_pressed,
+		"apply_cameras": cameras_check.button_pressed,
+		"apply_audio": audio_check.button_pressed,
+		"apply_spline_meshes": splines_check.button_pressed,
+		"preserve_folders": preserve_folders_check.button_pressed,
 		"flip_normal_green": flip_normal_green_check.button_pressed,
 		"save_external_materials": save_external_mats_check.button_pressed,
 		"light_energy_scale": energy_scale_spin.value,

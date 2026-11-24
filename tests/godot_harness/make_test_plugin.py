@@ -275,6 +275,7 @@ func _run_tests() -> void:
 	_test_foliage(root)
 	_test_materials(root)
 	_test_lods_and_skeletal_physics(root)
+	_test_phase3_scene_parity(root)
 	_test_terrain(root)
 
 	print("\\n============================================")
@@ -650,6 +651,59 @@ func _test_lods_and_skeletal_physics(root: Node) -> void:
 	check("external .tres material file created on disk",
 		FileAccess.file_exists("res://materials/MI_Test.tres"))
 	ext_root.queue_free()
+
+
+func _test_phase3_scene_parity(root: Node) -> void:
+	print("\\n--- Phase 3: render flags, folders, splines, probes, cameras, audio ---")
+	var mesh_group := root.get_node_or_null("UnrealStaticMeshes")
+	check("Outliner folder Architecture/Interior created",
+		mesh_group != null and mesh_group.get_node_or_null("Architecture/Interior/Decor_Hidden") != null)
+	var decor := find_node(root, "Decor_Hidden")
+	if decor and decor is Node3D:
+		check("NoCollision component does NOT create a StaticBody3D", not (decor is StaticBody3D), decor.get_class())
+		check("hidden component imports invisible", not (decor as Node3D).visible)
+		var dmi := find_node(decor, "TriNode") as MeshInstance3D
+		check("shadowless + max_draw_distance_m applied on static mesh",
+			dmi != null and dmi.cast_shadow == GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			and absf(dmi.visibility_range_end - 45.0) < 0.001,
+			"shadow=%s end=%s" % [dmi.cast_shadow if dmi else -1, dmi.visibility_range_end if dmi else -1])
+
+	var pipe := find_node(root, "Pipe_Spline")
+	check("SplineMesh Pipe_Spline exists under Architecture/Pipes",
+		mesh_group != null and mesh_group.get_node_or_null("Architecture/Pipes/Pipe_Spline") != null)
+	if pipe:
+		check("Pipe_Spline stamped with unreal_spline_mesh metadata", bool(pipe.get_meta("unreal_spline_mesh", false)))
+		var pmi := find_node(pipe, "TriNode") as MeshInstance3D
+		if pmi and pmi.mesh:
+			var aabb := pmi.mesh.get_aabb()
+			check("SplineMesh vertices deformed towards end_pos (4, 2, 0)",
+				aabb.end.x > 3.5 and aabb.end.y > 1.5, str(aabb))
+
+	var probe := find_node(root, "BoxProbe_1") as ReflectionProbe
+	check("BoxProbe_1 ReflectionProbe exists under UnrealReflectionProbes",
+		probe != null and root.get_node_or_null("UnrealReflectionProbes/BoxProbe_1") != null)
+	if probe:
+		check("ReflectionProbe size, intensity and box_projection match",
+			near(probe.size, Vector3(12, 6, 8)) and absf(probe.intensity - 1.5) < 0.001 and probe.box_projection,
+			"size=%s int=%s box=%s" % [probe.size, probe.intensity, probe.box_projection])
+
+	var cam := find_node(root, "ShowcaseCam") as Camera3D
+	check("ShowcaseCam Camera3D exists under UnrealCameras",
+		cam != null and root.get_node_or_null("UnrealCameras/ShowcaseCam") != null)
+	if cam:
+		check("Camera3D uses KEEP_WIDTH horizontal FOV (85 deg) and clip planes",
+			cam.keep_aspect == Camera3D.KEEP_WIDTH and absf(cam.fov - 85.0) < 0.001
+			and absf(cam.near - 0.1) < 0.001 and absf(cam.far - 2000.0) < 0.01,
+			"aspect=%s fov=%s near=%s far=%s" % [cam.keep_aspect, cam.fov, cam.near, cam.far])
+
+	var aud := find_node(root, "AmbientWind") as AudioStreamPlayer3D
+	check("AmbientWind AudioStreamPlayer3D exists under UnrealAudio",
+		aud != null and root.get_node_or_null("UnrealAudio/AmbientWind") != null)
+	if aud:
+		check("AudioStreamPlayer3D volume_db, pitch, max_distance, autoplay match",
+			absf(aud.volume_db + 6.0) < 0.01 and absf(aud.pitch_scale - 1.1) < 0.01
+			and absf(aud.max_distance - 35.0) < 0.01 and aud.autoplay,
+			"db=%s pitch=%s dist=%s auto=%s" % [aud.volume_db, aud.pitch_scale, aud.max_distance, aud.autoplay])
 
 
 func _dump(n: Node, depth: int) -> void:

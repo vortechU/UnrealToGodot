@@ -415,6 +415,68 @@ layout = {
                             "godot_world_transform": t(-5, 0, -5),
                             "material_overrides": []}],
         },
+        {
+            # Phase 3: Outliner folder hierarchy + NoCollision + hidden + shadowless + max draw distance.
+            "name": "Decor_Hidden", "class": "StaticMeshActor",
+            "folder_path": "Architecture/Interior",
+            "godot_transform": t(2, 0, -2),
+            "components": [{"name": "SM0", "mesh_key": "SM_Rock", "mesh_name": "SM_Rock",
+                            "godot_relative_transform": t(2, 0, -2),
+                            "godot_world_transform": t(2, 0, -2),
+                            "visible": False, "cast_shadow": False,
+                            "collision_enabled": False, "max_draw_distance_m": 45.0,
+                            "material_overrides": []}],
+        },
+        {
+            # Phase 3: SplineMeshComponent curved from (0,0,0) to (4,2,0).
+            "name": "Pipe_Spline", "class": "StaticMeshActor",
+            "folder_path": "Architecture/Pipes",
+            "godot_transform": t(0, 0, 10),
+            "components": [{"name": "Spline0", "mesh_key": "SM_Crate", "mesh_name": "SM_Crate",
+                            "godot_relative_transform": t(0, 0, 10),
+                            "godot_world_transform": t(0, 0, 10),
+                            "collision_enabled": False,
+                            "spline_mesh": {
+                                "start_pos": [0.0, 0.0, 0.0],
+                                "start_tangent": [4.0, 0.0, 0.0],
+                                "start_scale": [1.0, 1.0],
+                                "start_roll_rad": 0.0,
+                                "end_pos": [4.0, 2.0, 0.0],
+                                "end_tangent": [4.0, 0.0, 0.0],
+                                "end_scale": [1.0, 1.0],
+                                "end_roll_rad": 0.0,
+                                "forward_axis": "x",
+                                "up_dir": [0.0, 1.0, 0.0],
+                            },
+                            "material_overrides": []}],
+        },
+    ],
+    "reflection_probes": [
+        {
+            "name": "BoxProbe_1", "shape": "box",
+            "godot_transform": t(0, 2, 0),
+            "size_m": [12.0, 6.0, 8.0], "intensity": 1.5,
+            "box_projection": True, "blend_distance_m": 1.0, "visible": True,
+        },
+    ],
+    "cameras": [
+        {
+            "name": "ShowcaseCam",
+            "godot_transform": t(0, 3, 12),
+            "projection": "perspective", "fov_deg": 85.0,
+            "ortho_width_m": 5.12, "near_clip_m": 0.1, "far_clip_m": 2000.0,
+            "aspect_ratio": 1.777778,
+        },
+    ],
+    "audio": [
+        {
+            "name": "AmbientWind",
+            "godot_transform": t(1, 2, 3),
+            "sound_name": "S_Wind", "sound_file": None,
+            "volume_db": -6.0, "pitch_scale": 1.1,
+            "attenuation_radius_m": 35.0, "is_spatialized": True,
+            "auto_play": True, "looping": True,
+        },
     ],
     # One decal, written exactly as the exporter emits it for a UE DecalActor at
     # the origin with yaw +90 and scale (X=5, Y=2, Z=3), keeping UE's default

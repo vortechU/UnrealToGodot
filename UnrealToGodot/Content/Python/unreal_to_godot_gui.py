@@ -542,6 +542,9 @@ class UnrealToGodotApp:
         self.feat_foliage_var = tk.BooleanVar(value=True)
         self.feat_navigation_var = tk.BooleanVar(value=True)
         self.feat_metadata_var = tk.BooleanVar(value=True)
+        self.feat_probes_var = tk.BooleanVar(value=True)
+        self.feat_cameras_var = tk.BooleanVar(value=True)
+        self.feat_audio_var = tk.BooleanVar(value=True)
 
         feature_defs = [
             ("Lights & Post-Process", self.feat_lights_var),
@@ -550,6 +553,9 @@ class UnrealToGodotApp:
             ("Foliage & Instances", self.feat_foliage_var),
             ("Navigation Volumes", self.feat_navigation_var),
             ("Tags & Metadata", self.feat_metadata_var),
+            ("Reflection Probes", self.feat_probes_var),
+            ("Cameras", self.feat_cameras_var),
+            ("Ambient Audio", self.feat_audio_var),
         ]
         for idx, (feat_label, feat_var) in enumerate(feature_defs):
             feat_cb = tk.Checkbutton(
@@ -872,6 +878,9 @@ class UnrealToGodotApp:
             "foliage": self.feat_foliage_var.get(),
             "navigation": self.feat_navigation_var.get(),
             "metadata": self.feat_metadata_var.get(),
+            "reflection_probes": self.feat_probes_var.get(),
+            "cameras": self.feat_cameras_var.get(),
+            "audio": self.feat_audio_var.get(),
             "write_tscn": self.write_tscn_var.get(),
             "tscn_scene_name": self.tscn_name_entry.get().strip(),
             "terrain_height_resolution": _positive_int(
@@ -916,6 +925,9 @@ class UnrealToGodotApp:
                         self.feat_foliage_var.set(feats.get("foliage", True))
                         self.feat_navigation_var.set(feats.get("navigation", True))
                         self.feat_metadata_var.set(feats.get("metadata", True))
+                        self.feat_probes_var.set(feats.get("reflection_probes", True))
+                        self.feat_cameras_var.set(feats.get("cameras", True))
+                        self.feat_audio_var.set(feats.get("audio", True))
                         self.write_tscn_var.set(feats.get("write_tscn", False))
                         for entry, key, default in (
                                 (self.terrain_height_res_entry, "terrain_height_resolution",

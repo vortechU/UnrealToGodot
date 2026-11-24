@@ -208,6 +208,19 @@ layout = {
         "agent_radius_m": 0.35, "agent_height_m": 1.92, "max_slope_deg": 44.0,
         "agent_max_step_height_m": 0.35, "cell_size_m": 0.19,
     },
+    "reflection_probes": [
+        {"name": "BoxProbe_1", "shape": "box", "godot_transform": t(0, 2, 0),
+         "size_m": [12.0, 6.0, 8.0], "intensity": 1.5, "box_projection": True, "visible": True},
+    ],
+    "cameras": [
+        {"name": "ShowcaseCam", "godot_transform": t(0, 3, 12),
+         "projection": "perspective", "fov_deg": 85.0, "near_clip_m": 0.1, "far_clip_m": 2000.0},
+    ],
+    "audio": [
+        {"name": "AmbientWind", "godot_transform": t(1, 2, 3), "sound_name": "S_Wind",
+         "sound_file": None, "volume_db": -6.0, "pitch_scale": 1.1,
+         "attenuation_radius_m": 35.0, "auto_play": True},
+    ],
 }
 
 out_path = os.path.join(ROOT, "test_level.tscn")
@@ -701,6 +714,19 @@ for marker in ("TRANSPARENCY_ALPHA_SCISSOR", "TRANSPARENCY_ALPHA", "BLEND_MODE_A
 assert "process/normal_map_invert_y" in tex_lim_gd, \
     "texture_import_limit.gd missing process/normal_map_invert_y"
 print("Phase 1 addon material/normal/tres markers OK")
+
+# Phase 3: reflection probes, cameras, audio emitted cleanly & pinned against import_environment.gd
+probe_blk = node_block("BoxProbe_1")
+assert node_type("BoxProbe_1") == "ReflectionProbe" and "size = Vector3(12.0, 6.0, 8.0)" in probe_blk \
+    and "box_projection = true" in probe_blk, probe_blk
+cam_blk = node_block("ShowcaseCam")
+assert node_type("ShowcaseCam") == "Camera3D" and "keep_aspect = 0" in cam_blk and "fov = 85.0" in cam_blk, cam_blk
+aud_blk = node_block("AmbientWind")
+assert node_type("AmbientWind") == "AudioStreamPlayer3D" and "volume_db = -6.0" in aud_blk \
+    and "max_distance = 35.0" in aud_blk, aud_blk
+for gd_marker in ("_apply_reflection_probes", "_apply_cameras", "_apply_audio", "Camera3D.KEEP_WIDTH"):
+    assert gd_marker in gd, "import_environment.gd missing %r" % gd_marker
+print("Phase 3 probes/cameras/audio agree with import_environment.gd")
 
 print(f"OK: {ext_count} ext_resources, {sub_count} sub_resources, {len(nodes)} nodes, load_steps={load_steps}")
 print("--- excerpt ---")
