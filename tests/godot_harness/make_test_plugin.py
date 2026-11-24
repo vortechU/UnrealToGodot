@@ -274,6 +274,7 @@ func _run_tests() -> void:
 	_test_lights(root)
 	_test_foliage(root)
 	_test_materials(root)
+	_test_lods_and_skeletal_physics(root)
 	_test_terrain(root)
 
 	print("\\n============================================")
@@ -584,6 +585,71 @@ func _test_materials(root: Node) -> void:
 	var gl_imp := FileAccess.get_file_as_string("res://textures/TX_Test_NRM_GL.png.import")
 	check("OpenGL-authored normal map does NOT invert Y again",
 		not gl_imp.contains("process/normal_map_invert_y=true"), gl_imp)
+
+
+func _test_lods_and_skeletal_physics(root: Node) -> void:
+	print("\\n--- LOD chains & skeletal physics ---")
+	var crate := find_node(root, "Crate_1")
+	check("Crate_1 exists for LOD test", crate != null)
+	if crate:
+		var lod0_mi := find_node(crate, "TriNode") as MeshInstance3D
+		check("Crate_1 LOD0 visibility_range_end == 12.0",
+			lod0_mi != null and absf(lod0_mi.visibility_range_begin) < 0.001
+			and absf(lod0_mi.visibility_range_end - 12.0) < 0.001,
+			"begin=%s end=%s" % [lod0_mi.visibility_range_begin if lod0_mi else -1,
+				lod0_mi.visibility_range_end if lod0_mi else -1])
+		var lod1 := crate.get_node_or_null("SM_Crate_LOD1")
+		var lod2 := crate.get_node_or_null("SM_Crate_LOD2")
+		check("Crate_1 instanced LOD1 and LOD2 children", lod1 != null and lod2 != null)
+		if lod1:
+			var lod1_mi := find_node(lod1, "TriNode") as MeshInstance3D
+			check("LOD1 visibility_range is 12.0 .. 28.0",
+				lod1_mi != null and absf(lod1_mi.visibility_range_begin - 12.0) < 0.001
+				and absf(lod1_mi.visibility_range_end - 28.0) < 0.001,
+				"begin=%s end=%s" % [lod1_mi.visibility_range_begin if lod1_mi else -1,
+					lod1_mi.visibility_range_end if lod1_mi else -1])
+		if lod2:
+			var lod2_mi := find_node(lod2, "TriNode") as MeshInstance3D
+			check("LOD2 visibility_range is 28.0 .. unlimited (0.0)",
+				lod2_mi != null and absf(lod2_mi.visibility_range_begin - 28.0) < 0.001
+				and absf(lod2_mi.visibility_range_end) < 0.001,
+				"begin=%s end=%s" % [lod2_mi.visibility_range_begin if lod2_mi else -1,
+					lod2_mi.visibility_range_end if lod2_mi else -1])
+
+	var hero := find_node(root, "Hero_1")
+	check("Hero_1 skeletal actor exists", hero != null)
+	if hero:
+		var sim := find_node(hero, "UnrealPhysicalBoneSimulator")
+		check("skeletal physics built UnrealPhysicalBoneSimulator under Skeleton3D",
+			sim != null and sim.get_parent() is Skeleton3D,
+			str(sim.get_parent() if sim else null))
+		if sim:
+			var pb_root := sim.get_node_or_null("PhysicalBone_root") as PhysicalBone3D
+			var pb_spine := sim.get_node_or_null("PhysicalBone_spine") as PhysicalBone3D
+			check("PhysicalBone3D created for root and case-insensitively matched spine",
+				pb_root != null and pb_spine != null and pb_spine.bone_name == "spine",
+				"root=%s spine=%s" % [pb_root, pb_spine])
+			if pb_spine:
+				var cap_node := pb_spine.get_node_or_null("CapsuleCollision") as CollisionShape3D
+				check("spine PhysicalBone3D has CapsuleShape3D with converted height",
+					cap_node != null and cap_node.shape is CapsuleShape3D
+					and absf((cap_node.shape as CapsuleShape3D).radius - 0.15) < 0.001
+					and absf((cap_node.shape as CapsuleShape3D).height - 0.80) < 0.001,
+					str(cap_node.shape if cap_node else null))
+
+	# Also test save_external_materials=true in a separate throwaway root.
+	var ext_root := Node3D.new()
+	ext_root.name = "ExtMatRoot"
+	get_tree().get_root().add_child(ext_root)
+	var imp2 = Importer.new()
+	var ok2 = await imp2.do_import("res://level_layout.json", "res://models/",
+		"res://textures/", ext_root, {"apply_metadata": false, "build_terrain": false,
+			"apply_foliage": false, "apply_lights": false, "apply_decals": false,
+			"save_external_materials": true})
+	check("external .tres material import succeeded", ok2 == true)
+	check("external .tres material file created on disk",
+		FileAccess.file_exists("res://materials/MI_Test.tres"))
+	ext_root.queue_free()
 
 
 func _dump(n: Node, depth: int) -> void:

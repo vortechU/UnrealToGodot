@@ -1823,6 +1823,53 @@ check("OpenGL-authored normal map preserves flip_green_channel=True",
 check("normal slot fallback catches TC_DEFAULT normal maps too",
       tex_meta.get("T_Loose_N") == {"is_normal_map": True, "flip_green_channel": False}, tex_meta)
 
+print("\n=== 13. Phase 2: LOD screen-size -> switch distance extraction ===")
+
+
+class _FakeStaticMeshForLOD(u.StaticMesh):
+    def __init__(self, lod_count, radius_cm=200.0):
+        self._lods = lod_count
+        self._r = radius_cm
+
+    def get_num_lods(self):
+        return self._lods
+
+    def get_bounds(self):
+        return types.SimpleNamespace(sphere_radius=self._r)
+
+
+single_lod_mesh = _FakeStaticMeshForLOD(1)
+check("single-LOD mesh returns empty lods list",
+      EL.extract_mesh_lods(single_lod_mesh, "SM_Single") == [])
+
+multi_lod_mesh = _FakeStaticMeshForLOD(3, radius_cm=200.0)
+u.StaticMeshEditorSubsystem = type("StaticMeshEditorSubsystem", (), {})
+_fake_sm_subsys = types.SimpleNamespace(
+    get_lod_count=lambda m: m._lods,
+    get_lod_screen_sizes=lambda m: [1.0, 0.5, 0.2],
+)
+_prev_get_sub = getattr(u, "get_editor_subsystem", None)
+u.get_editor_subsystem = lambda cls: _fake_sm_subsys if cls is u.StaticMeshEditorSubsystem else None
+try:
+    lods = EL.extract_mesh_lods(multi_lod_mesh, "SM_Cliff")
+finally:
+    if _prev_get_sub is None:
+        delattr(u, "get_editor_subsystem")
+    else:
+        u.get_editor_subsystem = _prev_get_sub
+
+check("3-LOD mesh produces 3 entries with _LOD1/_LOD2 filenames",
+      len(lods) == 3 and [l["export_name"] for l in lods] == ["SM_Cliff", "SM_Cliff_LOD1", "SM_Cliff_LOD2"],
+      lods)
+check("LOD0 switch_distance_m is 0.0 and LOD distances strictly increase",
+      lods[0]["switch_distance_m"] == 0.0
+      and 0.0 < lods[1]["switch_distance_m"] < lods[2]["switch_distance_m"],
+      lods)
+# At 75 deg FOV, R=2.0m, screen_size=0.5 => d = 2.0 / (0.5 * tan(37.5 deg)) ~= 5.213m
+check("screen_size_to_switch_distance_m matches 75-deg FOV formula",
+      abs(EL.screen_size_to_switch_distance_m(2.0, 0.5) - 5.213) < 0.01,
+      EL.screen_size_to_switch_distance_m(2.0, 0.5))
+
 print("\n" + "=" * 60)
 if FAIL:
     print("FAILURES (%d): %s" % (len(FAIL), FAIL))

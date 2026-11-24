@@ -13,10 +13,16 @@ Usage:
 
 import os
 import json
+import math
 import re
 import unreal
 
 import ue2g_common
+
+# Default vertical FOV (75 deg, Godot Camera3D default) used to convert Unreal's
+# LOD screen-size fraction into a Godot visibility_range switch distance (m).
+_LOD_FOV_HALF_TAN = math.tan(math.radians(75.0 * 0.5))
+_DEFAULT_LOD_SCREEN_SIZES = (1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125)
 
 # Per-feature export toggles (see docs/SCHEMA_V2.md). The GUI passes a matching
 # dict; anything omitted falls back to these defaults.
@@ -178,6 +184,115 @@ def extract_mesh_collision(static_mesh):
         len(collision_data["convex_hulls"]) > 0
     )
     return collision_data if has_collision else None
+
+
+def screen_size_to_switch_distance_m(sphere_radius_m, screen_size):
+    """Converts an Unreal LOD screen-size fraction (0..1) and mesh bounding
+    sphere radius (m) into a Godot visibility_range distance (m) at 75 deg FOV.
+
+    Mirrors Unreal's ComputeBoundsScreenRadiusSquared approximation:
+    screen_size ~= sphere_radius / (distance * tan(fov / 2)).
+    """
+    try:
+        r = max(0.01, float(sphere_radius_m))
+        s = float(screen_size)
+    except (TypeError, ValueError):
+        return 0.0
+    if s <= 0.0 or s >= 1.0:
+        return 0.0
+    return round(r / (s * _LOD_FOV_HALF_TAN), 3)
+
+
+def extract_mesh_lods(mesh, export_name):
+    """Reads per-LOD screen sizes and computes Godot switch distances for meshes
+    with more than 1 LOD level. Returns [] for single-LOD meshes."""
+    lod_count = 1
+    screen_sizes = []
+    is_static = isinstance(mesh, unreal.StaticMesh)
+    is_skeletal = hasattr(unreal, "SkeletalMesh") and isinstance(mesh, unreal.SkeletalMesh)
+
+    if is_static:
+        subsys = None
+        if hasattr(unreal, "get_editor_subsystem") and hasattr(unreal, "StaticMeshEditorSubsystem"):
+            try:
+                subsys = unreal.get_editor_subsystem(unreal.StaticMeshEditorSubsystem)
+            except Exception:
+                subsys = None
+        if subsys is not None:
+            try:
+                lod_count = int(subsys.get_lod_count(mesh))
+            except Exception:
+                pass
+            try:
+                screen_sizes = [float(s) for s in (subsys.get_lod_screen_sizes(mesh) or [])]
+            except Exception:
+                pass
+        if lod_count <= 1 and hasattr(unreal, "EditorStaticMeshLibrary"):
+            try:
+                lod_count = int(unreal.EditorStaticMeshLibrary.get_lod_count(mesh))
+            except Exception:
+                pass
+            if not screen_sizes and hasattr(unreal.EditorStaticMeshLibrary, "get_lod_screen_sizes"):
+                try:
+                    screen_sizes = [float(s) for s in (unreal.EditorStaticMeshLibrary.get_lod_screen_sizes(mesh) or [])]
+                except Exception:
+                    pass
+        if lod_count <= 1 and hasattr(mesh, "get_num_lods"):
+            try:
+                lod_count = int(mesh.get_num_lods())
+            except Exception:
+                pass
+    elif is_skeletal:
+        lod_info = ue2g_common.safe_get_prop(mesh, "lod_info", None)
+        if lod_info:
+            lod_count = len(lod_info)
+            for info in lod_info:
+                ss = ue2g_common.safe_get_prop(info, "screen_size", None)
+                if ss is not None:
+                    val = ue2g_common.safe_get_prop(ss, "default", None)
+                    try:
+                        screen_sizes.append(float(val if val is not None else ss))
+                    except Exception:
+                        pass
+
+    if lod_count <= 1:
+        return []
+
+    sphere_radius_m = 1.0
+    try:
+        bounds = mesh.get_bounds()
+        if bounds is not None:
+            r_cm = getattr(bounds, "sphere_radius", None)
+            if r_cm is not None and float(r_cm) > 0.0:
+                sphere_radius_m = float(r_cm) * ue2g_common.CM_TO_M
+    except Exception:
+        pass
+
+    lods = []
+    prev_dist = 0.0
+    for idx in range(lod_count):
+        if idx < len(screen_sizes) and screen_sizes[idx] > 0.0:
+            ss = float(screen_sizes[idx])
+        elif idx < len(_DEFAULT_LOD_SCREEN_SIZES):
+            ss = _DEFAULT_LOD_SCREEN_SIZES[idx]
+        else:
+            ss = _DEFAULT_LOD_SCREEN_SIZES[-1] / (2.0 ** (idx - len(_DEFAULT_LOD_SCREEN_SIZES) + 1))
+
+        if idx == 0:
+            dist = 0.0
+        else:
+            dist = screen_size_to_switch_distance_m(sphere_radius_m, ss)
+            if dist <= prev_dist:
+                dist = round(prev_dist + max(5.0, sphere_radius_m * 4.0), 3)
+            prev_dist = dist
+
+        lods.append({
+            "lod_index": idx,
+            "export_name": export_name if idx == 0 else "%s_LOD%d" % (export_name, idx),
+            "screen_size": round(ss, 4),
+            "switch_distance_m": dist,
+        })
+    return lods
 
 # Packed PBR maps stuff roughness/metallic/AO into one texture's RGB channels.
 # Which channel holds what is encoded in the parameter name by convention, so the
@@ -1079,12 +1194,19 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                 mesh_key = "%s_%s" % (base, ue2g_common.short_path_hash(mesh.get_path_name()))
             export_names[mesh] = mesh_key
         if mesh_key not in mesh_library:
-            mesh_library[mesh_key] = {
+            entry = {
                 "path": mesh.get_path_name(),
                 "export_name": mesh_key,
                 "collision": extract_mesh_collision(mesh),
                 "materials": extract_mesh_materials(mesh, collected_textures)
             }
+            lods = extract_mesh_lods(mesh, mesh_key)
+            if lods:
+                entry["lods"] = lods
+            if hasattr(unreal, "SkeletalMesh") and isinstance(mesh, unreal.SkeletalMesh):
+                if ue2g_common.safe_get_prop(mesh, "physics_asset", None) is not None:
+                    entry["physics_file"] = "%s_physics.json" % mesh_key
+            mesh_library[mesh_key] = entry
         return mesh_key
 
     with unreal.ScopedSlowTask(len(all_actors), "Scanning level actors for Static Meshes...") as slow_task:

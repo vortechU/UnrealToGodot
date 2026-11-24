@@ -39,8 +39,8 @@ Both plugins stamp and verify a schema `format_version`. A mismatched plugin/add
 ### Geometry, Transforms & Scene Organization
 
 - **Coordinate & Scale Conversion** — Automatically converts Unreal's left-handed Z-up (centimeter) space into Godot's right-handed Y-up (meter) space.
-- **Batch Mesh glTF Export** — Exports selected meshes or every mesh used in the active level to glTF, using deterministic `_<hash>` filenames when asset packs reuse mesh names.
-- **Physics Collision Extraction** — Converts Unreal collision primitives (Boxes, Spheres, Capsules, and Convex Hulls) into `CollisionShape3D` nodes under `StaticBody3D`. For non-uniformly scaled props, scale is baked directly into the collision shapes rather than left on the physics body—preventing Jolt from averaging the axes and spamming console errors on every scene load.
+- **Batch Mesh glTF Export & LOD Chains** — Exports selected meshes or every mesh used in the active level to glTF (with optional `_LOD<n>.gltf` chains and per-LOD screen-size switch distances wired into Godot's `visibility_range`), using deterministic `_<hash>` filenames when asset packs reuse mesh names.
+- **Physics & Skeletal Ragdoll Extraction** — Converts Unreal static-mesh collision primitives (Boxes, Spheres, Capsules, and Convex Hulls) into `CollisionShape3D` nodes under `StaticBody3D` (baking non-uniform scale into shapes so Jolt never logs errors or averages axes), and rebuilds exported skeletal `UPhysicsAsset` (`_physics.json`) bodies onto `Skeleton3D` via `PhysicalBoneSimulator3D` + `PhysicalBone3D`.
 - **Blueprint & Multi-Component Actors** — Reconstructs complex Blueprint actors as a parent `Node3D` with each component placed at its relative transform offset.
 - **Clean, Grouped Scene Tree** — Organizes imported nodes into dedicated containers (`UnrealStaticMeshes`, `UnrealLights`, `UnrealDecals`, `UnrealFoliage`, and `UnrealNavigation`) so key scene elements aren't buried under thousands of props.
 

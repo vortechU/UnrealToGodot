@@ -19,6 +19,8 @@ var foliage_check: CheckBox
 var navigation_check: CheckBox
 var navigation_bake_check: CheckBox
 var metadata_check: CheckBox
+var lods_check: CheckBox
+var skel_physics_check: CheckBox
 var flip_normal_green_check: CheckBox
 var save_external_mats_check: CheckBox
 var energy_scale_spin: SpinBox
@@ -171,6 +173,8 @@ func _enter_tree() -> void:
 	navigation_check = _make_check(features,"Navigation Regions", "Create NavigationRegion3D nodes from Unreal NavMeshBoundsVolumes with matching agent settings.")
 	navigation_bake_check = _make_check(features,"    Bake navigation on import", "Bake the navigation meshes immediately after import (synchronous; can take a moment on large levels).", false)
 	metadata_check = _make_check(features,"Tags & Metadata", "Copy Unreal actor tags, classes and Blueprint variables onto nodes as metadata (get_meta()).")
+	lods_check = _make_check(features,"LOD Chains (_LOD<n>.gltf)", "Instance exported _LOD1..N glTF meshes alongside LOD0 and wire Godot visibility_range switching from Unreal screen-size thresholds.", true)
+	skel_physics_check = _make_check(features,"Skeletal Physics (_physics.json)", "Attach PhysicalBoneSimulator3D + PhysicalBone3D colliders onto imported Skeleton3D nodes from exported <mesh>_physics.json files.", true)
 	flip_normal_green_check = _make_check(features,"Flip normal map green channel (DX -> GL)", "Converts Unreal DirectX (-Y) normal maps to Godot OpenGL (+Y) via Godot's non-destructive process/normal_map_invert_y import flag (skipping maps whose Unreal Flip Green Channel flag was already enabled).", true)
 	save_external_mats_check = _make_check(features,"Save shared materials as .tres files", "Writes shared StandardMaterial3D resources to res://materials/ and reuses existing .tres files on re-import, keeping .tscn files smaller and allowing cross-scene material edits.", false)
 
@@ -250,6 +254,12 @@ func _enter_tree() -> void:
 	bind_foliage_btn.tooltip_text = "For scenes generated directly from Unreal (.tscn): loads each foliage MultiMesh's source glTF model and binds its mesh. Run once after opening the generated scene."
 	bind_foliage_btn.pressed.connect(_on_bind_foliage_pressed)
 	vbox.add_child(bind_foliage_btn)
+
+	var build_skel_phys_btn := Button.new()
+	build_skel_phys_btn.text = "Build Skeletal Physics (.tscn scenes)"
+	build_skel_phys_btn.tooltip_text = "Attaches PhysicalBoneSimulator3D colliders from <mesh>_physics.json files to any Skeleton3D in the currently open scene."
+	build_skel_phys_btn.pressed.connect(_on_build_skel_physics_pressed)
+	vbox.add_child(build_skel_phys_btn)
 	
 	# --- Status Label ---
 	status_label = Label.new()
@@ -258,6 +268,25 @@ func _enter_tree() -> void:
 	status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	status_label.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6))
 	vbox.add_child(status_label)
+
+func _on_build_skel_physics_pressed() -> void:
+	var scene_root: Node = EditorInterface.get_edited_scene_root()
+	if not scene_root:
+		status_label.text = "Error: Open a 3D scene first."
+		status_label.add_theme_color_override("font_color", Color(0.9, 0.3, 0.3))
+		return
+	var skel_script = load("res://addons/unreal_importer/import_skeletal_physics.gd")
+	if skel_script == null:
+		status_label.text = "Error: import_skeletal_physics.gd missing."
+		status_label.add_theme_color_override("font_color", Color(0.9, 0.3, 0.3))
+		return
+	var helper = skel_script.new()
+	var bones := int(helper.attach_in_scene(scene_root, models_edit.text, scene_root))
+	if bones > 0:
+		EditorInterface.mark_scene_as_unsaved()
+	status_label.text = "Status: Built %d skeletal physics bone(s)." % bones
+	status_label.add_theme_color_override("font_color", Color(0.2, 0.8, 0.2) if bones > 0 else Color(0.6, 0.6, 0.6))
+
 
 func _on_bind_foliage_pressed() -> void:
 	var scene_root: Node = EditorInterface.get_edited_scene_root()
@@ -522,6 +551,8 @@ func _on_import_pressed() -> void:
 		"apply_navigation": navigation_check.button_pressed,
 		"navigation_bake": navigation_bake_check.button_pressed,
 		"apply_metadata": metadata_check.button_pressed,
+		"apply_lods": lods_check.button_pressed,
+		"apply_skeletal_physics": skel_physics_check.button_pressed,
 		"flip_normal_green": flip_normal_green_check.button_pressed,
 		"save_external_materials": save_external_mats_check.button_pressed,
 		"light_energy_scale": energy_scale_spin.value,

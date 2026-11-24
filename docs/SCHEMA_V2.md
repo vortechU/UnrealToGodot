@@ -74,7 +74,9 @@ Each entry:
     "path": "/Game/Env/SM_Rock.SM_Rock",
     "export_name": "<mesh_key>",       // base filename of the exported glTF
     "collision": { "boxes": [...], "spheres": [...], "capsules": [...], "convex_hulls": [...] } | null,
-    "materials": [ { "slot_index": 0, "slot_name": "...", "material_name": "...", "material_path": "...", "parameters": { ... } } ]
+    "materials": [ { "slot_index": 0, "slot_name": "...", "material_name": "...", "material_path": "...", "parameters": { ... } } ],
+    "lods": [ { "lod_index": 0, "export_name": "<mesh_key>", "screen_size": 1.0, "switch_distance_m": 0.0 }, ... ], // optional; present when >1 LOD
+    "physics_file": "<mesh_key>_physics.json" // optional; skeletal meshes with a UPhysicsAsset
 }
 ```
 

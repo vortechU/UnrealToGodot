@@ -157,9 +157,69 @@ def make_gltf(with_texture):
     return doc
 
 
-for name in ["SM_Rock", "SM_Crate", "SM_Scaled"]:
+for name in ["SM_Rock", "SM_Crate", "SM_Crate_LOD1", "SM_Crate_LOD2", "SM_Scaled"]:
     with open(os.path.join(HARNESS, "models", name + ".gltf"), "w", encoding="utf-8") as f:
         json.dump(make_gltf(with_texture=False), f)
+
+# Minimal skinned glTF with a 2-bone Skeleton3D ("root" -> "spine") + companion
+# SK_Dummy_physics.json to test import_skeletal_physics.gd in real Godot.
+_ibm = struct.pack("<16f", 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1) * 2
+_joints = struct.pack("<12B", 0,0,0,0, 0,0,0,0, 1,0,0,0)
+_weights = struct.pack("<12f", 1,0,0,0, 1,0,0,0, 1,0,0,0)
+_sk_blob = pos_bytes + uv_bytes + idx_bytes + _ibm + _joints + _weights
+_sk_gltf = {
+    "asset": {"version": "2.0", "generator": "harness"},
+    "scene": 0,
+    "scenes": [{"nodes": [0, 1]}],
+    "nodes": [
+        {"name": "root", "children": [2]},
+        {"name": "SkMesh", "mesh": 0, "skin": 0},
+        {"name": "spine", "translation": [0.0, 1.0, 0.0]},
+    ],
+    "skins": [{"inverseBindMatrices": 3, "joints": [0, 2], "skeleton": 0}],
+    "meshes": [{"name": "SkTri", "primitives": [{
+        "attributes": {"POSITION": 0, "TEXCOORD_0": 1, "JOINTS_0": 4, "WEIGHTS_0": 5},
+        "indices": 2,
+    }]}],
+    "buffers": [{
+        "byteLength": len(_sk_blob),
+        "uri": "data:application/octet-stream;base64," + base64.b64encode(_sk_blob).decode("ascii"),
+    }],
+    "bufferViews": [
+        {"buffer": 0, "byteOffset": 0, "byteLength": len(pos_bytes), "target": 34962},
+        {"buffer": 0, "byteOffset": len(pos_bytes), "byteLength": len(uv_bytes), "target": 34962},
+        {"buffer": 0, "byteOffset": len(pos_bytes) + len(uv_bytes), "byteLength": 6, "target": 34963},
+        {"buffer": 0, "byteOffset": len(blob), "byteLength": len(_ibm)},
+        {"buffer": 0, "byteOffset": len(blob) + len(_ibm), "byteLength": len(_joints), "target": 34962},
+        {"buffer": 0, "byteOffset": len(blob) + len(_ibm) + len(_joints), "byteLength": len(_weights), "target": 34962},
+    ],
+    "accessors": [
+        {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+         "min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 0.0]},
+        {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC2",
+         "min": [0.0, 0.0], "max": [1.0, 1.0]},
+        {"bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR"},
+        {"bufferView": 3, "componentType": 5126, "count": 2, "type": "MAT4"},
+        {"bufferView": 4, "componentType": 5121, "count": 3, "type": "VEC4"},
+        {"bufferView": 5, "componentType": 5126, "count": 3, "type": "VEC4"},
+    ],
+}
+with open(os.path.join(HARNESS, "models", "SK_Dummy.gltf"), "w", encoding="utf-8") as f:
+    json.dump(_sk_gltf, f)
+with open(os.path.join(HARNESS, "models", "SK_Dummy_physics.json"), "w", encoding="utf-8") as f:
+    json.dump({
+        "mesh_name": "SK_Dummy",
+        "physics_asset_name": "PA_Dummy",
+        "bodies": [
+            {"bone_name": "root", "shapes": {
+                "boxes": [{"size": [40.0, 40.0, 40.0], "godot_local_transform": {"translation": [0,0,0], "rotation_quat": [0,0,0,1], "scale": [1,1,1]}}],
+                "spheres": [], "capsules": [], "convex_hulls": []}},
+            {"bone_name": "SPINE", "shapes": {
+                "boxes": [], "spheres": [],
+                "capsules": [{"radius": 15.0, "length": 50.0, "godot_local_transform": {"translation": [0,0,0], "rotation_quat": [0,0,0,1], "scale": [1,1,1]}}],
+                "convex_hulls": []}},
+        ],
+    }, f)
 
 # SM_Textured proves Godot resolves "../textures/..." out of a sibling folder.
 with open(os.path.join(HARNESS, "models", "SM_Textured.gltf"), "w", encoding="utf-8") as f:
@@ -202,9 +262,17 @@ layout = {
                     "collision": {"boxes": [{"size": [100.0, 100.0, 100.0],
                                              "godot_local_transform": t(0, 0, 0)}],
                                   "spheres": [], "capsules": [], "convex_hulls": []}},
-        # Crate has no collision -> exercises the plain-instance path.
+        # Crate has no collision -> exercises the plain-instance path + LOD chains.
         "SM_Crate": {"path": "/Game/SM_Crate", "export_name": "SM_Crate",
-                     "collision": None, "materials": []},
+                     "collision": None, "materials": [],
+                     "lods": [
+                         {"lod_index": 0, "export_name": "SM_Crate", "screen_size": 1.0, "switch_distance_m": 0.0},
+                         {"lod_index": 1, "export_name": "SM_Crate_LOD1", "screen_size": 0.5, "switch_distance_m": 12.0},
+                         {"lod_index": 2, "export_name": "SM_Crate_LOD2", "screen_size": 0.2, "switch_distance_m": 28.0},
+                     ]},
+        "SK_Dummy": {"path": "/Game/SK_Dummy", "export_name": "SK_Dummy",
+                     "collision": None, "materials": [],
+                     "physics_file": "SK_Dummy_physics.json"},
         # One of every collision primitive, for the non-uniformly scaled actor.
         # Jolt refuses a non-uniform scale on a sphere or a capsule outright, and
         # on a rotated box or hull; the importer has to bake the scale into these
@@ -336,6 +404,15 @@ layout = {
             "components": [{"name": "SM0", "mesh_key": "SM_Textured", "mesh_name": "SM_Textured",
                             "godot_relative_transform": t(0, 5, 0),
                             "godot_world_transform": t(0, 5, 0),
+                            "material_overrides": []}],
+        },
+        {
+            # Skeletal mesh with companion SK_Dummy_physics.json.
+            "name": "Hero_1", "class": "SkeletalMeshActor",
+            "godot_transform": t(-5, 0, -5),
+            "components": [{"name": "SK0", "mesh_key": "SK_Dummy", "mesh_name": "SK_Dummy",
+                            "godot_relative_transform": t(-5, 0, -5),
+                            "godot_world_transform": t(-5, 0, -5),
                             "material_overrides": []}],
         },
     ],

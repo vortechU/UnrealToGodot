@@ -42,6 +42,8 @@ const DEFAULT_IMPORT_OPTIONS := {
 	"apply_navigation": true,
 	"navigation_bake": false,
 	"apply_metadata": true,
+	"apply_lods": true,
+	"apply_skeletal_physics": true,
 	"flip_normal_green": true,
 	"save_external_materials": false,
 	"materials_folder": "res://materials/",
@@ -164,8 +166,11 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 				% [int(flip_res["changed"]), int(flip_res["total"]), str(flip_enabled)])
 	
 	var imported_count: int = 0
+	var lod_chains_wired: int = 0
+	var skel_physics_bones: int = 0
 	var missing_meshes: Dictionary = {}
 	var gameplay_helper = _load_feature("import_gameplay.gd")
+	var skel_physics_helper = _load_feature("import_skeletal_physics.gd")
 
 	# Every mesh actor goes under one container, the way lights (UnrealLights),
 	# decals (UnrealDecals), foliage and navigation already do. A level is mostly
@@ -266,6 +271,16 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					instanced_mesh.owner = active_scene_root
 					_set_owner_recursive(instanced_mesh, active_scene_root)
 					instanced_mesh.transform = mesh_place
+
+				if bool(import_options.get("apply_lods", true)):
+					var lod_parent: Node = physics_body if physics_body else instanced_mesh
+					var lod_xform: Transform3D = instanced_mesh.transform if physics_body else Transform3D.IDENTITY
+					if _apply_lod_chain(instanced_mesh, lod_parent, lod_xform, mesh_key, mesh_name, overrides, meshes_lib) > 0:
+						lod_chains_wired += 1
+				if bool(import_options.get("apply_skeletal_physics", true)) and skel_physics_helper:
+					skel_physics_bones += int(skel_physics_helper.attach_to_instance(
+						instanced_mesh, mesh_key, models_folder, active_scene_root, meshes_lib))
+
 				imported_count += 1
 				if gameplay_helper:
 					var target_node: Node = physics_body if physics_body else instanced_mesh
@@ -334,6 +349,16 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 						instanced_mesh.owner = active_scene_root
 						_set_owner_recursive(instanced_mesh, active_scene_root)
 						instanced_mesh.transform = mesh_place
+
+					if bool(import_options.get("apply_lods", true)):
+						var lod_parent: Node = physics_body if physics_body else instanced_mesh
+						var lod_xform: Transform3D = instanced_mesh.transform if physics_body else Transform3D.IDENTITY
+						if _apply_lod_chain(instanced_mesh, lod_parent, lod_xform, mesh_key, mesh_name, overrides, meshes_lib) > 0:
+							lod_chains_wired += 1
+					if bool(import_options.get("apply_skeletal_physics", true)) and skel_physics_helper:
+						skel_physics_bones += int(skel_physics_helper.attach_to_instance(
+							instanced_mesh, mesh_key, models_folder, active_scene_root, meshes_lib))
+
 					if gameplay_helper and gameplay_helper.has_method("apply_component_metadata"):
 						gameplay_helper.apply_component_metadata(physics_body if physics_body else instanced_mesh, comp_data, import_options)
 				else:
@@ -393,6 +418,10 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 		report.fact("actors in json", actors.size())
 		report.fact("mesh entries in json", meshes_lib.size())
 		report.fact("actors imported", imported_count)
+		if lod_chains_wired > 0:
+			report.fact("LOD chains wired", lod_chains_wired)
+		if skel_physics_bones > 0:
+			report.fact("skeletal physics bones built", skel_physics_bones)
 		if not _scale_baked.is_empty():
 			report.fact("meshes with baked collision scale", _scale_baked.size())
 			report.line("  Their actors are scaled non-uniformly, which Jolt cannot apply to a")
@@ -868,6 +897,110 @@ func _find_mesh_instances_recursive(node: Node, list: Array[MeshInstance3D]) -> 
 		list.append(node)
 	for child in node.get_children():
 		_find_mesh_instances_recursive(child, list)
+
+
+func _set_visibility_range_recursive(node: Node, range_begin: float, range_end: float) -> void:
+	"""Applies Godot 4 visibility_range_begin / visibility_range_end to every
+	MeshInstance3D in a glTF subtree for LOD distance switching."""
+	var instances: Array[MeshInstance3D] = []
+	_find_mesh_instances_recursive(node, instances)
+	for mi in instances:
+		mi.visibility_range_begin = range_begin
+		mi.visibility_range_end = range_end
+
+
+func _estimate_mesh_radius(node: Node) -> float:
+	"""Estimates the bounding-sphere radius (m) of a MeshInstance3D subtree for
+	auto-discovered LOD chains that lack explicit switch_distance_m values."""
+	var instances: Array[MeshInstance3D] = []
+	_find_mesh_instances_recursive(node, instances)
+	var max_r := 0.0
+	for mi in instances:
+		if mi.mesh:
+			var aabb := mi.mesh.get_aabb()
+			max_r = maxf(max_r, aabb.size.length() * 0.5)
+	return max_r if max_r > 0.01 else 1.0
+
+
+func _apply_lod_chain(lod0_node: Node3D, lod_parent: Node, lod_transform: Transform3D,
+		mesh_key: String, mesh_name: String, overrides: Array, meshes_lib: Dictionary) -> int:
+	"""Instances exported <mesh_key>_LOD1.gltf .. _LODn.gltf files and configures
+	non-overlapping visibility_range bands on LOD0 and every LOD sibling.
+	Returns the number of additional LOD levels wired (0 when no LOD1+ exists)."""
+	var mesh_entry = meshes_lib.get(mesh_key, {})
+	var raw_lods = mesh_entry.get("lods") if mesh_entry is Dictionary else null
+	var candidates: Array = []
+
+	if raw_lods is Array and (raw_lods as Array).size() > 1:
+		for item in raw_lods:
+			if not (item is Dictionary):
+				continue
+			var idx := int(item.get("lod_index", 0))
+			if idx <= 0:
+				continue
+			var exp_name := Common.get_str(item, "export_name", "%s_LOD%d" % [mesh_key, idx])
+			var path := find_model_for(active_models_folder, exp_name, "%s_LOD%d" % [mesh_name, idx])
+			if path == "":
+				continue
+			candidates.append({
+				"lod_index": idx,
+				"path": path,
+				"switch_distance_m": Common.get_num(item, "switch_distance_m", 0.0),
+			})
+	else:
+		# Auto-discover _LOD1.._LOD7 on disk even when the layout JSON predates "lods".
+		var radius_m := _estimate_mesh_radius(lod0_node)
+		var tan_half_fov := tan(deg_to_rad(37.5))
+		var default_ss := [0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.0078125]
+		for idx in range(1, 8):
+			var exp_name := "%s_LOD%d" % [mesh_key, idx]
+			var path := find_model_for(active_models_folder, exp_name, "%s_LOD%d" % [mesh_name, idx])
+			if path == "":
+				break
+			var ss: float = default_ss[idx - 1]
+			candidates.append({
+				"lod_index": idx,
+				"path": path,
+				"switch_distance_m": radius_m / (ss * tan_half_fov),
+			})
+
+	if candidates.is_empty():
+		return 0
+
+	candidates.sort_custom(func(a, b): return int(a["lod_index"]) < int(b["lod_index"]))
+
+	# Ensure strictly increasing switch distances.
+	var prev_dist := 0.0
+	for c in candidates:
+		var d := float(c["switch_distance_m"])
+		if d <= prev_dist:
+			d = prev_dist + 10.0
+		c["switch_distance_m"] = d
+		prev_dist = d
+
+	# Set LOD0 visibility end at LOD1's switch distance BEFORE adding LOD1..N as children
+	# of lod0_node (otherwise _set_visibility_range_recursive would overwrite them).
+	_set_visibility_range_recursive(lod0_node, 0.0, float(candidates[0]["switch_distance_m"]))
+
+	var wired := 0
+	for i in range(candidates.size()):
+		var entry: Dictionary = candidates[i]
+		var lod_inst := instance_gltf(str(entry["path"]))
+		if lod_inst == null:
+			continue
+		apply_materials_to_instance(lod_inst, mesh_key, overrides, meshes_lib)
+		var r_begin := float(entry["switch_distance_m"])
+		var r_end := float(candidates[i + 1]["switch_distance_m"]) if (i + 1 < candidates.size()) else 0.0
+		_set_visibility_range_recursive(lod_inst, r_begin, r_end)
+		lod_inst.name = "%s_LOD%d" % [mesh_name if mesh_name != "" else mesh_key, int(entry["lod_index"])]
+		lod_parent.add_child(lod_inst)
+		lod_inst.owner = active_scene_root
+		_set_owner_recursive(lod_inst, active_scene_root)
+		lod_inst.transform = lod_transform
+		lod_inst.set_meta("unreal_lod_index", int(entry["lod_index"]))
+		wired += 1
+
+	return wired
 
 func get_or_create_material(mat_name: String, mat_path: String, params: Dictionary, existing_mat: Material = null) -> BaseMaterial3D:
 	"""

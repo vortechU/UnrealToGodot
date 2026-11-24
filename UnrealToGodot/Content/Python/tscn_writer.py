@@ -774,6 +774,31 @@ class _TscnWriter(object):
                          % ", ".join('"%s"' % _escape_string(t) for t in tags))
         return lines
 
+    def _mesh_extra_metadata_lines(self, mesh_key, meshes_lib):
+        """Emits LOD / skeletal-physics handover metadata onto instanced mesh
+        nodes so dock utilities can bind them on directly-generated .tscn scenes."""
+        lines = []
+        entry = (meshes_lib or {}).get(mesh_key)
+        if not isinstance(entry, dict):
+            return lines
+        lods = entry.get("lods")
+        if isinstance(lods, list) and len(lods) > 1:
+            lod_paths = []
+            for item in lods:
+                if isinstance(item, dict) and int(_num(item.get("lod_index"), 0)) > 0:
+                    exp = item.get("export_name") or ""
+                    rp = self._mesh_res_path(exp)
+                    if rp:
+                        lod_paths.append(rp)
+            if lod_paths:
+                lines.append("metadata/unreal_lod_files = PackedStringArray(%s)"
+                             % ", ".join('"%s"' % _escape_string(p) for p in lod_paths))
+        phys = entry.get("physics_file")
+        if phys:
+            lines.append('metadata/unreal_mesh_key = "%s"' % _escape_string(mesh_key))
+            lines.append('metadata/unreal_physics_file = "%s"' % _escape_string(self.models_res + os.path.basename(str(phys))))
+        return lines
+
     # --- collision -> shape sub_resources ----------------------------------------------------
     def _emit_collision(self, parent_path, collision, scale=_UNIT_SCALE):
         """Emit CollisionShape3D child nodes (+ shape sub_resources) mirroring the GDScript
@@ -943,7 +968,8 @@ class _TscnWriter(object):
                                        props=body_props, metadata=actor_meta)
             self._emit_collision(body_path, collision, scale)
             inst_props = ["transform = " + _mat_to_transform3d(_scale_diag(scale))]
-            inst_meta = self._component_metadata_lines(comp) if emit_meta else []
+            inst_meta = (self._component_metadata_lines(comp) if emit_meta else []) \
+                + self._mesh_extra_metadata_lines(mesh_key, meshes_lib)
             self._add_node(_mesh_node_name(comp, mesh_key), None, body_path,
                            instance_id=ext_id, props=inst_props, metadata=inst_meta)
         else:
@@ -951,7 +977,8 @@ class _TscnWriter(object):
             # Merge actor + component tags into a single metadata/unreal_tags line
             # so Godot never sees duplicate keys in the same [node] block.
             props = ["transform = " + _mat_to_transform3d(mesh_place)]
-            meta = self._actor_metadata_lines(actor, extra_tags=comp.get("tags")) if emit_meta else []
+            meta = (self._actor_metadata_lines(actor, extra_tags=comp.get("tags")) if emit_meta else []) \
+                + self._mesh_extra_metadata_lines(mesh_key, meshes_lib)
             self._add_node(actor_name, None, root_path, instance_id=ext_id,
                            props=props, metadata=meta)
 

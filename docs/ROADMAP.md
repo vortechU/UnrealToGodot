@@ -13,9 +13,9 @@ This document tracks the planned feature additions across the Unreal exporter pl
 
 ## Overall Progress
 
-- **Completed:** 4 / 15
+- **Completed:** 6 / 15
 - **In Progress:** 0 / 15
-- **Pending:** 11 / 15
+- **Pending:** 9 / 15
 
 ---
 
@@ -52,17 +52,17 @@ Highest visual payoff across every imported asset pack.
 
 Features whose Unreal export side already exists, waiting on full Godot consumption.
 
-- [ ] **5. Wire Up Exported `_LOD<n>.gltf` Chains in Godot**
+- [x] **5. Wire Up Exported `_LOD<n>.gltf` Chains in Godot**
   - **Goal:** Make the exporter's existing **"Export LOD Levels"** checkbox work end-to-end for heavy/Nanite asset packs.
-  - **Exporter:** Export per-LOD Unreal `screen_size` thresholds and filenames under `meshes[key].lods`.
-  - **Godot Importer & `.tscn` Writer:** Instance LOD meshes with matching `visibility_range_begin` / `visibility_range_end` and fade margins (or merge LOD surfaces where appropriate).
-  - **Tests:** Unit tests for screen-size → distance conversion + Godot harness LOD visibility assertions.
+  - **Exporter:** Export per-LOD Unreal `screen_size` thresholds and computed `switch_distance_m` under `meshes[key].lods` in `export_level_to_json.py`.
+  - **Godot Importer & `.tscn` Writer:** Instance `_LOD1..N.gltf` meshes with non-overlapping `visibility_range_begin` / `visibility_range_end` bands (plus disk auto-discovery for older layouts) and `metadata/unreal_lod_files` handover in `tscn_writer.py`.
+  - **Tests:** `test_materials.py` screen-size math + headless Godot harness LOD visibility assertions.
 
-- [ ] **6. Consume `<mesh>_physics.json` for Skeletal Meshes**
+- [x] **6. Consume `<mesh>_physics.json` for Skeletal Meshes**
   - **Goal:** Complete the existing `extract_skeletal_mesh_physics` (`UPhysicsAsset`) pipeline on the Godot side.
-  - **Exporter:** Verify bone-local transform conventions against real Unreal `USkeletalMesh` + `UPhysicsAsset` exports.
-  - **Godot Importer:** Add an optional toggle (and standalone dock utility) to generate `PhysicalBoneSimulator3D` / `PhysicalBone3D` shapes (or `BoneAttachment3D` collider hitboxes) from `<mesh>_physics.json`.
-  - **Tests:** Transform/axis verification + headless Godot skeletal physics fixture test.
+  - **Exporter:** Stamps `physics_file` on skeletal mesh entries with a `UPhysicsAsset` in `export_level_to_json.py` (and `metadata/unreal_physics_file` in `tscn_writer.py`).
+  - **Godot Importer:** Added `addons/unreal_importer/import_skeletal_physics.gd` building `PhysicalBoneSimulator3D` + `PhysicalBone3D` + `CollisionShape3D` (case-insensitive bone matching) during import and via a standalone dock button (**"Build Skeletal Physics (.tscn scenes)"**).
+  - **Tests:** Headless Godot harness with real 2-bone skinned glTF + `_physics.json` fixture.
 
 ---
 
