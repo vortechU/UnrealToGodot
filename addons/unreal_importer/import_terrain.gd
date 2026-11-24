@@ -54,6 +54,10 @@ func apply(data: Dictionary, root: Node, scene_owner: Node, options: Dictionary)
 		if img == null:
 			warnings.append("Landscape '%s': heightmap could not be loaded (%s)." % [ls_name, Common.get_str(ls, "heightmap_file", "?")])
 			continue
+		if img.get_width() < 2 or img.get_height() < 2:
+			warnings.append("Landscape '%s': degenerate heightmap resolution (%dx%d); skipped."
+				% [ls_name, img.get_width(), img.get_height()])
+			continue
 
 		# An all-constant heightmap is a broken export, not a real landscape:
 		# every GPU route Unreal exposes can silently render nothing. Import it
@@ -151,6 +155,10 @@ func _build_mesh_terrain(ls: Dictionary, img: Image, root: Node, scene_owner: No
 	var extent: Vector3 = bounds[1]
 	if extent.x < 1.0 or extent.y < 1.0:
 		warnings.append("Landscape '%s': degenerate bounds; skipped." % ls_name)
+		return false
+	if img.get_width() < 2 or img.get_height() < 2:
+		warnings.append("Landscape '%s': degenerate heightmap resolution (%dx%d); skipped."
+			% [ls_name, img.get_width(), img.get_height()])
 		return false
 
 	# Downsample to a manageable grid before per-pixel work
@@ -423,14 +431,17 @@ func _try_terrain3d(ls: Dictionary, img: Image, root: Node, scene_owner: Node,
 	    instead, which puts the terrain exactly where Unreal had it."""
 	if not ClassDB.class_exists("Terrain3D"):
 		return false
-	var terrain = ClassDB.instantiate("Terrain3D")
-	if terrain == null or not (terrain is Node3D):
-		return false
-
 	var ls_name := Common.get_str(ls, "name", "Landscape")
 	var bounds := _ue_bounds(ls)
 	var center: Vector3 = bounds[0]
 	var extent: Vector3 = bounds[1]
+	if extent.x < 1.0 or extent.y < 1.0:
+		warnings.append("Landscape '%s': degenerate bounds; skipped." % ls_name)
+		return false
+
+	var terrain = ClassDB.instantiate("Terrain3D")
+	if terrain == null or not (terrain is Node3D):
+		return false
 
 	# Terrain3D spaces its vertices `vertex_spacing` metres apart, so the spacing
 	# must describe the HEIGHTMAP's texels, not Unreal's landscape quads: the
@@ -547,7 +558,7 @@ func _align_to_region_grid(img: Image, corner: Vector3, region_extent_m: float, 
 	Returns {"image": Image, "origin": Vector3} — import at `origin` and the
 	original pixels come to rest on `corner`."""
 	if region_extent_m <= 0.0:
-		return {"image": img, "origin": corner}
+		return {"image": img, "origin": corner, "pad_x": 0, "pad_z": 0}
 	var snapped := Vector3(floorf(corner.x / region_extent_m) * region_extent_m, 0.0,
 		floorf(corner.z / region_extent_m) * region_extent_m)
 	var pad_x := int(round((corner.x - snapped.x) / spacing))
@@ -599,7 +610,7 @@ func _store_terrain_metadata(node: Node, ls: Dictionary) -> void:
 	if res is Array and res.size() >= 2:
 		node.set_meta("heightmap_resolution", Vector2i(int(res[0]), int(res[1])))
 	node.set_meta("height_range_m", ls.get("height_range_m", []))
-	node.set_meta("vertex_spacing_m", float(ls.get("vertex_spacing_m", 1.0)))
+	node.set_meta("vertex_spacing_m", Common.get_num(ls, "vertex_spacing_m", 1.0))
 	# The landscape material's own textures, so the ground textures are findable
 	# from the node rather than by hunting through textures/ by name.
 	var material = ls.get("material")

@@ -322,14 +322,22 @@ func _make_check(parent: Control, text: String, tooltip: String, default_on: boo
 	return check
 
 
+func _dialog_initial_dir(path_str: String, is_file: bool) -> String:
+	var dir_path := path_str.get_base_dir() if is_file else path_str
+	if not (dir_path.begins_with("res://") or dir_path.contains("/") or dir_path.contains("\\")):
+		dir_path = "res://"
+	if dir_path.begins_with("res://"):
+		dir_path = ProjectSettings.globalize_path(dir_path)
+	return dir_path
+
+
 func _on_browse_json() -> void:
 	var dialog := FileDialog.new()
 	dialog.title = "Select Layout JSON File"
 	dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILE
 	dialog.access = FileDialog.ACCESS_FILESYSTEM
 	dialog.add_filter("*.json", "JSON Files")
-	var current_path = json_edit.text
-	dialog.current_dir = current_path.get_base_dir() if (current_path.begins_with("res://") or current_path.contains("/") or current_path.contains("\\")) else "res://"
+	dialog.current_dir = _dialog_initial_dir(json_edit.text, true)
 	EditorInterface.get_base_control().add_child(dialog)
 	
 	dialog.file_selected.connect(func(path):
@@ -346,8 +354,7 @@ func _on_browse_models() -> void:
 	dialog.title = "Select glTF Models Folder"
 	dialog.file_mode = FileDialog.FILE_MODE_OPEN_DIR
 	dialog.access = FileDialog.ACCESS_FILESYSTEM
-	var current_path = models_edit.text
-	dialog.current_dir = current_path if (current_path.begins_with("res://") or current_path.contains("/") or current_path.contains("\\")) else "res://"
+	dialog.current_dir = _dialog_initial_dir(models_edit.text, false)
 	EditorInterface.get_base_control().add_child(dialog)
 	
 	dialog.dir_selected.connect(func(path):
@@ -367,8 +374,7 @@ func _on_browse_textures() -> void:
 	dialog.title = "Select Textures Folder"
 	dialog.file_mode = FileDialog.FILE_MODE_OPEN_DIR
 	dialog.access = FileDialog.ACCESS_FILESYSTEM
-	var current_path = textures_edit.text
-	dialog.current_dir = current_path if (current_path.begins_with("res://") or current_path.contains("/") or current_path.contains("\\")) else "res://"
+	dialog.current_dir = _dialog_initial_dir(textures_edit.text, false)
 	EditorInterface.get_base_control().add_child(dialog)
 	
 	dialog.dir_selected.connect(func(path):
@@ -471,25 +477,30 @@ func _on_import_pressed() -> void:
 		while shrink_fs and shrink_fs.is_scanning():
 			await get_tree().process_frame
 
-	# Cap textures that are already in the project. Changing the importer
-	# default only affects future imports, so anything transferred in before
-	# the limit was chosen is still sitting there at full 4K.
-	if tex_limit > 0:
-		var total_capped := 0
-		var total_textures := 0
-		for folder in tex_folders:
-			var capped: Dictionary = TextureLimit.apply_to_folder(folder, tex_limit)
-			total_capped += int(capped.get("changed", 0))
-			total_textures += int(capped.get("total", 0))
-		if total_capped > 0:
+	# Sync process/size_limit on textures already in the project (including 0 when
+	# switching back to "No limit" -- _rewrite_import_file is a no-op when already equal).
+	var total_capped := 0
+	var total_textures := 0
+	for folder in tex_folders:
+		var capped: Dictionary = TextureLimit.apply_to_folder(folder, tex_limit)
+		total_capped += int(capped.get("changed", 0))
+		total_textures += int(capped.get("total", 0))
+	if total_capped > 0:
+		if tex_limit > 0:
 			status_label.text = "Status: capping %d texture(s) to %dpx..." % [total_capped, tex_limit]
+		else:
+			status_label.text = "Status: uncapping %d texture(s)..." % total_capped
+		await get_tree().process_frame
+		# Let the queued reimports finish before materials load the textures.
+		var fs := EditorInterface.get_resource_filesystem()
+		while fs and fs.is_scanning():
 			await get_tree().process_frame
-			# Let the queued reimports finish before materials load the textures.
-			var fs := EditorInterface.get_resource_filesystem()
-			while fs and fs.is_scanning():
-				await get_tree().process_frame
+		if tex_limit > 0:
 			print("Unreal Importer: capped %d/%d texture(s) to %dpx"
 				% [total_capped, total_textures, tex_limit])
+		else:
+			print("Unreal Importer: removed size cap on %d/%d texture(s)"
+				% [total_capped, total_textures])
 
 	# Instantiate our importer class. Note that since we invoke do_import() directly
 	# and pass the scene root, we bypass the need for EditorScript's get_scene() context.

@@ -1,331 +1,280 @@
 # Unreal Engine to Godot Asset & Level Exporter
 
-A robust toolset for migrating level layouts, static/skeletal meshes, collision shapes, and PBR materials from **Unreal Engine** to **Godot Engine 4.x**. 
+A toolchain for migrating 3D asset packs and level layouts—static and skeletal meshes, collision shapes, PBR materials, lighting, decals, landscapes, foliage, and navigation—from **Unreal Engine** to **Godot Engine 4**.
 
-**What this is for:** moving **3D asset packs you own** out of Unreal and into
-Godot — the meshes, their materials and textures, their collision, and the way
-they are laid out in a level. If you have bought environment or prop packs and
-want to build with them in Godot, this is the tool.
+![Unreal Engine 5 scene compared side-by-side with the imported scene in Godot 4](assets/social-card.jpg)
 
-**What it is not:** a project converter. Gameplay logic, Blueprint graphs and
-systems do not come across, and that is by design — see
-[Scope](#scope-what-transfers-and-what-doesnt) before you start.
+> **What this is for:** Moving **3D asset packs you own** out of Unreal and into Godot with their meshes, materials, textures, collisions, and level layout intact.
+>
+> **What it is not:** A full project converter. Gameplay logic, Blueprint graphs, and engine systems do not transfer by design—see [Scope: What Transfers & What Doesn't](#scope-what-transfers--what-doesnt) before starting.
 
-This repository contains two main components:
-1. **Unreal to Godot Exporter (Unreal Plugin)**: A Python-based plugin that runs inside Unreal Engine, providing a thread-safe Tkinter GUI to batch export meshes to glTF and level layouts to JSON.
-2. **Unreal Layout Importer (Godot Addon)**: A GDScript addon that parses the JSON layout and instances the exported glTF models at their correct remapped coordinate transforms, automatically generating physics collisions and remapping PBR materials.
+### Quick Navigation
+
+[Compatibility](#engine-compatibility) · [Features](#key-features) · [Project Structure](#project-structure) · [Installation](#installation--setup) · [How to Use](#how-to-use) · [Scope](#scope-what-transfers--what-doesnt) · [Troubleshooting](#troubleshooting) · [Schema & Extending](#schema--extending) · [Support](#support)
+
+---
+
+## Architecture Overview
+
+The repository contains two paired components that share a versioned JSON layout schema:
+
+1. **Unreal to Godot Exporter (Unreal Plugin)** — A Python plugin running inside Unreal Engine with a thread-safe Tkinter GUI to batch-export meshes to glTF, textures to PNG, landscapes to EXR, and level layouts to JSON (or directly to `.tscn`).
+2. **Unreal Layout Importer (Godot Addon)** — A GDScript editor dock that parses the layout JSON, instances exported glTF assets at remapped transforms, generates physics collisions, binds PBR materials, and rebuilds lighting, terrain, foliage, decals, and navigation.
 
 ---
 
 ## Engine Compatibility
 
-| | Tested against | Notes |
-|---|---|---|
-| **Unreal Engine** | **5.7 - 5.8** | Both confirmed against the same landscape/material suite; the landscape API behaves identically on the two. Earlier versions are **untested** — no claim either way. Version-specific engine APIs are probed at runtime rather than assumed, so older 5.x may well work, but nobody has confirmed it yet. If you try one, [tell us how it went](https://discord.com/invite/HGwkYW2h6Y). Requires the built-in **Python Editor Script**, **Editor Scripting Utilities** and **glTF Exporter** plugins. |
-| **Godot** | **4.7.1** | The addon ships `.uid` resource sidecars, which are a Godot 4.4+ concept, so 4.4 is the practical floor. |
+| Engine | Tested Version | Requirements & Notes |
+| --- | --- | --- |
+| **Unreal Engine** | **5.7 – 5.8** | Confirmed against the same landscape and material test suite (landscape APIs behave identically on both). Earlier 5.x versions are **untested**, though version-specific APIs are probed at runtime rather than assumed—if you test an older version, [let us know on Discord](https://discord.com/invite/HGwkYW2h6Y). Requires built-in **Python Editor Script Plugin**, **Editor Scripting Utilities**, and **glTF Exporter**. |
+| **Godot Engine** | **4.7.1** | The addon ships `.uid` resource sidecars (introduced in Godot 4.4), making **Godot 4.4+** the practical minimum. |
 
-Both halves stamp and check a schema version, so a mismatched plugin/addon pair
-fails immediately with a message naming which side to update, rather than
-part-way through an import.
+Both plugins stamp and verify a schema `format_version`. A mismatched plugin/addon pair fails immediately with a message telling you which side to update, rather than breaking halfway through an import.
 
 ---
 
 ## Key Features
 
-- 🔄 **Coordinate & Scale Conversion**: Automatically transforms Unreal's left-handed Z-up (centimeter) coordinate system into Godot's right-handed Y-up (meter) system.
-- 📦 **Static Mesh glTF Export**: Batch exports selected meshes (or all meshes used in the level) from Unreal directly into glTF format, with collision-safe filenames when asset packs reuse mesh names.
-- 🧱 **Collision Shape Extraction**: Extracts Unreal collision primitives (Boxes, Spheres, Capsules, and Convex Hulls) and auto-generates corresponding Godot `CollisionShape3D` nodes attached to `StaticBody3D` nodes. Non-uniformly scaled props — Jolt refuses that scale on a shape and silently substitutes the average of the three axes, one console error per body per load — get the scale baked into the shapes instead, so the collider keeps matching the mesh and the log stays quiet.
-- 🗂️ **Grouped Scene Tree**: Mesh actors land under a single `UnrealStaticMeshes` node, beside `UnrealLights`, `UnrealDecals`, `UnrealFoliage` and `UnrealNavigation`, so the handful of nodes you actually go looking for aren't buried among thousands of props.
-- 🎨 **PBR Material & Texture Binding**: Translates Unreal material parameters (albedo, roughness, metallic, tiling) and binds exported textures to Godot `StandardMaterial3D` resources (case-insensitive file matching).
-- 🌿 **Blueprint/Complex Actor Support**: Supports multi-mesh/multi-component Blueprint actors by instancing them as a parent `Node3D` with relative component offsets.
-- 💡 **Lighting & Post-Processing**: Converts every light component — including those on Blueprint props, not just `DirectionalLight`/`PointLight`/`SpotLight`/`RectLight` actors — into `DirectionalLight3D`/`OmniLight3D`/`SpotLight3D`, carrying intensity (normalised through Unreal's own unit conversion, so lumens/candela/unitless/EV/nits all agree), linear colour, cone angles, source size, specular and volumetric scattering, shadow distance, distance fade and visibility. `PostProcessVolume` + height fog + sky become a Godot `WorldEnvironment` (bloom, SSAO, exposure, fog, sky, color temperature).
-- 🩹 **Decals**: Exports every decal component — including those on Blueprint props, not just `DeferredDecal` actors — as Godot `Decal` nodes with matching size, projection axis, textures, tint/opacity, visibility, sorting priority and distance fade.
-- ⛰️ **Landscape / Terrain Migration**: Exports Landscape heightmaps and paint-layer weightmaps as float EXR images and rebuilds them via the [Terrain3D](https://github.com/TokisanGames/Terrain3D) plugin (recommended — see [Landscapes](#landscapes-install-terrain3d)), with a plugin-free mesh fallback that needs no plugins at all. Unreal's GPU landscape export silently produces nothing on landscapes without edit layers — which is most asset-pack terrain — so the exporter validates what the GPU wrote and falls back to sampling the landscape's own collision heightfield and paint layers on the CPU. Paint layers come across as a splat material tinted with each layer's Unreal debug colour, with a texture slot per layer.
-- 🌱 **Foliage as MultiMesh**: Painted foliage, HISM and ISM instances are exported as packed transform arrays and rebuilt as `MultiMeshInstance3D` nodes — thousands of instances stay performant. Per-component visibility, shadow casting, Unreal's per-instance cull distances (as a Godot visibility range with matching fade) and material overrides all come across.
-- 🗺️ **Navigation Volumes**: `NavMeshBoundsVolume` actors become `NavigationRegion3D` nodes with matching agent settings (optionally auto-baked on import).
-- 🏷️ **Tags & Metadata**: Actor tags, component tags and (best-effort) Blueprint variables land on Godot nodes as metadata, readable via `get_meta()`.
-- 🎬 **Direct `.tscn` Generation**: Optionally writes a ready-to-open Godot 4 scene file straight from Unreal — no importer dock run required.
-- 🎛️ **Fully Customizable**: Every feature has its own toggle on both the Unreal export GUI and the Godot import dock, with persisted settings and tooltips.
-- ⚡ **Thread-Safe Architecture**: Uses a queue-based asynchronous architecture for the Tkinter GUI to prevent Unreal Engine editor lock-ups.
+### Geometry, Transforms & Scene Organization
+
+- **Coordinate & Scale Conversion** — Automatically converts Unreal's left-handed Z-up (centimeter) space into Godot's right-handed Y-up (meter) space.
+- **Batch Mesh glTF Export** — Exports selected meshes or every mesh used in the active level to glTF, using deterministic `_<hash>` filenames when asset packs reuse mesh names.
+- **Physics Collision Extraction** — Converts Unreal collision primitives (Boxes, Spheres, Capsules, and Convex Hulls) into `CollisionShape3D` nodes under `StaticBody3D`. For non-uniformly scaled props, scale is baked directly into the collision shapes rather than left on the physics body—preventing Jolt from averaging the axes and spamming console errors on every scene load.
+- **Blueprint & Multi-Component Actors** — Reconstructs complex Blueprint actors as a parent `Node3D` with each component placed at its relative transform offset.
+- **Clean, Grouped Scene Tree** — Organizes imported nodes into dedicated containers (`UnrealStaticMeshes`, `UnrealLights`, `UnrealDecals`, `UnrealFoliage`, and `UnrealNavigation`) so key scene elements aren't buried under thousands of props.
+
+### Materials, Lighting & Atmosphere
+
+- **PBR Material & Texture Binding** — Maps Unreal material parameters (albedo, normal, roughness, metallic, ORM/RMA, tiling) and auto-exported textures onto Godot `StandardMaterial3D` / `ORMMaterial3D` resources with case-insensitive file matching.
+- **Lighting & Post-Processing** — Converts every light component (including lights nested inside Blueprint props, not only standalone light actors) into `DirectionalLight3D`, `OmniLight3D`, or `SpotLight3D`. Carries unit-normalized intensity (lumens, candela, unitless, EV, nits), linear color, cone angles, source size, specular/volumetric scattering, shadow distance, distance fade, and visibility. Translates `PostProcessVolume`, height fog, and sky settings into a Godot `WorldEnvironment` (bloom, SSAO, exposure, fog, sky, and color temperature).
+- **Decals** — Exports every decal component (including those on Blueprint props) as Godot `Decal` nodes preserving bounds, projection axis, textures, tint/opacity, visibility, sorting priority, and distance fade.
+
+### Environments, Foliage & Gameplay Data
+
+- **Landscape / Terrain Migration** — Exports Landscape heightmaps and paint-layer weightmaps as float EXR images and rebuilds them using [Terrain3D](https://github.com/TokisanGames/Terrain3D) (recommended) or a plugin-free mesh fallback. Because Unreal's GPU landscape export silently writes empty images on landscapes without edit layers (common in asset packs), the exporter validates GPU readbacks and automatically falls back to CPU sampling of the landscape's collision heightfield and paint layers.
+- **Foliage as MultiMesh** — Exports painted foliage, HISM, and ISM instances as packed transform arrays and rebuilds them as performant `MultiMeshInstance3D` nodes, retaining visibility, shadow casting, per-instance cull distances (as Godot visibility ranges with matching fade), and material overrides.
+- **Navigation Volumes** — Converts `NavMeshBoundsVolume` actors into `NavigationRegion3D` nodes with matching agent settings and optional auto-baking on import.
+- **Tags & Metadata** — Copies actor tags, component tags, and (best-effort) Blueprint variables onto Godot nodes as metadata readable via `get_meta()`.
+
+### Workflow & Tooling
+
+- **Direct `.tscn` Generation** — Optionally writes a ready-to-open Godot 4 scene file directly from Unreal without needing to run the importer dock.
+- **Granular Controls** — Every feature has its own toggle on both the Unreal exporter GUI and the Godot importer dock, with persisted settings and descriptive tooltips.
+- **Thread-Safe Unreal GUI** — Uses a queue-based architecture so the Tkinter interface stays responsive without locking up the Unreal Editor.
 
 ---
 
 ## Project Structure
 
-```
+```text
 .
 ├── addons/
-│   └── unreal_importer/                 # Godot Importer Addon
-│       ├── import_unreal_layout.gd      # Core import orchestrator
-│       ├── import_common.gd             # Shared helpers (transforms, file lookup)
-│       ├── import_environment.gd        # Lights, WorldEnvironment, decals
-│       ├── import_terrain.gd            # Landscape rebuild (Terrain3D / mesh fallback)
-│       ├── import_foliage.gd            # MultiMesh foliage rebuild
-│       ├── import_gameplay.gd           # Navigation regions + node metadata
-│       ├── importer_dock.gd             # Editor dock GUI (feature toggles)
-│       ├── plugin.cfg                   # Addon configuration
-│       └── unreal_importer.gd           # Addon activation script
-├── UnrealToGodot/                       # Unreal Engine Plugin
+│   └── unreal_importer/                      # Godot Importer Addon
+│       ├── import_unreal_layout.gd           # Core import orchestrator
+│       ├── import_common.gd                  # Shared helpers (transforms, file lookup)
+│       ├── import_environment.gd             # Lights, WorldEnvironment, decals
+│       ├── import_terrain.gd                 # Landscape rebuild (Terrain3D / mesh fallback)
+│       ├── import_foliage.gd                 # MultiMesh foliage rebuild
+│       ├── import_gameplay.gd                # Navigation regions + node metadata
+│       ├── import_report.gd                  # Import audit report writer
+│       ├── texture_import_limit.gd           # Texture resolution cap & disk shrinking
+│       ├── importer_dock.gd                  # Editor dock GUI & feature toggles
+│       ├── plugin.cfg                        # Addon configuration
+│       └── unreal_importer.gd                # Addon activation script
+├── UnrealToGodot/                            # Unreal Engine Plugin
 │   ├── Content/
 │   │   └── Python/
-│   │       ├── export_level_to_json.py  # Level parser & JSON exporter (orchestrator)
-│   │       ├── export_static_meshes_to_gltf.py # glTF exporter script
-│   │       ├── export_environment.py    # Lights, post-process, fog, sky, decals
-│   │       ├── export_landscape.py      # Landscape heightmaps & splatmaps
-│   │       ├── export_foliage.py        # Foliage/ISM/HISM packed instances
-│   │       ├── export_gameplay.py       # Nav volumes, tags, Blueprint variables
-│   │       ├── tscn_writer.py           # Direct Godot .tscn scene generation
-│   │       ├── ue2g_common.py           # Shared conversion math
-│   │       ├── init_unreal.py           # Startup script (registers menu entry)
-│   │       └── unreal_to_godot_gui.py   # Thread-safe Tkinter GUI
-│   └── UnrealToGodot.uplugin            # Unreal Plugin configuration
+│   │       ├── export_level_to_json.py       # Level parser & JSON exporter (orchestrator)
+│   │       ├── export_static_meshes_to_gltf.py # glTF mesh & texture exporter
+│   │       ├── export_environment.py         # Lights, post-process, fog, sky, decals
+│   │       ├── export_landscape.py           # Landscape heightmaps & splatmaps
+│   │       ├── export_foliage.py             # Foliage/ISM/HISM packed instances
+│   │       ├── export_gameplay.py            # Nav volumes, tags, Blueprint variables
+│   │       ├── tscn_writer.py                # Direct Godot .tscn scene generation
+│   │       ├── ue2g_common.py                # Shared conversion math
+│   │       ├── ue2g_diagnose.py              # Post-export self-audit module
+│   │       ├── init_unreal.py                # Startup script (registers Window menu entry)
+│   │       └── unreal_to_godot_gui.py        # Thread-safe Tkinter GUI
+│   └── UnrealToGodot.uplugin                 # Unreal plugin descriptor
+├── tools/
+│   └── ue2g_diagnose.py                      # Standalone CLI diagnostic tool
 └── docs/
-    └── SCHEMA_V2.md                     # Layout JSON schema & module contracts
+    ├── SCHEMA_V2.md                          # Layout JSON schema & module contracts
+    └── texture-sizing.md                     # Technical notes on why texture sizing lives in Godot
 ```
 
 ---
 
 ## Installation & Setup
 
-### 1. Unreal Engine Setup
+### 1. Unreal Engine Plugin
 
-1. Copy the `UnrealToGodot` folder into your Unreal Engine project's `Plugins` directory (create a `Plugins` folder in your project root if it doesn't exist).
-2. Open your Unreal Project.
-3. Go to **Edit > Plugins** and search for:
-   - **Unreal to Godot Exporter** (Enable it)
-   - **Python Editor Script Plugin** (Built-in, ensure it is enabled)
-   - **Editor Scripting Utilities** (Built-in, ensure it is enabled)
-   - **glTF Exporter** (Built-in, ensure it is enabled)
+1. Copy the `UnrealToGodot` folder into your Unreal project's `Plugins/` directory (create `Plugins/` in your project root if it does not exist).
+2. Open your Unreal project.
+3. Open **Edit > Plugins** and ensure all four plugins are enabled:
+   - **Unreal to Godot Exporter**
+   - **Python Editor Script Plugin** *(built-in)*
+   - **Editor Scripting Utilities** *(built-in)*
+   - **glTF Exporter** *(built-in)*
 4. Restart the Unreal Editor.
-5. You will see a new menu entry under **Window > Unreal to Godot Exporter**. Clicking this opens the Python GUI.
+5. Open the exporter anytime from **Window > Unreal to Godot Exporter**.
 
-### 2. Godot Engine Setup
+### 2. Godot Engine Addon
 
-1. Copy the `addons/unreal_importer` folder into your Godot project's `addons` directory.
-2. Open your Godot Project.
-3. Go to **Project > Project Settings > Plugins** and enable **Unreal Engine Layout Importer**.
-4. A new dock tab named **Unreal Importer** will appear in the bottom-right editor panel (alongside the Inspector tab).
+1. Copy the `addons/unreal_importer` folder into your Godot project's `addons/` directory.
+2. Open your Godot project.
+3. Open **Project > Project Settings > Plugins** and enable **Unreal Engine Layout Importer**.
+4. A new **Unreal Importer** dock tab will appear in the bottom-right editor panel (next to the Inspector).
 
 ---
 
 ## How to Use
 
-### Step 1: Exporting from Unreal Engine
+### Step 1: Export from Unreal Engine
 
-1. Open your level in Unreal Engine.
-2. Open the **Unreal to Godot Exporter** window from the **Window** menu.
-3. Set both paths: the glTF target folder (defaults to `Saved/Exports/GLTF`) and the layout JSON path.
-4. **Choose Level Export Features** (all optional, all persisted between sessions):
-   - **Lights & Post-Process**, **Decals**, **Landscape / Terrain**, **Foliage & Instances**, **Navigation Volumes**, **Tags & Metadata** — untick anything you don't want in the export.
-   - Unticking **Foliage & Instances** does not discard instanced geometry: each instance is exported as an ordinary mesh placement instead, so ISM/HISM detail (railings, window frames) still arrives — just unbatched. Leave it ticked for dense painted foliage, which is far cheaper as a MultiMesh.
-   - **Generate Godot .tscn scene directly**: writes a ready-to-open scene file into your Godot project (requires the Godot Project Path in the *Godot Engine Integration* section).
+1. Open the level you want to migrate in Unreal Engine.
+2. Launch **Window > Unreal to Godot Exporter**.
+3. Configure your output paths:
+   - **glTF target folder** (defaults to `Saved/Exports/GLTF`)
+   - **Layout JSON path**
+   *(Heightmaps/weightmaps write to a sibling `terrain/` folder; textures write to `textures/`.)*
+4. Toggle your desired **Level Export Features** (persisted across sessions):
+   - **Lights & Post-Process**, **Decals**, **Landscape / Terrain**, **Foliage & Instances**, **Navigation Volumes**, and **Tags & Metadata**.
+   - **Foliage & Instances note:** Unticking this does *not* drop instanced geometry. Instead, each ISM/HISM instance exports as an individual mesh placement so architectural details (railings, window frames) still arrive—just unbatched. Keep it enabled for dense painted foliage so it batches cleanly into a `MultiMeshInstance3D`.
+   - **Generate Godot `.tscn` scene directly** *(optional)*: Writes a ready-to-open scene file directly into your Godot project (requires setting **Godot Project Path** under *Godot Engine Integration*).
 5. Click **Export Everything (Meshes + Layout)**.
 
-That last button is the one to use. The layout names meshes the mesh export has
-to have written, so exporting the two halves separately is how they drift out of
-sync — and a mismatch shows up much later in Godot as a missing texture or a
-`MISSING_` placeholder, far from the click that caused it. Exporting together
-also encodes each texture once instead of twice, which on a real level is the
-difference between three minutes and a fraction of a second.
-
-The individual actions are still there when you want them — **Batch Export All
-Level Meshes**, **Export Selected Meshes** (for a Content Browser selection),
-and **Export Level Layout only**. If you use them, run both halves before
-importing.
-
-Heightmaps/splatmaps go to a sibling `terrain/` folder, textures to `textures/`.
-
-> **Keeping textures light**: Unreal exports source art, so a real level arrives
-> as several GB of 4K PNGs — enough to make Godot's importer run out of memory
-> and crash partway through. Texture sizing lives in the Godot importer dock,
-> because Unreal's Python API has no way to resize source art
-> ([why](docs/texture-sizing.md)):
+> [!TIP]
+> **Prefer "Export Everything (Meshes + Layout)" over running halves separately.**
+> The layout JSON references exact mesh filenames written by the mesh exporter. Running the two actions separately makes it easy for exports to drift out of sync—causing missing textures or `_MISSING_` placeholders later in Godot. Exporting together also encodes each shared texture once instead of twice, dramatically cutting export times on real levels.
 >
-> - **Texture size limit** (e.g. `1024`) caps what Godot imports, for textures
->   already in the project as well as new ones.
-> - **Also shrink texture files on disk** rewrites the oversized PNGs at that
->   size, which is what reclaims the space — 3.1 GB of 4K exports drops to a few
->   hundred MB. It is destructive: the full-resolution art only exists back in
->   Unreal, so raising the limit later means exporting again.
+> Individual actions (**Batch Export All Level Meshes**, **Export Selected Meshes**, and **Export Level Layout only**) remain available when needed; just make sure both halves are up to date before importing.
 
-### Step 2: Importing into Godot
+> [!IMPORTANT]
+> **Keeping textures light (avoiding Godot OOM crashes)**
+> Unreal exports full-resolution source art, so a full level can easily produce several gigabytes of 4K PNGs—enough to make Godot's importer run out of memory and crash mid-import. Because Unreal's Python API cannot resize source art ([technical explanation](docs/texture-sizing.md)), texture sizing is handled in the **Godot Importer dock**:
+> - **Texture size limit** *(default: `1024`)* — Caps the resolution Godot imports textures at, applying to both newly exported and already-imported textures.
+> - **Also shrink texture files on disk** — Rewrites oversized exported PNGs down to the capped size, shrinking multi-gigabyte 4K exports down to a few hundred megabytes. **This is destructive**: the full-resolution originals remain only in Unreal, so raising the limit later requires re-exporting.
 
-1. Open or create a 3D scene in Godot to serve as the active root level.
-2. In the **Unreal Importer** dock (bottom-right panel):
-   - **Layout JSON File**: Point to the exported JSON file.
-   - **glTF Models Folder**: Select the folder where you exported the glTF meshes.
-   - **Textures Folder**: Select the folder containing exported textures (if any).
-3. (Optional) Check **GDScript Coordinate Swap** if you want to recalculate the transform conversion entirely in Godot (defaults to using pre-calculated matrices from the JSON, which is recommended).
-4. **Choose Import Features**: toggle Lights, World Environment, Decals, Terrain (with a mode selector: Auto / Terrain3D / HTerrain / Mesh fallback), Foliage, Navigation Regions (with optional immediate baking), and Tags & Metadata. Adjust **Light energy scale** if the imported level looks too dark or bright.
+### Step 2: Import into Godot
+
+1. Open or create a 3D scene in Godot to serve as the target root level.
+2. In the **Unreal Importer** dock, set:
+   - **Layout JSON File** — Path to the exported layout `.json`.
+   - **glTF Models Folder** — Folder containing exported `.gltf` / `.glb` meshes.
+   - **Textures Folder** — Folder containing exported textures (if any).
+3. Expand **Import Features** to customize the import as needed:
+   - Toggle Lights, World Environment, Decals, Terrain (**Auto / Terrain3D / HTerrain / Mesh fallback**), Foliage, Navigation Regions (with optional immediate baking), and Tags & Metadata.
+   - *(Optional)* Enable **GDScript Coordinate Swap** only if you want Godot to recalculate transforms from raw coordinates (leaving it off uses pre-calculated JSON transforms, which is recommended).
+   - Tune **Light energy scale** if the scene looks too bright or dark, or **Min decal depth (m)** if thin Unreal decal boxes clip unevenly on textured surfaces.
+4. Set your **Texture size limit** and whether to **Also shrink texture files on disk**.
 5. Click **Import Unreal Level Layout**.
-6. The importer will populate the active scene with instanced models, collisions, materials, lights, environment, decals, terrain, foliage and navigation regions.
 
-### Direct .tscn workflow (no importer run needed)
+### Optional: Direct `.tscn` Workflow
 
-If you enabled **Generate Godot .tscn scene directly** on the Unreal side, just open the generated `.tscn` in Godot. Two follow-ups:
-- Click **Bind Foliage Meshes (.tscn scenes)** in the importer dock once — `.tscn` files cannot reference meshes inside glTF scenes, so foliage MultiMeshes are bound in-place from their `source_model` metadata.
-- Landscapes appear as placeholder `Node3D`s carrying the full heightmap/weightmap metadata — a text scene cannot decode a float EXR into geometry. Run the dock import with only **Terrain** enabled to build them, or use your terrain plugin's own import tools with the exported `terrain/` files.
+If you enabled **Generate Godot `.tscn` scene directly** during export, open the generated `.tscn` file in Godot directly. Two quick follow-ups apply:
+
+- **Foliage:** Click **Bind Foliage Meshes (`.tscn` scenes)** once in the Unreal Importer dock. Because `.tscn` files cannot directly reference meshes nested inside glTF scenes, this binds each foliage MultiMesh in place using its `source_model` metadata.
+- **Landscapes:** Landscapes appear as placeholder `Node3D` nodes storing the heightmap/weightmap metadata (a text scene cannot decode float EXRs into geometry). Run a dock import with only **Terrain** enabled to build them, or import the `terrain/*.exr` files directly through your terrain plugin.
 
 ---
 
-## Scope: what transfers, and what doesn't
+## Scope: What Transfers & What Doesn't
 
-This tool moves **art**, not **behaviour**. Point it at an environment or prop
-pack you own and it will bring the meshes, materials, textures, collision and
-level layout across. Point it at a finished game expecting a playable Godot
-project and you will be disappointed.
+This tool migrates **art**, not **behavior**. Typical environment, prop, and modular building packs transfer cleanly. Dense, heavily authored scenes—such as sprawling city kits or packs relying heavily on custom master-material shaders—will require more manual polish.
 
-Typical asset packs transfer cleanly. The cases that get rough are the dense,
-heavily-authored ones — sprawling city kits, anything leaning on custom shader
-work — not ordinary prop, environment or modular building sets.
+| Category | Status | Summary |
+| --- | --- | --- |
+| **Static & skeletal meshes, collision shapes, level layout, Blueprint actor hierarchy** | Transfers well | Positions, rotations, non-uniform scales, and relative offsets come across cleanly. |
+| **Lights, sky/fog/post-process, decals, foliage (MultiMesh), navigation volumes, tags** | Transfers well | Mapped to native Godot 4 nodes and `get_meta()` metadata. |
+| **PBR materials, lighting calibration, Nanite meshes, landscape materials** | Approximate | Expect minor manual tuning—details below. |
+| **Blueprint graphs, gameplay systems, AnimBlueprints, particles, audio, cameras** | Out of scope | Not converted by design; rebuild behavior in GDScript. |
 
-### Transfers well
+### Transfers Approximately (Expect Some Manual Work)
 
-Static and skeletal meshes, collision primitives and convex hulls, PBR material
-parameters and textures, level layout and Blueprint actor composition, lights,
-post-process/fog/sky, decals, foliage as MultiMesh, navigation volumes, and
-actor/component tags as node metadata.
+- **Materials (parameter-level, not shader-graph-level):** Albedo, normal, and ORM/RMA maps along with scalar, vector, and tiling parameters rebuild as Godot `StandardMaterial3D` / `ORMMaterial3D`. Custom shader graph logic—HLSL nodes, world-position offset, vertex-paint blending, or parallax—has no automatic equivalent and must be reauthored.
+- **Lighting (calibrated, not identical):** Unreal (lumens/candela/lux, Lumen) and Godot (energy, SDFGI/VoxelGI) use fundamentally different lighting and tonemapping pipelines. Intensities are normalized to candelas via Unreal's unit conversion and anchored so a default Unreal light imports as a default Godot light. Use **Light energy scale** for a quick global pass; raw Unreal intensities, units, and normalized candela values are also stored in the JSON if you want to build a custom mapping.
+- **Nanite meshes:** Godot has no Nanite equivalent. Nanite assets export as standard triangle meshes at their available LODs; packs authored assuming Nanite polygon budgets may need decimation.
 
-### Out of scope, by design
+### Out of Scope by Design
 
-**Gameplay logic and systems do not transfer.** Blueprint graphs, event
-scripting, AnimBlueprints and state machines, gameplay frameworks — none of it
-converts, and none of it is planned for the near term. Translating engine-to-engine
-behaviour is a genuinely hard problem and a different tool than this one; whether
-any of it lands later is undecided. Blueprint *actors* are still placed correctly
-with their meshes and relative offsets, and their variables land as node metadata
-where the Unreal Python API exposes them, so you have the structure to rebuild
-against in GDScript — but the rebuilding is yours.
+- **Gameplay logic & systems:** Blueprint event graphs, gameplay frameworks, AnimBlueprints, and animation state machines do not convert and are not planned in the near term. Blueprint *actors* still transfer with their meshes, relative offsets, and (where exposed by Unreal's Python API) variables as node metadata so you have the scene structure ready to script against in GDScript.
+- **Other unexported types:** Niagara/Cascade particle systems, audio (sound cues, ambient actors, attenuation), and `CameraActor`s are not exported.
+- **Animations:** Raw animation *sequences* can be embedded in glTF via **Export Animation Sequences (Skeletal Meshes)**, though the logic driving them cannot.
 
-Also not emitted: Niagara/Cascade particles, audio (sound cues, ambient actors,
-attenuation), and `CameraActor`s. Animation *sequences* can be embedded into the
-glTF via the **Export Animations** toggle; the logic driving them cannot.
+### Landscapes: Install Terrain3D
 
-### Transfers approximately — expect some manual work
+Heightmaps and paint-layer weightmaps export as float EXRs, and the terrain surface, collision, and a splat material are rebuilt automatically.
 
-- **Materials are parameter-level, not graph-level.** Albedo/normal/RMA maps,
-  scalars, vectors and tiling are read off the material instance and rebuilt as a
-  Godot `StandardMaterial3D`/`ORMMaterial3D`. That covers ordinary PBR pack
-  materials well. What lives in the master material's *graph* — custom HLSL,
-  world-position offset, vertex-paint blending, parallax — has no counterpart and
-  is simply absent, so shader-heavy packs need reauthoring.
-- **Lighting is a calibration, not a match.** Unreal (lumens/candela/lux, Lumen) and
-  Godot (energy, SDFGI/VoxelGI) use different intensity models and different
-  global illumination. Intensities are normalised to candelas using Unreal's own
-  unit conversion and then anchored so a default Unreal light imports as a default
-  Godot light, which makes the units mutually consistent and the common case
-  roughly right — but two tonemapped renderers cannot be reconciled by a constant,
-  so the **Light energy scale** control still exists for the final pass. Raw Unreal
-  intensities, units and the normalised candela figure are all preserved in the JSON
-  so you can re-derive your own mapping.
-- **Nanite has no Godot equivalent.** Nanite meshes export as regular triangle
-  meshes at their available LODs; a pack authored on the assumption of Nanite
-  density may need decimation to run well.
+- **Recommended plugin:** For anything beyond a quick preview, install [Terrain3D](https://github.com/TokisanGames/Terrain3D) (`1.x` and `0.9.x` are both supported) and set Terrain mode to **Auto** or **Terrain3D**. Terrain3D preserves full exported heightmap resolution, whereas the plugin-free mesh fallback caps detail at a `257×257` grid.
+- **Paint layer materials:** Unreal's terrain look lives inside a layer-blend shader graph, and Python cannot read which texture maps to which paint layer (layers are often named simply `1`, `2`, `3`). The importer builds a splat material tinted with each layer's Unreal debug color and exposes `layer0..3_albedo` slots—drop your ground textures into those slots and set the matching tints to white. Terrain3D users can alternatively wire the exported `terrain/*.exr` weightmaps into a `Terrain3DAssets` resource.
+- **Known limits:** The built-in splat material blends the first **4** paint layers (additional layers still export). When Unreal's GPU landscape export fails—the normal case for asset-pack terrain—the CPU fallback samples at `513×513` for heightmaps and `129×129` for weightmaps by default. Both grid sizes can be raised in the exporter GUI at the cost of longer export times. If you hit an edge case, please [open an issue](https://github.com/vortechU/UnrealToGodot/issues).
 
-### Landscapes: install Terrain3D
+### Workflow Boundaries
 
-Heightmaps and paint-layer weightmaps export as float EXRs, and the surface,
-its collision and a splat material are all rebuilt for you. For anything beyond
-a preview, install the [Terrain3D](https://github.com/TokisanGames/Terrain3D)
-plugin (1.x and 0.9.x are both supported) and pick **Auto** or **Terrain3D** as
-the terrain mode: it keeps the full exported heightmap resolution, while the
-plugin-free mesh fallback caps out at a 257×257 grid.
-
-What does **not** come across is the layer *material*. Unreal's terrain look
-lives in a layer-blend material graph, and which texture belongs to which paint
-layer is not readable from Python — paint layers are frequently just named `1`,
-`2`, `3`. So the importer blends the layers using each one's Unreal debug colour
-and exposes `layer0..3_albedo` on the terrain material: drop your ground
-textures into those slots (and set the matching tint to white) and you have the
-real surface. Terrain3D users can instead wire the exported `terrain/*.exr`
-weightmaps into a `Terrain3DAssets` set.
-
-Two limits worth knowing: the splat material blends the first **four** paint
-layers (further layers still export), and when Unreal's GPU landscape export
-fails — the normal case on asset-pack landscapes — the heightmap is sampled on
-the CPU at a capped resolution (513² by default, 129² for weightmaps), which you
-can raise in the exporter's options at the cost of export time. If you hit
-something else, please
-[report it](https://github.com/vortechU/UnrealToGodot/issues).
-
-### Workflow boundaries
-
-- **Only loaded levels are read.** Actors come from the currently loaded world,
-  so **World Partition** cells that are not loaded, and unloaded streaming
-  sublevels, will silently not be in the export. Load what you want exported
-  first.
-- **Import is one-shot, not incremental.** There is no stable actor identity in
-  the schema yet, so re-running an import adds a second copy rather than updating
-  the first. Iterate by importing into a fresh scene.
+- **Only loaded levels are exported:** The exporter reads actors from the currently loaded world. Unloaded **World Partition** cells and unloaded streaming sublevels are silently omitted—load everything you want exported first.
+- **Imports are one-shot, not incremental:** The schema does not yet track stable actor IDs, so re-running an import into the same scene duplicates actors instead of updating them. Iterate by importing into a fresh scene.
 
 ---
 
 ## Troubleshooting
 
-### Start here: read the reports
+### Start Here: Read the Automated Reports
 
-Both halves of the toolchain describe themselves in writing, automatically.
-There is nothing to run and nothing to remember.
+Both halves of the toolchain audit their own output automatically:
 
-**After an export**, the exporter audits its own output and writes
-`ue2g_report.txt` next to it. Any problem is also surfaced in the GUI status
-bar and the Unreal output log, prefixed `EXPORT CHECK:`. It catches the things
-that actually go wrong: stale glTFs left from an older export, texture URIs
-pointing at files that don't exist, meshes the layout references but that were
-never exported, material scalars outside Godot's valid range, and texture sets
-big enough to crash Godot's importer.
+- **After export (`ue2g_report.txt`):** Written next to your export, with issues also surfaced in the GUI status bar and Unreal's Output Log prefixed `EXPORT CHECK:`. Catches stale glTFs from older runs, broken texture URIs, meshes referenced by the layout that were never exported, out-of-range material scalars, and oversized texture sets.
+- **After import (`res://ue2g_import_report.txt`):** Written to your Godot project root, summarizing bound material maps, missing textures, and any failures—even if the import aborts early.
 
-**After an import**, the importer writes `res://ue2g_import_report.txt`,
-listing how many material slots got each map bound, which textures were
-missing, and what failed — including when the import dies early.
-
-Those two files are self-contained: they describe a run without anyone having
-to remember what they saw.
-
-To re-check an export folder later, run the same audit from a **terminal**
-(PowerShell, cmd, bash — *not* Unreal's Python console, which would treat the
-command as a script filename):
+You can also re-run the export audit anytime from a **system terminal** (PowerShell, Command Prompt, or bash—*not* Unreal's Python console, which interprets arguments as a script filename):
 
 ```bash
 python tools/ue2g_diagnose.py <export_folder>
-# optionally cross-check the Godot side too:
+
+# Optionally cross-check against your Godot project as well:
 python tools/ue2g_diagnose.py <export_folder> --godot-project <godot_project>
 ```
 
-It needs only Python — no Unreal, no Godot — so it also runs on a machine that
-has nothing but the exported files.
+The diagnostic script requires only standard Python (no Unreal or Godot installation needed).
 
-### Common problems
+### Common Issues
 
-- **Errors like `Can't open file from path 'res://models/<Material>_<Mesh>_BaseColor.png'`**: those filenames are produced only by material *baking*, which the exporter disables. Their presence means the `.gltf` files are left over from an older export. Clear the `models/` folder, re-run the mesh export (a **separate action** from the layout export — running one does not re-run the other), and delete the Godot project's `.godot/` cache, which otherwise keeps serving the old import.
-- **Godot crashes, hangs, or half-imports a large level**: a full map can export several GB of 4K textures, and Godot's WebP packer runs out of memory and segfaults partway through, leaving a half-populated `.godot` cache that looks like a toolchain bug. Set **Max Texture Resolution** (e.g. 2048) in the exporter. `tools/ue2g_diagnose.py` warns before you hit this.
-- **GUI window doesn't appear or locks up**: Ensure Tkinter is installed in your python environment. On Windows, standard Unreal installations include Tkinter automatically.
-- **Missing Meshes Warning**: If a mesh name doesn't match the glTF filename, the importer will place a `Marker3D` placeholder in the scene tree labeled `_MISSING_<MeshName>`. Verify your glTF export folder. Note: when an asset pack contains two different meshes with the same name, exports get a deterministic `_<hash>` suffix — re-export both meshes and layout together so the names line up.
-- **Textures aren't loading**: Textures referenced by materials and decals are auto-exported to a `textures/` folder next to your export. File matching is case-insensitive; supported extensions are `.png`, `.tga`, `.jpg`, `.jpeg`, `.dds`, `.exr` and `.webp`.
-- **A few textures are missing, and the log says "could not be written as PNG"**: Unreal's PNG exporter only writes 8/16-bit source art, so a texture imported from a floating-point source (`.exr`, `.hdr`) — plus cubemaps and sky panoramas — has no PNG form and is skipped. The rest of the export is unaffected; materials using those maps import without them, and the export report flags the dangling references. To include one, re-import it in Unreal from an 8/16-bit source. (Before v2.1 these crashed the editor outright: the exporter forced `TextureExporterPNG`, which bypasses the engine's own compatibility check and hits an assert.)
-- **Imported level too dark/bright**: Unreal and Godot use different light intensity models (lumens/candela/lux vs. energy). Adjust **Light energy scale** in the importer dock, or tweak individual lights — the raw Unreal intensity and units are preserved in the JSON.
-- **Terrain looks flat or missing**: Terrain rebuild needs the exported `terrain/*.exr` files next to the layout JSON (or copied into your Godot project by auto-transfer). If the import report says the heightmap has *no height variation*, the Unreal side wrote an empty image — re-export with the current version, which detects that and falls back to CPU sampling. Without a terrain plugin the mesh fallback caps detail at a 257×257 grid; install Terrain3D for full resolution.
-- **Foliage invisible after opening a generated .tscn**: run **Bind Foliage Meshes** from the importer dock (see the direct .tscn workflow above).
-- **Blueprint variables missing from metadata**: the stock Unreal Python API only exposes Blueprint variables on some engine versions; actor/component tags always export.
+- **`Can't open file from path 'res://models/<Material>_<Mesh>_BaseColor.png'`**
+  Those filenames come from Unreal glTF material *baking*, which this exporter disables—meaning stale `.gltf` files from an older export are still sitting in `models/`. Clear `models/`, re-run **Export Everything (Meshes + Layout)**, and delete Godot's `.godot/` cache folder so Godot does not serve cached old imports.
+- **Godot crashes, hangs, or half-imports a large level**
+  Full maps often export several gigabytes of 4K PNGs, causing Godot's WebP packer to run out of memory and crash mid-import (leaving a broken `.godot/` cache behind). Keep **Texture size limit** enabled (e.g., `1024` or `2048`) and **Also shrink texture files on disk** checked in the Godot importer dock before importing. Running `tools/ue2g_diagnose.py` warns you ahead of time if a texture set is dangerously large.
+- **Exporter GUI window doesn't appear or locks up**
+  Verify Tkinter is available in Unreal's embedded Python environment (standard Windows Unreal Engine installations include Tkinter by default).
+- **Missing meshes (`_MISSING_<MeshName>` `Marker3D` placeholders)**
+  The mesh name in the layout JSON did not match any `.gltf` file in your models folder. Confirm your **glTF Models Folder** path. If a pack contains multiple meshes with the same name, the exporter appends a deterministic `_<hash>` suffix—re-export meshes and layout together so filenames stay synchronized.
+- **Textures aren't loading**
+  Material and decal textures auto-export into a sibling `textures/` folder. Matching is case-insensitive and supports `.png`, `.tga`, `.jpg`, `.jpeg`, `.dds`, `.exr`, and `.webp`.
+- **A few textures skipped with `"could not be written as PNG"`**
+  Unreal's PNG exporter only handles 8/16-bit source art. Floating-point textures (`.exr`, `.hdr`), cubemaps, and sky panoramas cannot be exported as PNG and are safely skipped (the rest of the export succeeds and the report logs the skipped references). To include one, re-import it in Unreal from an 8/16-bit source image.
+- **Imported scene is too dark or too bright**
+  Adjust **Light energy scale** in the Godot importer dock or tweak individual light nodes. Original Unreal intensities and units are preserved in the layout JSON.
+- **Terrain looks flat or missing**
+  Terrain import requires the `terrain/*.exr` files alongside your layout JSON (or copied into the Godot project via auto-transfer). If `ue2g_import_report.txt` reports *no height variation*, re-export with the latest version so CPU heightfield fallback runs when Unreal's GPU export writes blank images. For full resolution beyond the `257×257` mesh fallback, install Terrain3D.
+- **Foliage is invisible after opening a directly generated `.tscn`**
+  Run **Bind Foliage Meshes (`.tscn` scenes)** from the Godot importer dock (see [Direct `.tscn` Workflow](#optional-direct-tscn-workflow)).
+- **Blueprint variables missing from node metadata**
+  Unreal's stock Python API only exposes Blueprint variables on certain engine versions; actor and component tags always export.
+
+---
 
 ## Schema & Extending
 
-The layout JSON format and per-module contracts are documented in [docs/SCHEMA_V2.md](docs/SCHEMA_V2.md). Each feature is an isolated module pair (Python exporter + GDScript importer) — deleting a module file simply disables that feature, and new features can follow the same contract.
+The layout JSON schema and per-module contracts are documented in [docs/SCHEMA_V2.md](docs/SCHEMA_V2.md).
 
-The layout carries a `format_version`, which the Godot addon checks on import.
-Bump it in `export_level_to_json.py` and `SUPPORTED_FORMAT_VERSION` in
-`import_unreal_layout.gd` together whenever the schema changes incompatibly.
+Each feature is implemented as an isolated Python exporter / GDScript importer module pair—removing a module cleanly disables that feature, and new features can be added following the same contract. Whenever you make an incompatible schema change, bump `format_version` in `export_level_to_json.py` and `SUPPORTED_FORMAT_VERSION` in `import_unreal_layout.gd` together.
 
 ---
 
 ## Support
 
-- **Discord** — [join the server](https://discord.com/invite/HGwkYW2h6Y) for help,
-  questions and migration war stories.
-- **Bug reports** — [GitHub issues](https://github.com/vortechU/UnrealToGodot/issues).
-  Attach `ue2g_report.txt` and `ue2g_import_report.txt`; between them they
-  describe a whole run, which usually answers the first three questions anyone
-  would ask you.
+- **Discord** — [Join the community server](https://discord.com/invite/HGwkYW2h6Y) for help, questions, and migration tips.
+- **Bug Reports** — [Open a GitHub issue](https://github.com/vortechU/UnrealToGodot/issues) and attach both `ue2g_report.txt` and `res://ue2g_import_report.txt`—together they capture the full export/import run and save back-and-forth debugging.
 
 Built by **Vordev** — [vortech.studio](https://www.vortech.studio/).
 
@@ -335,7 +284,4 @@ Built by **Vordev** — [vortech.studio](https://www.vortech.studio/).
 
 MIT — see [LICENSE](LICENSE).
 
-This license covers the toolchain only, **not the content you run it through**.
-The tool is intended for moving asset packs you own into Godot; your packs keep
-whatever license they came with, and it is on you to confirm that license permits
-using them in another engine before you migrate.
+This license covers the **toolchain only**, not the assets you process with it. Asset packs retain their original licenses, and you are responsible for verifying that an asset pack's license permits use in another game engine before migrating it.

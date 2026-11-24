@@ -153,11 +153,12 @@ def collect_landscapes(all_actors, json_dir, options=None, collected_textures=No
         unreal.log_warning(f"export_landscape: cannot create terrain directory: {str(e)}")
         return results
 
+    used_labels = set()
     for landscape in parents:
         try:
             related = children_of.get(_actor_key(landscape), [])
             entry = _export_one_landscape(world, landscape, related, terrain_dir, opts,
-                                           collected_textures)
+                                           collected_textures, used_labels=used_labels)
             if entry:
                 results.append(entry)
         except Exception as e:
@@ -297,8 +298,15 @@ def _build_component_grid(actors, comp_class):
 
 
 def _export_one_landscape(world, landscape, related_proxies, terrain_dir, opts,
-                          collected_textures=None):
-    label = ue2g_common.sanitize_name(landscape.get_actor_label())
+                          collected_textures=None, used_labels=None):
+    base_label = ue2g_common.sanitize_name(landscape.get_actor_label())
+    label = base_label
+    if used_labels is not None:
+        suffix = 1
+        while label in used_labels:
+            suffix += 1
+            label = f"{base_label}_{suffix}"
+        used_labels.add(label)
     group = [landscape] + list(related_proxies)
     origin, extent = _union_actor_bounds(group)
     if origin is None:
@@ -476,6 +484,9 @@ def _trace_heightmap_cpu(group, center, extent, terrain_dir, height_file, width,
         return None
 
     cap = _int_opt(opts, "terrain_height_resolution", DEFAULT_TRACE_GRID_MAX)
+    if cap <= 0:
+        unreal.log("export_landscape: CPU heightmap fallback disabled (terrain_height_resolution=0).")
+        return None
     w = max(2, min(width, cap))
     h = max(2, min(height, cap))
     top = center.z + extent.z + 10000.0
@@ -681,17 +692,67 @@ def _collect_material_textures(landscape, collected_textures):
 
     textures = []
     seen = set()
+
+    def _iter_landscape_material_textures(mat):
+        """Yields (param_name, texture) for a base Material OR MaterialInstance chain."""
+        mi_types = tuple(
+            cls for cls in (getattr(unreal, "MaterialInstance", None),
+                            getattr(unreal, "MaterialInstanceConstant", None))
+            if cls is not None
+        )
+        visited = set()
+
+        def _walk(node, is_parent=False):
+            if node is None or node in visited:
+                return
+            visited.add(node)
+            if mi_types and isinstance(node, mi_types):
+                yielded_any = False
+                try:
+                    tparams = node.get_editor_property("texture_parameter_values") or []
+                except Exception:
+                    tparams = []
+                for tp in tparams:
+                    tex = getattr(tp, "parameter_value", None)
+                    if tex is None:
+                        continue
+                    tex_cls = getattr(unreal, "Texture", None)
+                    if tex_cls is not None and not isinstance(tex, tex_cls):
+                        continue
+                    pname = getattr(getattr(tp, "parameter_info", None), "name", "")
+                    yielded_any = True
+                    yield str(pname or ""), tex
+                parent = ue2g_common.safe_get_prop(node, "parent", None)
+                if parent is not None:
+                    for item in _walk(parent, is_parent=True):
+                        yielded_any = True
+                        yield item
+                if not yielded_any and not is_parent:
+                    for tex in ue2g_common.iter_material_dependency_textures(node):
+                        yield "", tex
+            else:
+                for item in ue2g_common.iter_base_material_textures(
+                        node, include_dependencies=not is_parent):
+                    yield item
+
+        return _walk(mat)
+
     try:
-        for param_name, tex in ue2g_common.iter_base_material_textures(material):
+        for param_name, tex in _iter_landscape_material_textures(material):
             if tex is None:
                 continue
             try:
                 tex_name = tex.get_name()
             except Exception:
                 continue
-            if tex_name in seen:
+            try:
+                tex_path = tex.get_path_name()
+            except Exception:
+                tex_path = ""
+            dedup_key = tex_path or tex_name
+            if dedup_key in seen:
                 continue
-            seen.add(tex_name)
+            seen.add(dedup_key)
             if collected_textures is not None:
                 collected_textures.add(tex)
             role = None
@@ -705,11 +766,14 @@ def _collect_material_textures(landscape, collected_textures):
             # suffix comes off -- both consumers match on "albedo".
             if role and role.endswith("_texture"):
                 role = role[: -len("_texture")]
-            textures.append({
+            tex_entry = {
                 "parameter": str(param_name or ""),
                 "texture": tex_name,
                 "role": role or "unknown",
-            })
+            }
+            if tex_path:
+                tex_entry["path"] = tex_path
+            textures.append(tex_entry)
     except Exception as e:
         unreal.log_warning(f"export_landscape: could not read the landscape material's textures: {str(e)}")
 

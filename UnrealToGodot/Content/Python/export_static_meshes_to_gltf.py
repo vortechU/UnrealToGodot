@@ -176,10 +176,10 @@ def inject_texture_references(gltf_path, params_by_material, textures_rel="../te
             pbr["baseColorFactor"] = [_clamp01(color[0], 1.0), _clamp01(color[1], 1.0),
                                       _clamp01(color[2], 1.0), _clamp01(alpha, 1.0)]
 
-        # With a packed map present the scalars are pass-through multipliers for a
-        # texture that cannot be injected here (channel order), so writing them
-        # would say "fully metallic" rather than "driven by a map". Fall back to
-        # neutral dielectric values for the preview instead.
+        # With a packed or standalone roughness/metallic map present the scalars
+        # are pass-through multipliers for a texture that cannot be injected here,
+        # so writing them would say "fully metallic" rather than "driven by a map".
+        # Fall back to neutral dielectric values for the preview instead.
         roughness = params.get("roughness")
         metallic = params.get("metallic")
         channels = params.get("packed_channels") or {}
@@ -188,6 +188,10 @@ def inject_texture_references(gltf_path, params_by_material, textures_rel="../te
                 roughness = 1.0
             if "metallic" in channels:
                 metallic = 0.0
+        if params.get("roughness_texture"):
+            roughness = 1.0
+        if params.get("metallic_texture"):
+            metallic = 0.0
         pbr["roughnessFactor"] = _clamp01(roughness, 0.5)
         pbr["metallicFactor"] = _clamp01(metallic, 0.0)
 
@@ -245,7 +249,9 @@ def inject_textures_for_exported_mesh(mesh, export_dir, mesh_name, separate_text
         if not filename.lower().endswith(".gltf"):
             continue
         stem = filename[:-5]
-        if stem != mesh_name and not stem.startswith(mesh_name + "_LOD"):
+        is_lod = (stem.startswith(mesh_name + "_LOD")
+                  and stem[len(mesh_name) + len("_LOD"):].isdigit())
+        if stem != mesh_name and not is_lod:
             continue
         try:
             n = inject_texture_references(os.path.join(export_dir, filename),
@@ -442,63 +448,86 @@ def extract_skeletal_mesh_physics(skeletal_mesh):
         }
         
         # 1. Box Elements
-        for box in agg_geom.get_editor_property("box_elems"):
-            center = box.get_editor_property("center")
-            rot = box.get_editor_property("rotation")
-            u_quat = rot.quaternion()
-            godot_local = gltf_local_shape_transform(center, u_quat)
-
-            # FKBoxElem X/Y/Z are the box's FULL side lengths in cm already.
-            collision_data["boxes"].append({
-                "size": [
-                    box.get_editor_property("x"),
-                    box.get_editor_property("y"),
-                    box.get_editor_property("z")
-                ],
-                "godot_local_transform": godot_local
-            })
-
-        # 2. Sphere Elements
-        for sphere in agg_geom.get_editor_property("sphere_elems"):
-            center = sphere.get_editor_property("center")
-            godot_local = gltf_local_shape_transform(center, unreal.Quat(0.0, 0.0, 0.0, 1.0))
-            
-            collision_data["spheres"].append({
-                "radius": sphere.get_editor_property("radius"),
-                "godot_local_transform": godot_local
-            })
-            
-        # 3. Capsule (Sphyl) Elements
-        for capsule in agg_geom.get_editor_property("sphyl_elems"):
-            center = capsule.get_editor_property("center")
-            rot = capsule.get_editor_property("rotation")
-            u_quat = rot.quaternion()
-            godot_local = gltf_local_shape_transform(center, u_quat)
-
-            collision_data["capsules"].append({
-                "radius": capsule.get_editor_property("radius"),
-                "length": capsule.get_editor_property("length"),
-                "godot_local_transform": godot_local
-            })
-            
-        # 4. Convex Elements
-        for convex in agg_geom.get_editor_property("convex_elems"):
+        for box in (ue2g_common.safe_get_prop(agg_geom, "box_elems", []) or []):
             try:
-                center = convex.get_editor_property("center")
-                rot = convex.get_editor_property("rotation")
+                center = box.get_editor_property("center")
+                rot = box.get_editor_property("rotation")
                 u_quat = rot.quaternion()
                 godot_local = gltf_local_shape_transform(center, u_quat)
 
-                vertices = []
-                vertex_data = convex.get_editor_property("vertex_data")
-                if vertex_data:
-                    for v in vertex_data:
-                        vertices.append([v.x, v.y, v.z])
-                        
-                collision_data["convex_hulls"].append({
-                    "vertices": vertices,
+                # FKBoxElem X/Y/Z are the box's FULL side lengths in cm already.
+                collision_data["boxes"].append({
+                    "size": [
+                        box.get_editor_property("x"),
+                        box.get_editor_property("y"),
+                        box.get_editor_property("z")
+                    ],
                     "godot_local_transform": godot_local
                 })
+            except Exception as e:
+                unreal.log_warning(f"Failed to read box collision element for bone {bone_name}: {str(e)}")
+
+        # 2. Sphere Elements
+        for sphere in (ue2g_common.safe_get_prop(agg_geom, "sphere_elems", []) or []):
+            try:
+                center = sphere.get_editor_property("center")
+                godot_local = gltf_local_shape_transform(center, unreal.Quat(0.0, 0.0, 0.0, 1.0))
+
+                collision_data["spheres"].append({
+                    "radius": sphere.get_editor_property("radius"),
+                    "godot_local_transform": godot_local
+                })
+            except Exception as e:
+                unreal.log_warning(f"Failed to read sphere collision element for bone {bone_name}: {str(e)}")
+
+        # 3. Capsule (Sphyl) Elements
+        for capsule in (ue2g_common.safe_get_prop(agg_geom, "sphyl_elems", []) or []):
+            try:
+                center = capsule.get_editor_property("center")
+                rot = capsule.get_editor_property("rotation")
+                u_quat = rot.quaternion()
+                godot_local = gltf_local_shape_transform(center, u_quat)
+
+                collision_data["capsules"].append({
+                    "radius": capsule.get_editor_property("radius"),
+                    "length": capsule.get_editor_property("length"),
+                    "godot_local_transform": godot_local
+                })
+            except Exception as e:
+                unreal.log_warning(f"Failed to read capsule collision element for bone {bone_name}: {str(e)}")
+
+        # 4. Convex Elements (FKConvexElem uses transform, not center/rotation)
+        for convex in (ue2g_common.safe_get_prop(agg_geom, "convex_elems", []) or []):
+            try:
+                u_scale = None
+                convex_transform = ue2g_common.safe_get_prop(convex, "transform", None)
+                if convex_transform is not None:
+                    center = convex_transform.translation
+                    u_quat = convex_transform.rotation
+                    u_scale = getattr(convex_transform, "scale3d", None)
+                else:
+                    center = ue2g_common.safe_get_prop(convex, "center", None)
+                    rot = ue2g_common.safe_get_prop(convex, "rotation", None)
+                    if center is None:
+                        center = unreal.Vector(0.0, 0.0, 0.0)
+                    u_quat = rot.quaternion() if rot is not None else unreal.Quat(0.0, 0.0, 0.0, 1.0)
+                godot_local = gltf_local_shape_transform(center, u_quat)
+
+                sx = u_scale.x if u_scale is not None else 1.0
+                sy = u_scale.y if u_scale is not None else 1.0
+                sz = u_scale.z if u_scale is not None else 1.0
+
+                vertices = []
+                vertex_data = ue2g_common.safe_get_prop(convex, "vertex_data", None)
+                if vertex_data:
+                    for v in vertex_data:
+                        vertices.append([v.x * sx, v.y * sy, v.z * sz])
+
+                if vertices:
+                    collision_data["convex_hulls"].append({
+                        "vertices": vertices,
+                        "godot_local_transform": godot_local
+                    })
             except Exception as e:
                 unreal.log_warning(f"Failed to read convex hull element for bone {bone_name}: {str(e)}")
                 
@@ -643,6 +672,11 @@ def copy_exports_to_godot(export_dir, meshes_exported, separate_textures, godot_
                             # the export folder itself was arranged.
                             if ext.lower() == ".gltf":
                                 retarget_gltf_textures(dest_path, "../textures")
+                        elif ext.lower() == ".gltf" and not separate_textures:
+                            # Exported directly into <project>/models with sibling
+                            # textures; step 2 copies those textures into
+                            # <project>/textures, so retarget the URIs to match.
+                            retarget_gltf_textures(dest_path, "../textures")
                     except Exception as copy_err:
                         unreal.log_warning(f"Failed to copy {filename} to Godot: {str(copy_err)}")
                         
@@ -667,7 +701,7 @@ def copy_exports_to_godot(export_dir, meshes_exported, separate_textures, godot_
         
         for filename in os.listdir(textures_dir):
             base_name, ext = os.path.splitext(filename)
-            if ext.lower() in [".png", ".tga", ".jpg", ".jpeg", ".dds"]:
+            if ext.lower() in [".png", ".tga", ".jpg", ".jpeg", ".dds", ".exr", ".webp"]:
                 is_match = base_name in tex_names
                 if not is_match:
                     for mesh in meshes_exported:
@@ -887,7 +921,7 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
     # Automatically export referenced textures
     if exported_count > 0:
         try:
-            export_textures_for_meshes(meshes_to_export, export_dir, separate_textures,
+            export_textures_for_meshes(exported_meshes, export_dir, separate_textures,
                                        name_map=texture_names)
         except Exception as tex_err:
             unreal.log_warning(f"Failed to export textures for meshes: {str(tex_err)}")
@@ -975,21 +1009,26 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
         
     unique_meshes = set()
     for actor in all_actors:
-        # Static Meshes
-        static_comps = actor.get_components_by_class(unreal.StaticMeshComponent)
-        for comp in static_comps:
-            mesh = comp.static_mesh if hasattr(comp, "static_mesh") else comp.get_editor_property("static_mesh")
-            if mesh:
-                unique_meshes.add(mesh)
-                
-        # Skeletal Meshes
-        skeletal_comps = []
-        if hasattr(unreal, "SkeletalMeshComponent"):
-            skeletal_comps = actor.get_components_by_class(unreal.SkeletalMeshComponent)
-        for comp in skeletal_comps:
-            mesh = comp.skeletal_mesh if hasattr(comp, "skeletal_mesh") else comp.get_editor_property("skeletal_mesh")
-            if mesh:
-                unique_meshes.add(mesh)
+        if actor is None:
+            continue
+        try:
+            # Static Meshes
+            static_comps = actor.get_components_by_class(unreal.StaticMeshComponent)
+            for comp in static_comps:
+                mesh = ue2g_common.safe_get_prop(comp, "static_mesh")
+                if mesh:
+                    unique_meshes.add(mesh)
+
+            # Skeletal Meshes
+            skeletal_comps = []
+            if hasattr(unreal, "SkeletalMeshComponent"):
+                skeletal_comps = actor.get_components_by_class(unreal.SkeletalMeshComponent)
+            for comp in skeletal_comps:
+                mesh = ue2g_common.safe_get_prop(comp, "skeletal_mesh")
+                if mesh:
+                    unique_meshes.add(mesh)
+        except Exception:
+            continue
                 
     meshes_to_export = list(unique_meshes)
     if not meshes_to_export:
@@ -1107,7 +1146,7 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
     # Automatically export referenced textures
     if exported_count > 0:
         try:
-            export_textures_for_meshes(meshes_to_export, export_dir, separate_textures,
+            export_textures_for_meshes(exported_meshes, export_dir, separate_textures,
                                        name_map=texture_names)
         except Exception as tex_err:
             unreal.log_warning(f"Failed to export textures for meshes: {str(tex_err)}")

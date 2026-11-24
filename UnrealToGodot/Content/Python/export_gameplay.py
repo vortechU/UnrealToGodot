@@ -48,10 +48,15 @@ def collect_navigation(all_actors):
                     continue
                 if vol_class is not None and isinstance(actor, vol_class):
                     origin, extent = actor.get_actor_bounds(False)
-                    # Brush scale is already folded into the world bounds, so the
-                    # region transform must not re-apply it.
-                    transform = ue2g_common.unreal_to_godot_transform(actor.get_actor_transform())
-                    transform["scale"] = [1.0, 1.0, 1.0]
+                    # get_actor_bounds returns a world-space AABB (brush scale,
+                    # offset, and rotation are already folded into origin/extent),
+                    # so place the NavigationRegion3D at the AABB center with
+                    # identity rotation and unit scale so filter_baking_aabb matches.
+                    transform = {
+                        "translation": ue2g_common.vector_to_godot(origin),
+                        "rotation_quat": [0.0, 0.0, 0.0, 1.0],
+                        "scale": [1.0, 1.0, 1.0],
+                    }
                     bounds.append({
                         "name": actor.get_actor_label(),
                         "godot_transform": transform,

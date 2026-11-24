@@ -67,11 +67,23 @@ func apply(data: Dictionary, root: Node, scene_owner: Node, options: Dictionary)
 		var mesh: Mesh = mesh_inst.mesh
 		scene_inst.free()
 
+		var overrides = entry.get("material_overrides")
+		var has_overrides: bool = overrides is Array and not (overrides as Array).is_empty()
+		var mesh_lib_entry = meshes_lib.get(mesh_key)
+		var has_lib_mats: bool = (mesh_lib_entry is Dictionary
+			and mesh_lib_entry.get("materials") is Array
+			and not (mesh_lib_entry.get("materials") as Array).is_empty())
+		if material_helper != null and (has_overrides or has_lib_mats):
+			# Duplicate the external glTF Mesh resource before setting surface
+			# materials: mutating the imported Mesh in place pollutes Godot's
+			# resource cache and is discarded when the scene is saved to .tscn.
+			mesh = mesh.duplicate()
+
 		_apply_library_materials(mesh, mesh_key, meshes_lib, material_helper)
 		# A foliage type pointing at an overridden material (the usual way a pack
 		# ships a winter/dead variant of one mesh) used to render with the base
 		# mesh's material instead.
-		_apply_material_overrides(mesh, entry.get("material_overrides"), material_helper)
+		_apply_material_overrides(mesh, overrides, material_helper)
 
 		var floats = entry.get("godot_transforms", [])
 		if not (floats is Array):
@@ -112,7 +124,7 @@ func apply(data: Dictionary, root: Node, scene_owner: Node, options: Dictionary)
 		Common.add_owned_child(container, mmi, scene_owner)
 		created += 1
 
-	if created == 0:
+	if container.get_child_count() == 0:
 		container.queue_free()
 	return {"created": created, "warnings": warnings}
 
@@ -154,11 +166,14 @@ func _apply_material_overrides(mesh: Mesh, overrides, material_helper) -> void:
 		var params = entry.get("parameters")
 		if not (params is Dictionary):
 			continue
+		var override_name := Common.get_str(entry, "material_name", "None")
+		var existing_mat := mesh.surface_get_material(slot)
+		var base_mat: Material = existing_mat if (existing_mat and override_name != "" and existing_mat.resource_name.to_lower() == override_name.to_lower()) else null
 		var mat = material_helper.get_or_create_material(
-			Common.get_str(entry, "material_name", "None"),
+			override_name,
 			Common.get_str(entry, "material_path", "None"),
 			params,
-			mesh.surface_get_material(slot)
+			base_mat
 		)
 		if mat:
 			mesh.surface_set_material(slot, mat)

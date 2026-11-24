@@ -93,6 +93,27 @@ func apply_actor_metadata(node: Node, actor_data: Dictionary, options: Dictionar
 			node.set_meta(_sanitize_meta_key(str(key)), value)
 
 
+func apply_component_metadata(node: Node, comp_data: Dictionary, options: Dictionary) -> void:
+	"""Writes Unreal component tags onto the component node as metadata."""
+	if node == null or not bool(options.get("apply_metadata", true)):
+		return
+	var tags = comp_data.get("tags")
+	if not (tags is Array) or tags.is_empty():
+		return
+	var tag_list := PackedStringArray()
+	if node.has_meta("unreal_tags"):
+		var existing = node.get_meta("unreal_tags")
+		if existing is PackedStringArray or existing is Array:
+			for e in existing:
+				tag_list.append(str(e))
+	for t in tags:
+		var s := str(t)
+		if s != "" and not tag_list.has(s):
+			tag_list.append(s)
+	if not tag_list.is_empty():
+		node.set_meta("unreal_tags", tag_list)
+
+
 func _sanitize_meta_key(key: String) -> String:
 	"""Godot metadata names must be valid identifiers."""
 	var out := ""

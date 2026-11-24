@@ -313,6 +313,11 @@ def audit_models(rep, models_dir, layout, strict=True):
                 key = comp.get("mesh_key") or comp.get("mesh_name")
                 if key:
                     wanted.add(key)
+        for foliage in layout.get("foliage") or []:
+            if isinstance(foliage, dict):
+                key = foliage.get("mesh_key") or foliage.get("mesh_name")
+                if key:
+                    wanted.add(key)
         absent = sorted(wanted - available)
         if absent:
             rep.error("%d mesh(es) referenced by the layout have no .gltf "
@@ -327,7 +332,7 @@ IMAGE_EXTENSIONS = (".png", ".tga", ".jpg", ".jpeg", ".dds", ".exr", ".webp")
 
 
 def layout_texture_names(layout):
-    """Every texture filename stem the layout references, from all three places."""
+    """Every texture filename stem the layout references across all sections."""
     names = set()
 
     def _add(params, keys):
@@ -347,8 +352,20 @@ def layout_texture_names(layout):
         for comp in actor.get("components", []) or []:
             for override in comp.get("material_overrides", []) or []:
                 _add(override.get("parameters"), slots)
+    for foliage in layout.get("foliage") or []:
+        if isinstance(foliage, dict):
+            for override in foliage.get("material_overrides", []) or []:
+                _add(override.get("parameters"), slots)
     for decal in layout.get("decals") or []:
         _add(decal.get("textures"), ("albedo", "normal", "orm", "emission"))
+    for landscape in layout.get("landscapes") or []:
+        mat = landscape.get("material") if isinstance(landscape, dict) else None
+        if isinstance(mat, dict):
+            for tex in mat.get("textures", []) or []:
+                if isinstance(tex, dict):
+                    value = tex.get("texture")
+                    if isinstance(value, str) and value:
+                        names.add(value)
     return names
 
 
@@ -504,12 +521,12 @@ def find_models_dir(root):
 
 def find_layout_json(root):
     """Locates the layout JSON. The exporter names it <LevelName>_layout.json,
-    and only falls back to level_layout.json when the level is unnamed."""
-    for name in ("level_layout.json",):
-        candidate = os.path.join(root, name)
-        if os.path.isfile(candidate):
-            return candidate
-    matches = sorted(f for f in _listdir(root) if f.lower().endswith("_layout.json"))
+    and falls back to level_layout.json when unnamed. When several *_layout.json
+    files exist in the same folder, the most recently written one wins."""
+    matches = sorted(
+        f for f in _listdir(root)
+        if f.lower().endswith("_layout.json") and os.path.isfile(os.path.join(root, f))
+    )
     if matches:
         # Newest wins: an export folder accumulates one per level exported.
         matches.sort(key=lambda f: os.path.getmtime(os.path.join(root, f)), reverse=True)

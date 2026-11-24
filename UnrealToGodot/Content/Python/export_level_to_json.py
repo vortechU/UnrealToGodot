@@ -82,65 +82,91 @@ def extract_mesh_collision(static_mesh):
     }
     
     # 1. Box Elements
-    for box in agg_geom.get_editor_property("box_elems"):
-        center = box.get_editor_property("center")
-        rot = box.get_editor_property("rotation")
-        u_quat = rot.quaternion()
-        godot_local = gltf_local_shape_transform(center, u_quat)
-
-        # FKBoxElem X/Y/Z are already the box's FULL side lengths in cm (Godot's
-        # BoxShape3D.size is likewise full extents), so store them as-is.
-        collision_data["boxes"].append({
-            "size": [
-                box.get_editor_property("x"), # Full width in cm  (Unreal X)
-                box.get_editor_property("y"), # Full depth in cm  (Unreal Y)
-                box.get_editor_property("z")  # Full height in cm (Unreal Z)
-            ],
-            "godot_local_transform": godot_local
-        })
-
-    # 2. Sphere Elements
-    for sphere in agg_geom.get_editor_property("sphere_elems"):
-        center = sphere.get_editor_property("center")
-        # Spheres don't have rotation
-        godot_local = gltf_local_shape_transform(center, unreal.Quat(0.0, 0.0, 0.0, 1.0))
-        
-        collision_data["spheres"].append({
-            "radius": sphere.get_editor_property("radius"), # in cm
-            "godot_local_transform": godot_local
-        })
-        
-    # 3. Capsule (Sphyl) Elements
-    for capsule in agg_geom.get_editor_property("sphyl_elems"):
-        center = capsule.get_editor_property("center")
-        rot = capsule.get_editor_property("rotation")
-        u_quat = rot.quaternion()
-        godot_local = gltf_local_shape_transform(center, u_quat)
-
-        collision_data["capsules"].append({
-            "radius": capsule.get_editor_property("radius"), # in cm
-            "length": capsule.get_editor_property("length"), # cylinder length in cm
-            "godot_local_transform": godot_local
-        })
-        
-    # 4. Convex Elements
-    for convex in agg_geom.get_editor_property("convex_elems"):
+    for box in (ue2g_common.safe_get_prop(agg_geom, "box_elems", []) or []):
         try:
-            center = convex.get_editor_property("center")
-            rot = convex.get_editor_property("rotation")
+            center = box.get_editor_property("center")
+            rot = box.get_editor_property("rotation")
             u_quat = rot.quaternion()
             godot_local = gltf_local_shape_transform(center, u_quat)
 
-            vertices = []
-            vertex_data = convex.get_editor_property("vertex_data")
-            if vertex_data:
-                for v in vertex_data:
-                    vertices.append([v.x, v.y, v.z]) # in cm, relative to shape origin
-                
-            collision_data["convex_hulls"].append({
-                "vertices": vertices,
+            # FKBoxElem X/Y/Z are already the box's FULL side lengths in cm (Godot's
+            # BoxShape3D.size is likewise full extents), so store them as-is.
+            collision_data["boxes"].append({
+                "size": [
+                    box.get_editor_property("x"), # Full width in cm  (Unreal X)
+                    box.get_editor_property("y"), # Full depth in cm  (Unreal Y)
+                    box.get_editor_property("z")  # Full height in cm (Unreal Z)
+                ],
                 "godot_local_transform": godot_local
             })
+        except Exception as e:
+            unreal.log_warning(f"Failed to read box collision element: {str(e)}")
+
+    # 2. Sphere Elements
+    for sphere in (ue2g_common.safe_get_prop(agg_geom, "sphere_elems", []) or []):
+        try:
+            center = sphere.get_editor_property("center")
+            # Spheres don't have rotation
+            godot_local = gltf_local_shape_transform(center, unreal.Quat(0.0, 0.0, 0.0, 1.0))
+
+            collision_data["spheres"].append({
+                "radius": sphere.get_editor_property("radius"), # in cm
+                "godot_local_transform": godot_local
+            })
+        except Exception as e:
+            unreal.log_warning(f"Failed to read sphere collision element: {str(e)}")
+
+    # 3. Capsule (Sphyl) Elements
+    for capsule in (ue2g_common.safe_get_prop(agg_geom, "sphyl_elems", []) or []):
+        try:
+            center = capsule.get_editor_property("center")
+            rot = capsule.get_editor_property("rotation")
+            u_quat = rot.quaternion()
+            godot_local = gltf_local_shape_transform(center, u_quat)
+
+            collision_data["capsules"].append({
+                "radius": capsule.get_editor_property("radius"), # in cm
+                "length": capsule.get_editor_property("length"), # cylinder length in cm
+                "godot_local_transform": godot_local
+            })
+        except Exception as e:
+            unreal.log_warning(f"Failed to read capsule collision element: {str(e)}")
+
+    # 4. Convex Elements
+    # FKConvexElem stores a Transform (not center/rotation like boxes/capsules);
+    # read transform first, fall back to center/rotation, and default to identity
+    # so readable vertex_data is never lost when transform fields are unexposed.
+    for convex in (ue2g_common.safe_get_prop(agg_geom, "convex_elems", []) or []):
+        try:
+            u_scale = None
+            convex_transform = ue2g_common.safe_get_prop(convex, "transform", None)
+            if convex_transform is not None:
+                center = convex_transform.translation
+                u_quat = convex_transform.rotation
+                u_scale = getattr(convex_transform, "scale3d", None)
+            else:
+                center = ue2g_common.safe_get_prop(convex, "center", None)
+                rot = ue2g_common.safe_get_prop(convex, "rotation", None)
+                if center is None:
+                    center = unreal.Vector(0.0, 0.0, 0.0)
+                u_quat = rot.quaternion() if rot is not None else unreal.Quat(0.0, 0.0, 0.0, 1.0)
+            godot_local = gltf_local_shape_transform(center, u_quat)
+
+            sx = u_scale.x if u_scale is not None else 1.0
+            sy = u_scale.y if u_scale is not None else 1.0
+            sz = u_scale.z if u_scale is not None else 1.0
+
+            vertices = []
+            vertex_data = ue2g_common.safe_get_prop(convex, "vertex_data", None)
+            if vertex_data:
+                for v in vertex_data:
+                    vertices.append([v.x * sx, v.y * sy, v.z * sz]) # in cm, relative to shape origin
+
+            if vertices:
+                collision_data["convex_hulls"].append({
+                    "vertices": vertices,
+                    "godot_local_transform": godot_local
+                })
         except Exception as e:
             unreal.log_warning(f"Failed to read convex hull element: {str(e)}")
         
@@ -365,10 +391,13 @@ def finalize_layout_texture_names(layout_data, name_by_path):
         for comp in (actor.get("components") or []):
             for override in (comp.get("material_overrides") or []):
                 apply_texture_export_names(override.get("parameters"), name_by_path)
+    for foliage in (layout_data.get("foliage") or []):
+        for override in (foliage.get("material_overrides") or []):
+            apply_texture_export_names(override.get("parameters"), name_by_path)
     for decal in (layout_data.get("decals") or []):
         apply_texture_export_names(decal.get("textures"), name_by_path)
-    # The landscape material's textures are recorded as a list of asset names
-    # rather than a slot dict, so they are rewritten by name, not by path.
+    # Landscape material textures carry "path" when available (preferred so colliding
+    # asset names disambiguate accurately) and fall back to matching by asset name.
     name_by_asset = {}
     for path, final in name_by_path.items():
         name_by_asset[str(path).split(".")[-1]] = final
@@ -377,7 +406,11 @@ def finalize_layout_texture_names(layout_data, name_by_path):
         if not isinstance(material, dict):
             continue
         for tex in (material.get("textures") or []):
-            final = name_by_asset.get(tex.get("texture"))
+            if not isinstance(tex, dict):
+                continue
+            final = name_by_path.get(tex.get("path")) if tex.get("path") else None
+            if not final:
+                final = name_by_asset.get(tex.get("texture"))
             if final:
                 tex["texture"] = final
 
@@ -547,16 +580,21 @@ def extract_material_parameters(material, collected_textures=None):
     _extract_recursive(material)
 
     # Godot computes roughness/metallic as scalar * texture[channel]. Unreal drives
-    # them straight from the packed map unless the material exposes an explicit
-    # multiplier, so a scalar left at its default would zero the texture out --
-    # metallic defaults to 0.0, which would cancel the map entirely. Promote the
-    # unset scalars to 1.0 so the packed map passes through unchanged.
+    # them straight from a packed or standalone map unless the material exposes an
+    # explicit multiplier, so a scalar left at its default would zero or halve the
+    # texture -- metallic defaults to 0.0, which cancels a metallic map entirely,
+    # and roughness defaults to 0.5, which halves a standalone roughness map.
+    # Promote unset scalars to 1.0 so the map passes through unchanged.
     if parameters["packed_texture"]:
         channels = parameters["packed_channels"] or {}
         if "roughness" in channels and "roughness" not in assigned:
             parameters["roughness"] = 1.0
         if "metallic" in channels and "metallic" not in assigned:
             parameters["metallic"] = 1.0
+    if parameters["roughness_texture"] and "roughness" not in assigned:
+        parameters["roughness"] = 1.0
+    if parameters["metallic_texture"] and "metallic" not in assigned:
+        parameters["metallic"] = 1.0
 
     return parameters
 
@@ -892,108 +930,132 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
             if slow_task.should_cancel():
                 unreal.log_warning("Export cancelled by user.")
                 break
+            if actor is None:
+                continue
+
+            try:
+                actor_label = actor.get_actor_label()
+                slow_task.enter_progress_frame(1, f"Scanning: {actor_label}")
                 
-            actor_label = actor.get_actor_label()
-            slow_task.enter_progress_frame(1, f"Scanning: {actor_label}")
-            
-            # Find all StaticMeshComponents inside this actor
-            static_comps = actor.get_components_by_class(unreal.StaticMeshComponent)
-            
-            # Find all SkeletalMeshComponents inside this actor
-            skeletal_comps = []
-            if hasattr(unreal, "SkeletalMeshComponent"):
-                skeletal_comps = actor.get_components_by_class(unreal.SkeletalMeshComponent)
+                # Find all StaticMeshComponents inside this actor
+                static_comps = actor.get_components_by_class(unreal.StaticMeshComponent)
                 
-            valid_components = []
-            
-            for comp in static_comps:
-                if instanced_classes and isinstance(comp, instanced_classes) \
-                        and not expand_instanced:
-                    continue  # exported as packed instance arrays by the foliage exporter
-                mesh = comp.static_mesh if hasattr(comp, "static_mesh") else comp.get_editor_property("static_mesh")
-                if mesh:
-                    valid_components.append((comp, mesh))
+                # Find all SkeletalMeshComponents inside this actor
+                skeletal_comps = []
+                if hasattr(unreal, "SkeletalMeshComponent"):
+                    skeletal_comps = actor.get_components_by_class(unreal.SkeletalMeshComponent)
                     
-            for comp in skeletal_comps:
-                mesh = comp.skeletal_mesh if hasattr(comp, "skeletal_mesh") else comp.get_editor_property("skeletal_mesh")
-                if mesh:
-                    valid_components.append((comp, mesh))
-                    
-            if not valid_components:
-                continue # Skip actors with no meshes (e.g. lights, cameras, logic)
+                valid_components = []
                 
-            # Collect actor-level properties
-            actor_class = actor.get_class().get_name()
-            actor_transform = actor.get_actor_transform()
-            
-            actor_data = {
-                "name": actor_label,
-                "class": actor_class,
-                "unreal_transform": unreal_transform_to_dict(actor_transform),
-                "godot_transform": unreal_to_godot_transform(actor_transform),
-                "components": []
-            }
-
-            if gameplay_mod and opts.get("metadata"):
-                try:
-                    meta = gameplay_mod.extract_actor_metadata(actor)
-                    actor_data["tags"] = meta.get("tags", [])
-                    actor_data["properties"] = meta.get("properties", {})
-                except Exception as e:
-                    unreal.log_warning(f"Metadata extraction failed for {actor_label}: {str(e)}")
-            
-            for comp, mesh in valid_components:
-                comp_name = comp.get_name()
-                mesh_name = mesh.get_name()
-                mesh_path = mesh.get_path_name()
-                mesh_key = register_mesh(mesh)
-
-                # Foliage export is off: emit one placement per instance rather
-                # than one per component, which would put a whole painted field
-                # on a single mesh at the component origin.
-                if expand_instanced and isinstance(comp, instanced_classes):
-                    placements = _expand_instanced_component(
-                        foliage_mod, comp, comp_name, mesh_key, mesh_name, mesh_path,
-                        extract_component_material_overrides(comp, collected_textures),
-                        actor_label)
-                    actor_data["components"].extend(placements)
-                    total_components_count += len(placements)
-                    continue
-
-                # Fetch local relative transform and absolute world transform of the component
-                comp_relative_transform = comp.get_relative_transform()
-                comp_world_transform = comp.get_world_transform()
-
-                comp_data = {
-                    "name": comp_name,
-                    "mesh_key": mesh_key,
-                    "mesh_name": mesh_name,
-                    "mesh_path": mesh_path,
-                    "unreal_relative_transform": unreal_transform_to_dict(comp_relative_transform),
-                    "godot_relative_transform": unreal_to_godot_transform(comp_relative_transform),
-                    "unreal_world_transform": unreal_transform_to_dict(comp_world_transform),
-                    "godot_world_transform": unreal_to_godot_transform(comp_world_transform),
-                    "material_overrides": extract_component_material_overrides(comp, collected_textures)
+                for comp in static_comps:
+                    if ue2g_common.safe_get_prop(comp, "is_editor_only", False):
+                        continue
+                    if instanced_classes and isinstance(comp, instanced_classes) \
+                            and not expand_instanced:
+                        continue  # exported as packed instance arrays by the foliage exporter
+                    mesh = comp.static_mesh if hasattr(comp, "static_mesh") else comp.get_editor_property("static_mesh")
+                    if mesh:
+                        valid_components.append((comp, mesh))
+                        
+                for comp in skeletal_comps:
+                    if ue2g_common.safe_get_prop(comp, "is_editor_only", False):
+                        continue
+                    mesh = comp.skeletal_mesh if hasattr(comp, "skeletal_mesh") else comp.get_editor_property("skeletal_mesh")
+                    if mesh:
+                        valid_components.append((comp, mesh))
+                        
+                if not valid_components:
+                    continue # Skip actors with no meshes (e.g. lights, cameras, logic)
+                    
+                # Collect actor-level properties
+                actor_class = actor.get_class().get_name()
+                actor_transform = actor.get_actor_transform()
+                
+                actor_data = {
+                    "name": actor_label,
+                    "class": actor_class,
+                    "unreal_transform": unreal_transform_to_dict(actor_transform),
+                    "godot_transform": unreal_to_godot_transform(actor_transform),
+                    "components": []
                 }
 
                 if gameplay_mod and opts.get("metadata"):
                     try:
-                        comp_tags = gameplay_mod.extract_component_tags(comp)
-                        if comp_tags:
-                            comp_data["tags"] = comp_tags
-                    except Exception:
-                        pass
-
-                actor_data["components"].append(comp_data)
-                total_components_count += 1
+                        meta = gameplay_mod.extract_actor_metadata(actor)
+                        actor_data["tags"] = meta.get("tags", [])
+                        actor_data["properties"] = meta.get("properties", {})
+                    except Exception as e:
+                        unreal.log_warning(f"Metadata extraction failed for {actor_label}: {str(e)}")
                 
-            exported_actors.append(actor_data)
+                for comp, mesh in valid_components:
+                    comp_name = comp.get_name()
+                    mesh_name = mesh.get_name()
+                    mesh_path = mesh.get_path_name()
+                    mesh_key = register_mesh(mesh)
+
+                    comp_tags = []
+                    if gameplay_mod and opts.get("metadata"):
+                        try:
+                            comp_tags = gameplay_mod.extract_component_tags(comp) or []
+                        except Exception:
+                            comp_tags = []
+
+                    # Foliage export is off: emit one placement per instance rather
+                    # than one per component, which would put a whole painted field
+                    # on a single mesh at the component origin.
+                    if expand_instanced and isinstance(comp, instanced_classes):
+                        placements = _expand_instanced_component(
+                            foliage_mod, comp, comp_name, mesh_key, mesh_name, mesh_path,
+                            extract_component_material_overrides(comp, collected_textures),
+                            actor_label)
+                        if comp_tags:
+                            for p in placements:
+                                p["tags"] = list(comp_tags)
+                        actor_data["components"].extend(placements)
+                        total_components_count += len(placements)
+                        continue
+
+                    # Fetch local relative transform and absolute world transform of the component
+                    comp_relative_transform = comp.get_relative_transform()
+                    comp_world_transform = comp.get_world_transform()
+
+                    comp_data = {
+                        "name": comp_name,
+                        "mesh_key": mesh_key,
+                        "mesh_name": mesh_name,
+                        "mesh_path": mesh_path,
+                        "unreal_relative_transform": unreal_transform_to_dict(comp_relative_transform),
+                        "godot_relative_transform": unreal_to_godot_transform(comp_relative_transform),
+                        "unreal_world_transform": unreal_transform_to_dict(comp_world_transform),
+                        "godot_world_transform": unreal_to_godot_transform(comp_world_transform),
+                        "material_overrides": extract_component_material_overrides(comp, collected_textures)
+                    }
+
+                    if comp_tags:
+                        comp_data["tags"] = comp_tags
+
+                    actor_data["components"].append(comp_data)
+                    total_components_count += 1
+                    
+                if actor_data["components"]:
+                    exported_actors.append(actor_data)
+            except Exception as actor_err:
+                unreal.log_warning(f"Failed to export actor '{ue2g_common.safe_get_name(actor)}': {str(actor_err)}")
  
     # 5. Collect feature data (lights, post-process, decals, terrain, foliage, navigation)
     environment_data = {}
     if environment_mod:
         try:
-            environment_data = environment_mod.collect_environment(all_actors, collected_textures) or {}
+            want_lights = bool(opts.get("lights"))
+            want_decals = bool(opts.get("decals"))
+            try:
+                environment_data = environment_mod.collect_environment(
+                    all_actors, collected_textures,
+                    include_lights=want_lights, include_decals=want_decals) or {}
+            except TypeError:
+                # Backward compatibility with custom/legacy 2-arg collect_environment.
+                tex_sink = collected_textures if want_decals else set()
+                environment_data = environment_mod.collect_environment(all_actors, tex_sink) or {}
         except Exception as e:
             unreal.log_warning(f"Environment export failed: {str(e)}")
     if not opts.get("lights"):

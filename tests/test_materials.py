@@ -452,15 +452,22 @@ check("each material now names its OWN file",
 check("pack A binds pack A's art", p_a["albedo_texture"] == by_asset[tex_a])
 check("pack B binds pack B's art", p_b["albedo_texture"] == by_asset[tex_b])
 
-# The whole-layout walk has to reach mesh materials, component overrides and decals.
+# The whole-layout walk has to reach mesh materials, component overrides,
+# foliage overrides, decals, and landscape material textures.
 layout = {
     "meshes": {"SM_Wall": {"materials": [
         {"parameters": EL.extract_material_parameters(_albedo_mi(tex_a))}]}},
     "actors": [{"components": [{"material_overrides": [
         {"parameters": EL.extract_material_parameters(_albedo_mi(tex_b))}]}]}],
+    "foliage": [{"name": "Foliage_SM_Wall", "material_overrides": [
+        {"parameters": EL.extract_material_parameters(_albedo_mi(tex_b))}]}],
     "decals": [{"textures": {"albedo": "T_Concrete_D", "normal": None, "orm": None,
                              "emission": None,
                              "texture_paths": {"albedo": tex_b.get_path_name()}}}],
+    "landscapes": [{"material": {"textures": [
+        {"parameter": "", "texture": "T_Concrete_D", "path": tex_a.get_path_name(), "role": "albedo"},
+        {"parameter": "", "texture": "T_Concrete_D", "path": tex_b.get_path_name(), "role": "albedo"},
+    ]}}],
 }
 EL.finalize_layout_texture_names(layout, by_path)
 check("mesh material references are finalized",
@@ -469,8 +476,59 @@ check("mesh material references are finalized",
 check("component material overrides are finalized",
       layout["actors"][0]["components"][0]["material_overrides"][0]["parameters"]["albedo_texture"]
       == by_asset[tex_b])
+check("foliage material overrides are finalized",
+      layout["foliage"][0]["material_overrides"][0]["parameters"]["albedo_texture"]
+      == by_asset[tex_b], layout["foliage"][0])
 check("decal textures are finalized",
       layout["decals"][0]["textures"]["albedo"] == by_asset[tex_b], layout["decals"][0])
+check("landscape textures with colliding names disambiguate by path",
+      layout["landscapes"][0]["material"]["textures"][0]["texture"] == by_asset[tex_a]
+      and layout["landscapes"][0]["material"]["textures"][1]["texture"] == by_asset[tex_b],
+      layout["landscapes"][0])
+
+# Standalone roughness/metallic textures must promote unset scalars to 1.0 so
+# Godot does not zero out metallic_texture (default 0.0) or halve roughness_texture (default 0.5).
+sep_mi = _MI({
+    "texture_parameter_values": [
+        _TexParam("Roughness", _Tex("T_Steel_R")),
+        _TexParam("Metallic", _Tex("T_Steel_M")),
+    ],
+    "scalar_parameter_values": [],
+    "vector_parameter_values": [],
+    "parent": None,
+})
+sep_params = EL.extract_material_parameters(sep_mi)
+check("standalone roughness_texture promotes unset roughness scalar to 1.0",
+      sep_params["roughness"] == 1.0, sep_params)
+check("standalone metallic_texture promotes unset metallic scalar to 1.0",
+      sep_params["metallic"] == 1.0, sep_params)
+
+# Standalone maps are not injected into glTF, so preview factors must stay neutral.
+sep_gltf = os.path.join(tmp, "sep.gltf")
+with open(sep_gltf, "w", encoding="utf-8") as f:
+    json.dump({"asset": {"version": "2.0"}, "materials": [{"name": "M_Sep"}]}, f)
+EX.inject_texture_references(sep_gltf, {"M_Sep": sep_params}, "../textures")
+with open(sep_gltf, encoding="utf-8") as f:
+    spbr = json.load(f)["materials"][0]["pbrMetallicRoughness"]
+check("standalone metallic_texture does not make glTF preview render chrome",
+      spbr["metallicFactor"] == 0.0 and spbr["roughnessFactor"] == 1.0, spbr)
+
+# LOD filename matching must require numeric LOD suffix, not arbitrary "_LOD..." mesh names.
+lod_dir = tempfile.mkdtemp()
+for fname in ("SM_Rock.gltf", "SM_Rock_LOD1.gltf", "SM_Rock_LOD_Helper.gltf"):
+    with open(os.path.join(lod_dir, fname), "w", encoding="utf-8") as f:
+        json.dump({"asset": {"version": "2.0"}, "materials": [{"name": "M_Rock"}]}, f)
+_orig_mpfm = EX.material_params_for_mesh
+EX.material_params_for_mesh = lambda _m: {"M_Rock": {"albedo_texture": "T_Rock_D"}}
+try:
+    EX.inject_textures_for_exported_mesh(object(), lod_dir, "SM_Rock", True)
+finally:
+    EX.material_params_for_mesh = _orig_mpfm
+check("LOD injection touches SM_Rock and SM_Rock_LOD1",
+      len(json.load(open(os.path.join(lod_dir, "SM_Rock.gltf"), encoding="utf-8")).get("images", [])) == 1
+      and len(json.load(open(os.path.join(lod_dir, "SM_Rock_LOD1.gltf"), encoding="utf-8")).get("images", [])) == 1)
+check("LOD injection skips unrelated SM_Rock_LOD_Helper.gltf",
+      "images" not in json.load(open(os.path.join(lod_dir, "SM_Rock_LOD_Helper.gltf"), encoding="utf-8")))
 
 untouched = EL.extract_material_parameters(_albedo_mi(tex_a))
 EL.apply_texture_export_names(untouched, {})
@@ -975,6 +1033,22 @@ tinted = _decal_entry(_decal_mi(vectors=[_ScalarParam("BaseColor", _LinColor(0.5
 check("the material tint reaches Decal.modulate (it used to be dropped entirely)",
       [round(c, 4) for c in tinted["modulate"]] == [0.5, 0.25, 0.0, 0.5], tinted["modulate"])
 
+# If DecalColor arrives as an sRGB FColor (0..255 bytes), it must be decoded to linear 0..1.
+class _FColorStub(u.Color):
+    def __init__(self, r, g, b, a=255):
+        self.r, self.g, self.b, self.a = r, g, b, a
+
+_prev_lc = u.LinearColor
+u.LinearColor = _LinColor
+try:
+    srgb_decal = _decal_entry(_decal_mi(), decal_color=_FColorStub(255, 128, 0, 128))
+finally:
+    u.LinearColor = _prev_lc
+check("sRGB FColor decal_color is decoded to linear 0..1 rather than 0..255",
+      srgb_decal["modulate"][0] == 1.0 and 0.20 < srgb_decal["modulate"][1] < 0.23
+      and srgb_decal["modulate"][2] == 0.0 and abs(srgb_decal["modulate"][3] - 128.0 / 255.0) < 1e-4,
+      srgb_decal["modulate"])
+
 faded = _decal_entry(_decal_mi(scalars=[_ScalarParam("Opacity", 0.25)]))
 check("an Opacity parameter folds into modulate's alpha",
       _near(faded["modulate"][3], 0.25), faded["modulate"])
@@ -1245,6 +1319,88 @@ hostile = EE._build_light_entries(_FakeLightActor([_HostileComp()]))
 check("an unreadable light component still produces an entry rather than raising",
       len(hostile) == 1 and hostile[0]["type"] == "point", hostile)
 
+# Edge cases from second sweep: 0-degree lumen spotlight, editor-only lights/decals,
+# disabled PostProcessVolume, hidden fog/sky light, and FKConvexElem.transform.
+zero_cone_spot = _light("spot", intensity=100.0, intensity_units="LUMENS", outer_cone_angle=0.0)
+check("0-degree lumen spotlight does not divide by zero",
+      zero_cone_spot["intensity_candelas"] > 0.0, zero_cone_spot)
+
+ed_light = EE._build_light_entries(_FakeLightActor([_FakeLightComp("point", is_editor_only=True)]))
+check("editor-only light component is skipped", ed_light == [], ed_light)
+ed_decal = EE._build_decal_entries(_FakeDecalActor(None, [_FakeDecalComp(_decal_mi(), is_editor_only=True)]), set())
+check("editor-only decal component is skipped", ed_decal == [], ed_decal)
+
+
+class _DisabledPP:
+    def __init__(self, enabled=True, blend_weight=1.0):
+        self._p = {"enabled": enabled, "blend_weight": blend_weight, "settings": None, "unbound": True, "priority": 5.0}
+
+    def get_editor_property(self, k):
+        return self._p[k]
+
+    def get_actor_label(self):
+        return "PP_Disabled"
+
+    def get_actor_transform(self):
+        return _FakeTransform()
+
+    def get_actor_bounds(self, _):
+        return _Vec(), _Vec(100, 100, 100)
+
+
+check("disabled PostProcessVolume is skipped",
+      EE._build_post_process_entry(_DisabledPP(enabled=False)) is None)
+check("zero blend_weight PostProcessVolume is skipped",
+      EE._build_post_process_entry(_DisabledPP(blend_weight=0.0)) is None)
+
+
+class _ConvexElem:
+    """FKConvexElem: exposes transform + vertex_data, NOT center/rotation."""
+    def __init__(self, verts, scale=(1.0, 1.0, 1.0)):
+        self._props = {
+            "transform": types.SimpleNamespace(
+                translation=_Vec(10.0, 20.0, 30.0),
+                rotation=_Quat(0.0, 0.0, 0.0, 1.0),
+                scale3d=_Vec(*scale),
+            ),
+            "vertex_data": [_Vec(*v) for v in verts],
+        }
+
+    def get_editor_property(self, k):
+        if k not in self._props:
+            raise Exception("FKConvexElem has no property %r" % k)
+        return self._props[k]
+
+
+class _AggGeom:
+    def __init__(self, convex_elems):
+        self._p = {"box_elems": [], "sphere_elems": [], "sphyl_elems": [], "convex_elems": convex_elems}
+
+    def get_editor_property(self, k):
+        return self._p[k]
+
+
+class _FakeSM:
+    def __init__(self, convex_elems):
+        self._bs = types.SimpleNamespace(get_editor_property=lambda k: _AggGeom(convex_elems))
+
+    def get_editor_property(self, k):
+        return self._bs
+
+
+hull_col = EL.extract_mesh_collision(_FakeSM([
+    _ConvexElem([(10, 20, 30), (0, 0, 0), (5, 5, 5)], scale=(2.0, 1.0, 0.5)),
+    _ConvexElem([]),  # empty hull must not be emitted
+]))
+check("FKConvexElem reads transform + vertex_data without needing center/rotation",
+      hull_col is not None and len(hull_col["convex_hulls"]) == 1, hull_col)
+check("FKConvexElem transform translation and scale are preserved",
+      hull_col["convex_hulls"][0]["godot_local_transform"]["translation"] == [0.1, 0.3, 0.2]
+      and hull_col["convex_hulls"][0]["vertices"][0] == [20.0, 20.0, 15.0],
+      hull_col["convex_hulls"][0])
+check("mesh with only an empty convex hull returns None collision",
+      EL.extract_mesh_collision(_FakeSM([_ConvexElem([])])) is None)
+
 print("\n=== 9. Foliage / instanced meshes ===")
 
 # UE 5.7 hierarchy, probed: FISM derives from HISM derives from ISM.
@@ -1505,6 +1661,37 @@ rows = list(EF.iter_instance_transforms(fallback_comp))
 check("iter_instance_transforms yields (index, world, local) per instance",
       len(rows) == 2 and rows[0][0] == 0 and rows[0][1] is not None and rows[0][2] is not None,
       rows)
+
+print("\n=== 11. collect_environment respects include_decals / include_lights flags ===")
+u.PostProcessVolume = type("PostProcessVolume", (), {})
+u.ExponentialHeightFog = type("ExponentialHeightFog", (), {})
+u.SkyLight = type("SkyLight", (), {})
+decal_tex = _Tex("T_DecalOnly_D", "/Game/Decals/T_DecalOnly_D.T_DecalOnly_D")
+decal_mi = _MI({
+    "texture_parameter_values": [_TexParam("Diff", decal_tex)],
+    "scalar_parameter_values": [], "vector_parameter_values": [], "parent": None,
+})
+
+
+class _DecalOnlyActor(_FakeDecalActor):
+    def get_components_by_class(self, cls):
+        return self._comps if cls is u.DecalComponent else []
+
+
+decal_actor = _DecalOnlyActor(decal_mi)
+tex_when_off = set()
+env_no_decals = EE.collect_environment([decal_actor], tex_when_off,
+                                       include_lights=True, include_decals=False)
+check("disabling decals skips decal entries AND does not leak decal textures",
+      env_no_decals["decals"] == [] and len(tex_when_off) == 0,
+      (env_no_decals["decals"], tex_when_off))
+
+tex_when_on = set()
+env_with_decals = EE.collect_environment([decal_actor], tex_when_on,
+                                         include_lights=False, include_decals=True)
+check("enabling decals with lights off collects decals and their textures",
+      len(env_with_decals["decals"]) == 1 and decal_tex in tex_when_on,
+      (len(env_with_decals["decals"]), tex_when_on))
 
 print("\n" + "=" * 60)
 if FAIL:

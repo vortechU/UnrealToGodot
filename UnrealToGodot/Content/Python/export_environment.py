@@ -253,10 +253,10 @@ def _intensity_in_candelas(comp, light_type, intensity, units, outer_cone_angle_
             return intensity / math.pi
         cos_half_cone = -1.0
         if light_type == "spot" and outer_cone_angle_deg is not None:
-            # USpotLightComponent::GetCosHalfConeAngle clamps to 0..89.9 deg.
+            # Clamp away from 0 deg so 1 - cos(0) never divides by zero.
             cos_half_cone = math.cos(math.radians(
-                min(max(_f(outer_cone_angle_deg, 44.0), 0.0), 89.9)))
-        return intensity / (2.0 * math.pi * (1.0 - cos_half_cone))
+                min(max(_f(outer_cone_angle_deg, 44.0), 0.5), 89.9)))
+        return intensity / max(2.0 * math.pi * (1.0 - cos_half_cone), 1e-6)
     if units == "nits":
         return intensity * _emissive_area_m2(comp, light_type)
 
@@ -343,6 +343,8 @@ def _build_light_entries(actor):
 def _build_light_entry(actor, light_comp, name):
     light_type = _light_type_of(light_comp)
     if light_type is None:
+        return None
+    if _b(ue2g_common.safe_get_prop(light_comp, "is_editor_only", False), False):
         return None
 
     intensity = _f(ue2g_common.safe_get_prop(light_comp, "intensity", None), 0.0)
@@ -537,6 +539,11 @@ def _size_to_godot(v):
 
 
 def _build_post_process_entry(actor):
+    if not _b(ue2g_common.safe_get_prop(actor, "enabled", True), True):
+        return None
+    blend_weight = _f(ue2g_common.safe_get_prop(actor, "blend_weight", 1.0), 1.0)
+    if blend_weight <= 0.0:
+        return None
     settings = ue2g_common.safe_get_prop(actor, "settings", None)
     unbound = ue2g_common.safe_get_prop(actor, "unbound", True)
     priority = ue2g_common.safe_get_prop(actor, "priority", 0.0)
@@ -600,6 +607,9 @@ def _build_height_fog(actor):
         comp = None
     if comp is None:
         return None
+    if (not _b(ue2g_common.safe_get_prop(comp, "visible", True), True)
+            or _b(ue2g_common.safe_get_prop(comp, "hidden_in_game", False), False)):
+        return None
 
     density = ue2g_common.safe_get_prop(comp, "fog_density", None)
     falloff = ue2g_common.safe_get_prop(comp, "fog_height_falloff", None)
@@ -622,6 +632,10 @@ def _build_sky_light(actor):
         _log_actor_warning(actor, "failed to get SkyLightComponent", e)
         comp = None
     if comp is None:
+        return None
+    if (not _b(ue2g_common.safe_get_prop(comp, "visible", True), True)
+            or _b(ue2g_common.safe_get_prop(comp, "hidden_in_game", False), False)
+            or not _b(ue2g_common.safe_get_prop(comp, "affects_world", True), True)):
         return None
 
     intensity = ue2g_common.safe_get_prop(comp, "intensity", None)
@@ -1123,8 +1137,9 @@ def _decal_modulate(comp, params, material):
 
     decal_color = ue2g_common.safe_get_prop(comp, "decal_color", None)
     if decal_color is not None:
-        for i, channel in enumerate(("r", "g", "b", "a")):
-            modulate[i] = _f(getattr(decal_color, channel, 1.0), 1.0)
+        dc = ue2g_common.linear_color_to_list(decal_color, include_alpha=True)
+        for i in range(min(4, len(dc))):
+            modulate[i] = _f(dc[i], 1.0)
 
     tint = (params or {}).get("albedo_color")
     if isinstance(tint, (list, tuple)):
@@ -1214,6 +1229,8 @@ def _build_decal_entries(actor, collected_textures):
 
 def _build_decal_entry(actor, comp, name, collected_textures):
     if comp is None:
+        return None
+    if _b(ue2g_common.safe_get_prop(comp, "is_editor_only", False), False):
         return None
 
     decal_size = ue2g_common.safe_get_prop(comp, "decal_size", None)
@@ -1337,12 +1354,15 @@ def _component_world_transform(actor, comp):
 # Entry point
 # ---------------------------------------------------------------------------
 
-def collect_environment(all_actors, collected_textures):
+def collect_environment(all_actors, collected_textures,
+                        include_lights=True, include_decals=True):
     """
     Scans all_actors and returns:
         {"lights": [...], "post_process": [...], "height_fog": {...} | None,
          "sky_light": {...} | None, "has_sky_atmosphere": bool, "decals": [...]}
 
+    include_lights / include_decals allow callers to skip disabled categories so
+    decal textures are not added to collected_textures when decals are off.
     Never raises and never shows dialogs: failures are logged via
     unreal.log_warning and the affected actor/feature is simply skipped.
     """
@@ -1369,7 +1389,10 @@ def collect_environment(all_actors, collected_textures):
                 # unreal.DecalActor / unreal.PointLight dropped every one of
                 # them riding on a Blueprint prop -- and every branch below
                 # continues, which would have kept skipping them.
-                result["decals"].extend(_build_decal_entries(actor, collected_textures))
+                if include_decals:
+                    result["decals"].extend(_build_decal_entries(actor, collected_textures))
+                if not include_lights:
+                    continue
                 result["lights"].extend(_build_light_entries(actor))
 
                 if isinstance(actor, unreal.PostProcessVolume):

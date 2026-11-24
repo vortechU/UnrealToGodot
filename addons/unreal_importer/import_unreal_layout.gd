@@ -129,7 +129,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 		return false
 
 	var actors: Array = data["actors"]
-	var meshes_lib: Dictionary = data.get("meshes", {})
+	var meshes_lib: Dictionary = data.get("meshes", {}) if data.get("meshes") is Dictionary else {}
 	print("Starting import of ", actors.size(), " actors from Unreal...")
 	material_cache.clear()
 	
@@ -145,7 +145,10 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 	# so this is created exactly when it would not be left empty.
 	var mesh_root: Node = active_scene_root
 	for actor_data in actors:
-		if (actor_data.get("components", []) as Array).size() > 0:
+		if not (actor_data is Dictionary):
+			continue
+		var comps = actor_data.get("components", [])
+		if comps is Array and (comps as Array).size() > 0:
 			var container := Node3D.new()
 			container.name = STATIC_MESH_CONTAINER
 			Common.add_owned_child(active_scene_root, container, active_scene_root)
@@ -154,32 +157,39 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 
 	# Iterate and instance actors
 	for actor_data in actors:
-		var actor_name: String = actor_data.get("name", "Actor")
-		var actor_class: String = actor_data.get("class", "StaticMeshActor")
-		var components: Array = actor_data.get("components", [])
+		if not (actor_data is Dictionary):
+			continue
+		var actor_name: String = Common.get_str(actor_data, "name", "Actor")
+		var actor_class: String = Common.get_str(actor_data, "class", "StaticMeshActor")
+		var comps_raw = actor_data.get("components", [])
+		var components: Array = comps_raw if comps_raw is Array else []
 		
 		if components.size() == 0:
 			continue # No meshes to instance
 			
 		# Resolve the parent actor's transform
-		var actor_transform: Transform3D
+		var actor_transform: Transform3D = Transform3D.IDENTITY
 		if USE_GDSCRIPT_TRANSFORM_CONVERSION:
-			var u_trans = actor_data["unreal_transform"]
-			actor_transform = convert_unreal_to_godot_transform(
-				u_trans["translation"], 
-				u_trans["rotation_quat"], 
-				u_trans["scale"]
-			)
+			var u_trans = actor_data.get("unreal_transform")
+			if u_trans is Dictionary:
+				actor_transform = convert_unreal_to_godot_transform(
+					u_trans.get("translation", [0.0, 0.0, 0.0]),
+					u_trans.get("rotation_quat", [0.0, 0.0, 0.0, 1.0]),
+					u_trans.get("scale", [1.0, 1.0, 1.0])
+				)
 		else:
-			var g_trans = actor_data["godot_transform"]
-			actor_transform = get_transform_from_dict(g_trans)
+			var g_trans = actor_data.get("godot_transform")
+			if g_trans is Dictionary:
+				actor_transform = get_transform_from_dict(g_trans)
 			
 		# Optimisation: If it is a simple single-mesh actor, instance it directly.
 		# If it's a complex actor (multiple meshes / components), create a parent Node3D.
 		if components.size() == 1:
 			var comp_data = components[0]
-			var mesh_name: String = comp_data.get("mesh_name", "")
-			var mesh_key: String = comp_data.get("mesh_key", mesh_name)
+			if not (comp_data is Dictionary):
+				continue
+			var mesh_name: String = Common.get_str(comp_data, "mesh_name", "")
+			var mesh_key: String = Common.get_str(comp_data, "mesh_key", mesh_name)
 
 			# The component's absolute placement, straight from the exporter.
 			var comp_transform := component_world_transform(comp_data, actor_transform)
@@ -203,14 +213,15 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 
 			if instanced_mesh:
 				# Apply materials to mesh instance
-				var overrides = comp_data.get("material_overrides", [])
+				var overrides_raw = comp_data.get("material_overrides", [])
+				var overrides: Array = overrides_raw if overrides_raw is Array else []
 				apply_materials_to_instance(instanced_mesh, mesh_key, overrides, meshes_lib)
 
 				if physics_body:
 					# Physics body already carries actor * component, minus any scale
 					# Jolt could not have applied to the shapes -- which the mesh has
 					# to take instead, or it would render unscaled.
-					instanced_mesh.name = mesh_name
+					instanced_mesh.name = mesh_name if mesh_name != "" else (mesh_key if mesh_key != "" else "Mesh")
 					physics_body.add_child(instanced_mesh)
 					physics_body.owner = active_scene_root
 					instanced_mesh.owner = active_scene_root
@@ -227,7 +238,10 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					instanced_mesh.transform = mesh_place
 				imported_count += 1
 				if gameplay_helper:
-					gameplay_helper.apply_actor_metadata(physics_body if physics_body else instanced_mesh, actor_data, import_options)
+					var target_node: Node = physics_body if physics_body else instanced_mesh
+					gameplay_helper.apply_actor_metadata(target_node, actor_data, import_options)
+					if gameplay_helper.has_method("apply_component_metadata"):
+						gameplay_helper.apply_component_metadata(instanced_mesh if physics_body else target_node, comp_data, import_options)
 			else:
 				if physics_body:
 					physics_body.queue_free()
@@ -243,16 +257,19 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 			# unsafe scale here and it reappears in each component's local transform,
 			# which is where setup_physics_body can bake it into the shapes.
 			var actor_frame := Common.physics_body_transform(actor_transform)
-			actor_node.global_transform = actor_frame
+			actor_node.transform = actor_frame
 
-			var any_component_succeeded := false
 			# Components hang off actor_node, so their world placement has to be
 			# expressed relative to the actor rather than to the world.
-			var actor_inverse := actor_frame.affine_inverse()
+			var actor_inverse := Transform3D.IDENTITY
+			if absf(actor_frame.basis.determinant()) > 1e-12:
+				actor_inverse = actor_frame.affine_inverse()
 			for comp_data in components:
-				var comp_name: String = comp_data.get("name", "Component")
-				var mesh_name: String = comp_data.get("mesh_name", "")
-				var mesh_key: String = comp_data.get("mesh_key", mesh_name)
+				if not (comp_data is Dictionary):
+					continue
+				var comp_name: String = Common.get_str(comp_data, "name", "Component")
+				var mesh_name: String = Common.get_str(comp_data, "mesh_name", "")
+				var mesh_key: String = Common.get_str(comp_data, "mesh_key", mesh_name)
 
 				var comp_transform := actor_inverse * component_world_transform(comp_data, actor_transform)
 				# Re-seat the glTF mesh (and its collision) from the glTF axis order
@@ -268,13 +285,13 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 				var physics_body = setup_physics_body(actor_node, comp_name, mesh_place, mesh_key, meshes_lib)
 				var instanced_mesh = instance_gltf(gltf_path)
 				if instanced_mesh:
-					any_component_succeeded = true
 					# Apply materials to mesh instance
-					var overrides = comp_data.get("material_overrides", [])
+					var overrides_raw = comp_data.get("material_overrides", [])
+					var overrides: Array = overrides_raw if overrides_raw is Array else []
 					apply_materials_to_instance(instanced_mesh, mesh_key, overrides, meshes_lib)
 					
 					if physics_body:
-						instanced_mesh.name = mesh_name
+						instanced_mesh.name = mesh_name if mesh_name != "" else (mesh_key if mesh_key != "" else "Mesh")
 						physics_body.add_child(instanced_mesh)
 						physics_body.owner = active_scene_root
 						instanced_mesh.owner = active_scene_root
@@ -287,6 +304,8 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 						instanced_mesh.owner = active_scene_root
 						_set_owner_recursive(instanced_mesh, active_scene_root)
 						instanced_mesh.transform = mesh_place
+					if gameplay_helper and gameplay_helper.has_method("apply_component_metadata"):
+						gameplay_helper.apply_component_metadata(physics_body if physics_body else instanced_mesh, comp_data, import_options)
 				else:
 					if physics_body:
 						physics_body.queue_free()
@@ -386,7 +405,12 @@ func _check_format_version(data: Dictionary) -> bool:
 			+ "layout file at all). Update the Unreal plugin and export again.")
 		return false
 
-	var found := int(data["format_version"])
+	var raw_ver = data["format_version"]
+	if not (raw_ver is int or raw_ver is float):
+		printerr("Import Error: layout has invalid 'format_version': ", raw_ver)
+		_fail_report("level_layout.json has a non-numeric 'format_version' (%s)." % str(raw_ver))
+		return false
+	var found := int(raw_ver)
 	if found == SUPPORTED_FORMAT_VERSION:
 		return true
 
@@ -412,15 +436,20 @@ func component_world_transform(comp_data: Dictionary, actor_transform: Transform
 	transform, so use that and never accumulate.
 	"""
 	if USE_GDSCRIPT_TRANSFORM_CONVERSION:
-		if comp_data.has("unreal_world_transform"):
-			var u_trans = comp_data["unreal_world_transform"]
+		var u_trans = comp_data.get("unreal_world_transform")
+		if u_trans is Dictionary:
+			var u_loc = u_trans.get("translation")
+			var u_rot = u_trans.get("rotation_quat")
+			var u_scale = u_trans.get("scale")
 			return convert_unreal_to_godot_transform(
-				u_trans["translation"],
-				u_trans["rotation_quat"],
-				u_trans["scale"]
+				u_loc if u_loc is Array else [0.0, 0.0, 0.0],
+				u_rot if u_rot is Array else [0.0, 0.0, 0.0, 1.0],
+				u_scale if u_scale is Array else [1.0, 1.0, 1.0]
 			)
-	elif comp_data.has("godot_world_transform"):
-		return get_transform_from_dict(comp_data["godot_world_transform"])
+	else:
+		var g_trans = comp_data.get("godot_world_transform")
+		if g_trans is Dictionary:
+			return get_transform_from_dict(g_trans)
 	# Layout predates the world transform: fall back to the actor's own placement,
 	# which is correct for the single-root-component actors those layouts contain.
 	return actor_transform
@@ -495,32 +524,7 @@ func _set_owner_recursive(node: Node, owner: Node) -> void:
 
 func get_transform_from_dict(t_dict: Dictionary) -> Transform3D:
 	"""Constructs a Transform3D from a JSON transform dictionary."""
-	var trans_arr: Array = t_dict.get("translation", [0.0, 0.0, 0.0])
-	var quat_arr: Array = t_dict.get("rotation_quat", [0.0, 0.0, 0.0, 1.0])
-	var scale_arr: Array = t_dict.get("scale", [1.0, 1.0, 1.0])
-	
-	# Verify size of arrays to prevent index out of bounds
-	var tx = trans_arr[0] if trans_arr.size() > 0 else 0.0
-	var ty = trans_arr[1] if trans_arr.size() > 1 else 0.0
-	var tz = trans_arr[2] if trans_arr.size() > 2 else 0.0
-	
-	var qx = quat_arr[0] if quat_arr.size() > 0 else 0.0
-	var qy = quat_arr[1] if quat_arr.size() > 1 else 0.0
-	var qz = quat_arr[2] if quat_arr.size() > 2 else 0.0
-	var qw = quat_arr[3] if quat_arr.size() > 3 else 1.0
-	
-	var sx = scale_arr[0] if scale_arr.size() > 0 else 1.0
-	var sy = scale_arr[1] if scale_arr.size() > 1 else 1.0
-	var sz = scale_arr[2] if scale_arr.size() > 2 else 1.0
-	
-	var translation := Vector3(tx, ty, tz)
-	var quat := Quaternion(qx, qy, qz, qw)
-	var scale := Vector3(sx, sy, sz)
-	
-	# scaled_local() (R * S), not scaled() (S * R): the schema scale is local to
-	# the node. See Common.get_transform_from_dict for the full reasoning.
-	var basis := Basis(quat).scaled_local(scale)
-	return Transform3D(basis, translation)
+	return Common.get_transform_from_dict(t_dict)
 
 func convert_unreal_to_godot_transform(u_loc: Array, u_rot_quat: Array, u_scale: Array) -> Transform3D:
 	"""
@@ -546,6 +550,17 @@ func convert_unreal_to_godot_transform(u_loc: Array, u_rot_quat: Array, u_scale:
 	var qy: float = u_rot_quat[1] if u_rot_quat.size() > 1 else 0.0
 	var qz: float = u_rot_quat[2] if u_rot_quat.size() > 2 else 0.0
 	var qw: float = u_rot_quat[3] if u_rot_quat.size() > 3 else 1.0
+	var qlen: float = sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+	if qlen > 1e-12:
+		qx /= qlen
+		qy /= qlen
+		qz /= qlen
+		qw /= qlen
+	else:
+		qx = 0.0
+		qy = 0.0
+		qz = 0.0
+		qw = 1.0
 	
 	# Unreal Quat -> 3x3 Matrix
 	var r00 = 1.0 - 2.0 * (qy*qy + qz*qz)
@@ -584,9 +599,11 @@ func setup_physics_body(parent: Node, node_name: String, transform: Transform3D,
 	instance it parents under the returned body, via Common.physics_body_scale.
 	"""
 	var mesh_data = meshes_lib.get(mesh_name, {})
+	if not (mesh_data is Dictionary):
+		return null
 	var collision = mesh_data.get("collision", null)
 
-	if collision == null:
+	if collision == null or not (collision is Dictionary):
 		# No collision data defined for this mesh
 		return null
 
@@ -604,10 +621,15 @@ func setup_physics_body(parent: Node, node_name: String, transform: Transform3D,
 		_scale_baked[mesh_name] = true
 
 	# 1. Generate Box Colliders
-	if collision.has("boxes"):
-		for box_data in collision["boxes"]:
-			var size_arr: Array = box_data["size"]
-			var local_trans: Dictionary = box_data["godot_local_transform"]
+	var boxes = collision.get("boxes")
+	if boxes is Array:
+		for box_data in boxes:
+			if not (box_data is Dictionary):
+				continue
+			var size_arr = box_data.get("size", [0.0, 0.0, 0.0])
+			if not (size_arr is Array) or size_arr.size() < 3:
+				continue
+			var local_trans = box_data.get("godot_local_transform", {})
 
 			var shape_node := CollisionShape3D.new()
 			shape_node.name = "BoxCollision"
@@ -618,16 +640,21 @@ func setup_physics_body(parent: Node, node_name: String, transform: Transform3D,
 			var box_shape := BoxShape3D.new()
 			# Full extents cm -> m, remapped into the glTF axis order (X, Z, Y) so
 			# the box lines up with the mesh it hugs (matches gltf_local_shape_transform).
-			box_shape.size = (Vector3(size_arr[0], size_arr[2], size_arr[1]) * 0.01) \
+			box_shape.size = (Vector3(absf(float(size_arr[0])), absf(float(size_arr[2])), absf(float(size_arr[1]))) * 0.01) \
 				* Common.scaled_axis_factors(local.basis, scale)
 			shape_node.shape = box_shape
 			shape_node.transform = Common.scaled_shape_transform(local, scale)
 
 	# 2. Generate Sphere Colliders
-	if collision.has("spheres"):
-		for sphere_data in collision["spheres"]:
-			var radius: float = sphere_data["radius"]
-			var local_trans: Dictionary = sphere_data["godot_local_transform"]
+	var spheres = collision.get("spheres")
+	if spheres is Array:
+		for sphere_data in spheres:
+			if not (sphere_data is Dictionary):
+				continue
+			var radius: float = absf(Common.get_num(sphere_data, "radius", 0.0))
+			if radius <= 0.0:
+				continue
+			var local_trans = sphere_data.get("godot_local_transform", {})
 
 			var shape_node := CollisionShape3D.new()
 			shape_node.name = "SphereCollision"
@@ -645,11 +672,16 @@ func setup_physics_body(parent: Node, node_name: String, transform: Transform3D,
 				get_transform_from_dict(local_trans), scale)
 
 	# 3. Generate Capsule (Sphyl) Colliders
-	if collision.has("capsules"):
-		for cap_data in collision["capsules"]:
-			var radius: float = cap_data["radius"]
-			var length: float = cap_data["length"]
-			var local_trans: Dictionary = cap_data["godot_local_transform"]
+	var capsules = collision.get("capsules")
+	if capsules is Array:
+		for cap_data in capsules:
+			if not (cap_data is Dictionary):
+				continue
+			var radius: float = absf(Common.get_num(cap_data, "radius", 0.0))
+			var length: float = absf(Common.get_num(cap_data, "length", 0.0))
+			if radius <= 0.0:
+				continue
+			var local_trans = cap_data.get("godot_local_transform", {})
 
 			var shape_node := CollisionShape3D.new()
 			shape_node.name = "CapsuleCollision"
@@ -673,13 +705,16 @@ func setup_physics_body(parent: Node, node_name: String, transform: Transform3D,
 			shape_node.transform = Common.scaled_shape_transform(local, scale)
 
 	# 4. Generate Convex Hulls
-	if collision.has("convex_hulls"):
-		for convex_data in collision["convex_hulls"]:
-			var verts_arr: Array = convex_data.get("vertices", [])
-			var local_trans: Dictionary = convex_data["godot_local_transform"]
-
-			if verts_arr.size() == 0:
+	var convex_hulls = collision.get("convex_hulls")
+	if convex_hulls is Array:
+		for convex_data in convex_hulls:
+			if not (convex_data is Dictionary):
 				continue
+			var verts_raw = convex_data.get("vertices", [])
+			if not (verts_raw is Array) or (verts_raw as Array).is_empty():
+				continue
+			var verts_arr: Array = verts_raw
+			var local_trans = convex_data.get("godot_local_transform", {})
 
 			var shape_node := CollisionShape3D.new()
 			shape_node.name = "ConvexCollision"
@@ -690,13 +725,20 @@ func setup_physics_body(parent: Node, node_name: String, transform: Transform3D,
 			# A hull is a raw point cloud, so it takes the body scale EXACTLY --
 			# shear, mirror and all -- expressed in the shape's own frame:
 			# B^-1 * S * B, which is identity whenever there is nothing to bake.
-			var point_map := local.basis.inverse() * Basis.from_scale(scale) * local.basis
+			var point_map := Basis.from_scale(scale)
+			if absf(local.basis.determinant()) > 1e-12:
+				point_map = local.basis.inverse() * Basis.from_scale(scale) * local.basis
 
 			var convex_shape := ConvexPolygonShape3D.new()
 			var points = PackedVector3Array()
 			for v in verts_arr:
+				if not (v is Array) or v.size() < 3:
+					continue
 				# glTF axis order (X, Z, Y), cm -> m, matching the mesh geometry.
-				points.append(point_map * (Vector3(v[0], v[2], v[1]) * 0.01))
+				points.append(point_map * (Vector3(float(v[0]), float(v[2]), float(v[1])) * 0.01))
+			if points.is_empty():
+				shape_node.queue_free()
+				continue
 			convex_shape.points = points
 
 			shape_node.shape = convex_shape
@@ -717,8 +759,10 @@ func apply_materials_to_instance(instanced_mesh: Node3D, mesh_name: String, over
 	Override materials (per-instance) always create fresh materials to support unique colors.
 	Default materials (shared base) use the material cache for efficiency.
 	"""
-	var mesh_data: Dictionary = meshes_lib.get(mesh_name, {})
-	var default_mats: Array = mesh_data.get("materials", [])
+	var mesh_data_raw = meshes_lib.get(mesh_name)
+	var mesh_data: Dictionary = mesh_data_raw if mesh_data_raw is Dictionary else {}
+	var default_mats_raw = mesh_data.get("materials")
+	var default_mats: Array = default_mats_raw if default_mats_raw is Array else []
 	
 	# 1. Find all MeshInstance3D nodes recursively inside the sub-tree
 	var mesh_instances: Array[MeshInstance3D] = []
@@ -728,11 +772,15 @@ func apply_materials_to_instance(instanced_mesh: Node3D, mesh_name: String, over
 	var find_in_list = func(mat_list: Array, mat_name: String, slot_idx: int) -> Dictionary:
 		# By name first
 		for mat in mat_list:
-			var o_name: String = mat.get("material_name", "")
-			if o_name != "" and o_name.to_lower() == mat_name.to_lower():
+			if not (mat is Dictionary):
+				continue
+			var o_name: String = Common.get_str(mat, "material_name", "")
+			if o_name != "" and o_name != "None" and mat_name != "" and o_name.to_lower() == mat_name.to_lower():
 				return mat
 		# By slot index
 		for mat in mat_list:
+			if not (mat is Dictionary):
+				continue
 			if int(mat.get("slot_index", -1)) == slot_idx:
 				return mat
 		return {}
@@ -751,23 +799,37 @@ func apply_materials_to_instance(instanced_mesh: Node3D, mesh_name: String, over
 			if existing_mat:
 				mat_name = existing_mat.resource_name
 			
-			# Check override_mats first (per-instance unique, SKIP cache)
-			var override_data = find_in_list.call(override_mats, mat_name, slot_idx)
+			# Resolve the default material first so we know the true Unreal slot_index
+			# even when the glTF dropped unused material slots and shifted indices.
+			var default_data = find_in_list.call(default_mats, mat_name, slot_idx)
+			var unreal_slot_idx: int = int(default_data.get("slot_index", slot_idx)) if default_data.size() > 0 else slot_idx
+
+			# Check override_mats by slot index (not by the default material's name,
+			# which fails when slots are swapped or overrides carry a different name).
+			var override_data: Dictionary = {}
+			for mat_entry in override_mats:
+				if mat_entry is Dictionary and int(mat_entry.get("slot_index", -1)) == unreal_slot_idx:
+					override_data = mat_entry
+					break
 			if override_data.size() > 0:
 				var params = override_data.get("parameters", {})
-				if params:
-					var godot_mat = create_godot_material(params, existing_mat)
-					godot_mat.resource_name = mat_name
+				if params is Dictionary and not params.is_empty():
+					var override_name: String = Common.get_str(override_data, "material_name", mat_name)
+					# Only duplicate existing_mat if the override is the same material;
+					# otherwise duplicating leaks the default slot's textures onto the override.
+					var base_mat: Material = existing_mat if (override_name != "" and override_name.to_lower() == mat_name.to_lower()) else null
+					var godot_mat = create_godot_material(params, base_mat)
+					godot_mat.resource_name = override_name if override_name != "" else mat_name
 					mesh_inst.set_surface_override_material(slot_idx, godot_mat)
 				continue
 			
 			# Check default_mats (shared base, USE cache)
-			var default_data = find_in_list.call(default_mats, mat_name, slot_idx)
 			if default_data.size() > 0:
-				var mat_path = default_data.get("material_path", "")
+				var mat_path: String = Common.get_str(default_data, "material_path", "")
+				var resolved_name: String = mat_name if mat_name != "" else Common.get_str(default_data, "material_name", "")
 				var params = default_data.get("parameters", {})
-				if params:
-					var godot_mat = get_or_create_material(mat_name, mat_path, params, existing_mat)
+				if params is Dictionary and not params.is_empty():
+					var godot_mat = get_or_create_material(resolved_name, mat_path, params, existing_mat)
 					mesh_inst.set_surface_override_material(slot_idx, godot_mat)
 
 func _find_mesh_instances_recursive(node: Node, list: Array[MeshInstance3D]) -> void:
@@ -782,17 +844,19 @@ func get_or_create_material(mat_name: String, mat_path: String, params: Dictiona
 	Material instantiation cache manager. Reuses existing StandardMaterial3D/ORMMaterial3D instances
 	by path or name to preserve shared materials across mesh instances.
 	"""
-	if mat_path != "None" and material_cache.has(mat_path):
+	var has_path := mat_path != "" and mat_path != "None"
+	var has_name := mat_name != "" and mat_name != "None"
+	if has_path and material_cache.has(mat_path):
 		return material_cache[mat_path]
-	if mat_name != "None" and material_cache.has(mat_name):
+	if has_name and material_cache.has(mat_name):
 		return material_cache[mat_name]
 		
 	var mat = create_godot_material(params, existing_mat)
 	mat.resource_name = mat_name
 	
-	if mat_path != "None":
+	if has_path:
 		material_cache[mat_path] = mat
-	elif mat_name != "None":
+	elif has_name:
 		material_cache[mat_name] = mat
 		
 	return mat
@@ -810,8 +874,7 @@ func create_godot_material(params: Dictionary, existing_mat: Material = null) ->
 		mat = StandardMaterial3D.new()
 	
 	# 1. Map Albedo color
-	var color_arr: Array = params.get("albedo_color", [1.0, 1.0, 1.0, 1.0])
-	mat.albedo_color = Color(color_arr[0], color_arr[1], color_arr[2], color_arr[3])
+	mat.albedo_color = Common.color_from_array(params.get("albedo_color"), Color.WHITE)
 	
 	# 2. Map PBR multipliers
 	# Unreal's scalar parameters are inputs to a shader graph and are not bound
@@ -825,8 +888,15 @@ func create_godot_material(params: Dictionary, existing_mat: Material = null) ->
 	mat.metallic = _clamp_unit(params.get("metallic", 0.0), 0.0, "metallic")
 	
 	# 3. Map Tiling scale
-	var tiling_arr: Array = params.get("tiling", [1.0, 1.0])
-	mat.uv1_scale = Vector3(tiling_arr[0], tiling_arr[1], 1.0)
+	var tiling_raw = params.get("tiling")
+	var tile_u: float = 1.0
+	var tile_v: float = 1.0
+	if tiling_raw is Array:
+		if tiling_raw.size() > 0 and (tiling_raw[0] is float or tiling_raw[0] is int):
+			tile_u = float(tiling_raw[0])
+		if tiling_raw.size() > 1 and (tiling_raw[1] is float or tiling_raw[1] is int):
+			tile_v = float(tiling_raw[1])
+	mat.uv1_scale = Vector3(tile_u, tile_v, 1.0)
 	
 	# 4. Find and load textures (Only override if a valid file path is resolved on disk)
 	var albedo_tex: String = _safe_str(params.get("albedo_texture"))
@@ -950,13 +1020,7 @@ func _apply_packed_texture(mat: BaseMaterial3D, params: Dictionary) -> void:
 
 func load_texture(tex_path: String) -> Texture2D:
 	"""Loads a texture from res:// or from the external filesystem."""
-	if tex_path.begins_with("res://"):
-		return load(tex_path) as Texture2D
-		
-	var img := Image.load_from_file(tex_path)
-	if img:
-		return ImageTexture.create_from_image(img)
-	return null
+	return Common.load_texture_file(tex_path)
 
 func _safe_str(value) -> String:
 	"""Converts a Variant (possibly null from JSON) to a String, returning '' for null."""

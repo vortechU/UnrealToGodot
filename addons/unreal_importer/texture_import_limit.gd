@@ -75,30 +75,39 @@ static func _rewrite_import_file(import_path: String, size_limit: int) -> bool:
 	if text == "":
 		return false
 
+	var target_line := "process/size_limit=%d" % size_limit
 	var lines := text.split("\n")
 	var out: PackedStringArray = []
 	var in_params := false
 	var written := false
+	var changed := false
 	for line in lines:
 		var stripped := line.strip_edges()
 		if stripped.begins_with("["):
-			# Leaving [params] without having seen the key? Add it before moving on.
+			# Leaving [params] without having seen the key? Add it only when a
+			# non-zero limit is requested (Godot defaults absent size_limit to 0).
 			if in_params and not written:
-				out.append("process/size_limit=%d" % size_limit)
+				if size_limit > 0:
+					out.append(target_line)
+					changed = true
 				written = true
 			in_params = stripped == "[params]"
 			out.append(line)
 			continue
-		if in_params and stripped.begins_with("process/size_limit"):
-			out.append("process/size_limit=%d" % size_limit)
+		if in_params and stripped.begins_with("process/size_limit="):
+			if stripped != target_line:
+				changed = true
+			out.append(target_line)
 			written = true
 			continue
 		out.append(line)
 
 	if in_params and not written:
-		out.append("process/size_limit=%d" % size_limit)
+		if size_limit > 0:
+			out.append(target_line)
+			changed = true
 		written = true
-	if not written:
+	if not written or not changed:
 		return false
 
 	var f := FileAccess.open(import_path, FileAccess.WRITE)
@@ -171,10 +180,16 @@ static func shrink_source_files(folder: String, size_limit: int) -> Dictionary:
 
 	# The bytes behind every rewritten path just changed; without a reimport the
 	# editor keeps serving whatever the stale .godot cache holds.
-	if not changed.is_empty() and Engine.is_editor_hint():
+	# EditorFileSystem.reimport_files only accepts res:// paths (external export
+	# folders outside res:// are loaded directly off disk and need no reimport).
+	var res_changed := PackedStringArray()
+	for p in changed:
+		if p.begins_with("res://"):
+			res_changed.append(p)
+	if not res_changed.is_empty() and Engine.is_editor_hint():
 		var fs := EditorInterface.get_resource_filesystem()
 		if fs:
-			fs.reimport_files(changed)
+			fs.reimport_files(res_changed)
 	return result
 
 
@@ -202,9 +217,13 @@ static func apply_to_folder(folder: String, size_limit: int) -> Dictionary:
 			to_reimport.append(tex_path)
 	result["changed"] = to_reimport.size()
 
-	if not to_reimport.is_empty() and Engine.is_editor_hint():
+	var res_reimport := PackedStringArray()
+	for p in to_reimport:
+		if p.begins_with("res://"):
+			res_reimport.append(p)
+	if not res_reimport.is_empty() and Engine.is_editor_hint():
 		var fs := EditorInterface.get_resource_filesystem()
 		if fs:
-			fs.reimport_files(to_reimport)
-			result["reimported"] = to_reimport.size()
+			fs.reimport_files(res_reimport)
+			result["reimported"] = res_reimport.size()
 	return result

@@ -412,6 +412,21 @@ class _NoWeightmapAPI(Landscape):
 check(EX._gpu_weightmap_to_file("WORLD", _NoWeightmapAPI(), "1", tmp, "w.exr", 64, 64) is None,
       "a landscape with no weightmap API returns None instead of raising")
 
+
+class _StubColComp(LandscapeHeightfieldCollisionComponent):
+    def get_world_location(self):
+        return _Vec(0.0, 0.0, 0.0)
+
+
+class _StubColActor(Landscape):
+    def get_components_by_class(self, cls):
+        return [_StubColComp()] if cls is LandscapeHeightfieldCollisionComponent else []
+
+
+check(EX._trace_heightmap_cpu([_StubColActor()], _Vec(0, 0, 0), _Vec(1000, 1000, 100),
+                              tmp, "disabled.exr", 513, 513, {"terrain_height_resolution": 0}) is None,
+      "terrain_height_resolution=0 disables CPU height tracing instead of writing a 2x2 quad")
+
 # ===========================================================================
 print("9. the landscape material's textures are harvested")
 # ===========================================================================
@@ -478,6 +493,66 @@ try:
           "normal classified as normal (got %r)" % roles["T_ash_01_normal"])
     albedos = [t["texture"] for t in mat_entry["textures"] if t["role"] == "albedo"]
     check(len(albedos) == 3, "3 albedo candidates for the 3 paint layers -> %s" % albedos)
+
+    # A MaterialInstance landscape material must harvest its overridden
+    # texture_parameter_values as well as parent base-material textures.
+    u.MaterialInstance = type("MaterialInstance", (), {})
+    u.Texture = type("Texture", (), {})
+
+    class _RealTex(u.Texture):
+        def __init__(self, name, path):
+            self._name = name
+            self._path = path
+
+        def get_name(self):
+            return self._name
+
+        def get_path_name(self):
+            return self._path
+
+    class _LandscapeMI(u.MaterialInstance):
+        def __init__(self, tex_params, parent):
+            self._tp = tex_params
+            self._parent = parent
+
+        def get_editor_property(self, name):
+            if name == "texture_parameter_values":
+                return self._tp
+            if name == "parent":
+                return self._parent
+            raise Exception("no %s" % name)
+
+        def get_name(self):
+            return "MI_Desert"
+
+        def get_path_name(self):
+            return "/Game/MI_Desert.MI_Desert"
+
+    class _MILandscaped(Landscape):
+        def __init__(self, mat):
+            self._mat = mat
+
+        def get_editor_property(self, name):
+            if name == "landscape_material":
+                return self._mat
+            raise Exception("no %s" % name)
+
+    mi_tex = _RealTex("T_desert_albedo", "/Game/T_desert_albedo.T_desert_albedo")
+    tp_obj = types.SimpleNamespace(
+        parameter_info=types.SimpleNamespace(name="Layer0_Albedo"),
+        parameter_value=mi_tex,
+    )
+    mi_mat = _LandscapeMI([tp_obj], _Material())
+    ue2g_common.iter_base_material_textures = lambda mat, include_dependencies=True: iter([
+        ("Layer1_Normal", _RealTex("T_rock_normal", "/Game/T_rock_normal.T_rock_normal")),
+    ])
+    mi_collected = set()
+    mi_entry = EX._collect_material_textures(_MILandscaped(mi_mat), mi_collected)
+    mi_names = [t["texture"] for t in mi_entry.get("textures", [])]
+    check(mi_names == ["T_desert_albedo", "T_rock_normal"],
+          "MaterialInstance landscape material harvests instance overrides + parent textures -> %s" % mi_names)
+    check(mi_entry["textures"][0].get("path") == "/Game/T_desert_albedo.T_desert_albedo",
+          "landscape material texture entry records asset path for collision disambiguation")
 
     # A landscape with no material must not crash or invent an entry.
     check(EX._collect_material_textures(_NoLayers(), set()) == {},

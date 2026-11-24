@@ -152,6 +152,48 @@ offset = app.status_lbl.winfo_rooty() - root.winfo_rooty()
 check("status bar survives a 400px-tall window", 0 <= offset <= root.winfo_height(),
       "y=%d of %d" % (offset, root.winfo_height()))
 
+print("\n=== 5. Slate tick state polling is throttled ===")
+while not G._state_queue.empty():
+    G._state_queue.get_nowait()
+u.EditorUtilityLibrary = type("EditorUtilityLibrary", (), {"get_selected_assets": staticmethod(lambda: [])})
+u.EditorLevelLibrary = type("EditorLevelLibrary", (), {"get_editor_world": staticmethod(lambda: types.SimpleNamespace(get_name=lambda: "MapA"))})
+G._state_poll_accum = 0.0
+for _ in range(10):
+    G.check_editor_queues(0.016)  # 160ms total < 200ms threshold
+check("sub-interval ticks do not flood _state_queue", G._state_queue.qsize() == 0,
+      G._state_queue.qsize())
+G.check_editor_queues(0.05)  # crosses 200ms threshold
+check("crossing the poll interval emits exactly one state packet", G._state_queue.qsize() == 1,
+      G._state_queue.qsize())
+
+print("\n=== 6. poll_state updates auto layout filename without clobbering custom names ===")
+while not G._state_queue.empty():
+    G._state_queue.get_nowait()
+app.layout_path_entry.delete(0, "end")
+app.layout_path_entry.insert(0, os.path.join("C:/fake/Project/Saved/Exports", "level_layout.json"))
+app._last_auto_level_name = None
+G._state_queue.put({"level_name": "MapA"})
+app.poll_state()
+check("default level_layout.json auto-updates to active level",
+      os.path.basename(app.layout_path_entry.get()) == "MapA_layout.json",
+      app.layout_path_entry.get())
+
+G._state_queue.put({"level_name": "MapB"})
+app.poll_state()
+check("switching levels updates the previous auto-generated filename",
+      os.path.basename(app.layout_path_entry.get()) == "MapB_layout.json",
+      app.layout_path_entry.get())
+
+# User manually picks a custom *_layout.json name: poll_state must leave it alone.
+custom_path = os.path.join("C:/fake/Project/Saved/Exports", "my_custom_layout.json")
+app.layout_path_entry.delete(0, "end")
+app.layout_path_entry.insert(0, custom_path)
+G._state_queue.put({"level_name": "MapB"})
+app.poll_state()
+check("user-chosen *_layout.json filename is not clobbered by poll_state",
+      app.layout_path_entry.get() == custom_path,
+      app.layout_path_entry.get())
+
 app.is_closed = True
 root.destroy()
 

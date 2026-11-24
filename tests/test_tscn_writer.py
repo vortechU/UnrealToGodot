@@ -66,10 +66,23 @@ layout = {
             # to get double-composed into t(2, 4, 6).
             "name": "Rock_1", "class": "StaticMeshActor",
             "godot_transform": t(1, 2, 3, 45.0),
-            "tags": ["cover"], "properties": {"health": 50, "is_interactable": True},
+            "tags": ["cover"], "properties": {"health": 50, "is_interactable": True,
+                                              "Hit Points": 100, "1st-Slot": "yes"},
             "components": [{"name": "SM0", "mesh_key": "SM_Rock", "mesh_name": "SM_Rock",
                             "godot_relative_transform": t(1, 2, 3, 45.0),
                             "godot_world_transform": t(1, 2, 3, 45.0),
+                            "material_overrides": []}],
+        },
+        {
+            # Single-component visual-only actor carrying BOTH actor and component
+            # tags: must emit one merged metadata/unreal_tags line, not duplicates.
+            "name": "TaggedCrate", "class": "StaticMeshActor",
+            "godot_transform": t(0, 0, 0),
+            "tags": ["actor_tag"], "properties": {},
+            "components": [{"name": "SM0", "mesh_key": "SM_Crate", "mesh_name": "SM_Crate",
+                            "godot_relative_transform": t(0, 0, 0),
+                            "godot_world_transform": t(0, 0, 0),
+                            "tags": ["comp_tag", "actor_tag"],
                             "material_overrides": []}],
         },
         {
@@ -422,6 +435,13 @@ assert abs(cap_h - (1.0 + 2.0 * cap_r)) < 1e-9, \
 
 # And a uniformly scaled prop must be left exactly as it was: Rock_1's body still
 # carries its own transform and its shapes are untouched.
+rock_blk_meta = node_block("Rock_1")
+assert "metadata/Hit_Points = 100" in rock_blk_meta and "metadata/_1st_Slot = \"yes\"" in rock_blk_meta, \
+    "metadata keys with spaces/leading digits must be sanitized to valid identifiers:\n" + rock_blk_meta
+tagged_blk = node_block("TaggedCrate")
+assert tagged_blk.count("metadata/unreal_tags =") == 1, \
+    "actor + component tags must merge into one metadata/unreal_tags line:\n" + tagged_blk
+assert '["actor_tag", "comp_tag"]' in tagged_blk, "merged tags missing:\n" + tagged_blk
 rock_box_node = node("BoxCollision", parent=MESHES + "/Rock_1")
 rock_sid = re.search(r'shape = SubResource\("([^"]+)"\)', rock_box_node["body"]).group(1)
 rock_blk = re.search(r'\[sub_resource type="[^"]+" id="%s"\](.*?)(?=\n\[|\Z)' % re.escape(rock_sid),

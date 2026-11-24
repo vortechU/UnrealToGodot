@@ -85,6 +85,8 @@ def _diagnostic_status(rep):
 # Global handles
 _tick_handle = None
 _gui_thread = None
+_state_poll_accum = 0.0
+_STATE_POLL_INTERVAL_S = 0.2
 
 class UnrealToGodotApp:
     def __init__(self, project_dir):
@@ -116,6 +118,7 @@ class UnrealToGodotApp:
         # Bind close event
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.is_closed = False
+        self._last_auto_level_name = None
         
         # Start the GUI polling loop for editor state updates
         self.poll_state()
@@ -793,12 +796,17 @@ class UnrealToGodotApp:
                 self.level_lbl.config(text=f"Active Level: {latest_level_name}")
                 
                 current_path = self.layout_path_entry.get()
-                if current_path and latest_level_name != "UntitledLevel" and "_layout.json" in current_path:
-                    parent_dir = os.path.dirname(current_path)
+                if current_path and latest_level_name != "UntitledLevel":
+                    current_base = os.path.basename(current_path)
+                    auto_names = {"level_layout.json"}
+                    if self._last_auto_level_name:
+                        auto_names.add(f"{self._last_auto_level_name}_layout.json")
                     expected_filename = f"{latest_level_name}_layout.json"
-                    if os.path.basename(current_path) != expected_filename:
+                    if current_base in auto_names and current_base != expected_filename:
+                        parent_dir = os.path.dirname(current_path)
                         self.layout_path_entry.delete(0, tk.END)
                         self.layout_path_entry.insert(0, os.path.join(parent_dir, expected_filename))
+                    self._last_auto_level_name = latest_level_name
                         
         except Exception:
             pass
@@ -1071,38 +1079,43 @@ def check_editor_queues(delta_time):
     Ticking handler running on the Unreal game thread.
     Pushes current selection/level states to the GUI, and consumes queued export tasks.
     """
-    global _tick_handle
+    global _tick_handle, _state_poll_accum
     
-    # 1. Collect current editor state (Thread-safe read on main thread)
-    try:
-        selected = []
+    # 1. Collect current editor state at ~5 Hz (matching poll_state's 200ms cadence).
+    # Polling on every Slate frame (60-120 Hz) wastes main-thread cycles and lets
+    # _state_queue grow unbounded while a modal file dialog blocks Tkinter.
+    _state_poll_accum += max(0.0, float(delta_time or 0.0))
+    if _state_poll_accum >= _STATE_POLL_INTERVAL_S:
+        _state_poll_accum = 0.0
         try:
-            selected = unreal.EditorUtilityLibrary.get_selected_assets()
-        except Exception:
-            pass
-        supported_count = 0
-        for a in selected:
-            is_static = isinstance(a, unreal.StaticMesh)
-            is_skeletal = isinstance(a, unreal.SkeletalMesh) if hasattr(unreal, "SkeletalMesh") else False
-            if is_static or is_skeletal:
-                supported_count += 1
-        
-        world_name = "UntitledLevel"
-        try:
-            world = unreal.EditorLevelLibrary.get_editor_world()
-            world_name = world.get_name()
-        except Exception:
-            pass
+            selected = []
+            try:
+                selected = unreal.EditorUtilityLibrary.get_selected_assets()
+            except Exception:
+                pass
+            supported_count = 0
+            for a in selected:
+                is_static = isinstance(a, unreal.StaticMesh)
+                is_skeletal = isinstance(a, unreal.SkeletalMesh) if hasattr(unreal, "SkeletalMesh") else False
+                if is_static or is_skeletal:
+                    supported_count += 1
             
-        # Write state packet
-        state = {
-            "selection_count": supported_count,
-            "level_name": world_name
-        }
-        
-        _state_queue.put(state)
-    except Exception:
-        pass
+            world_name = "UntitledLevel"
+            try:
+                world = unreal.EditorLevelLibrary.get_editor_world()
+                world_name = world.get_name()
+            except Exception:
+                pass
+                
+            # Write state packet
+            state = {
+                "selection_count": supported_count,
+                "level_name": world_name
+            }
+            
+            _state_queue.put(state)
+        except Exception:
+            pass
 
     # 2. Process pending UI commands (Thread-safe write executed on main thread)
     try:
@@ -1249,13 +1262,18 @@ def show_window():
         _state_queue.get()
 
     # 2. Start tick callback on Unreal main thread
+    global _state_poll_accum
+    _state_poll_accum = _STATE_POLL_INTERVAL_S  # send initial state on the first tick
     _tick_handle = unreal.register_slate_post_tick_callback(check_editor_queues)
     
     # 3. Spawn the Tkinter GUI in its own background thread
     project_dir = os.path.realpath(unreal.Paths.project_dir())
     def run_gui():
-        app = UnrealToGodotApp(project_dir)
-        app.root.mainloop()
+        try:
+            app = UnrealToGodotApp(project_dir)
+            app.root.mainloop()
+        finally:
+            _command_queue.put(("close", []))
         
     _gui_thread = threading.Thread(target=run_gui)
     _gui_thread.daemon = True

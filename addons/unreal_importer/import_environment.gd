@@ -472,8 +472,9 @@ func _find_world_environment(root: Node) -> WorldEnvironment:
 	if root is WorldEnvironment:
 		return root
 	for child in root.get_children():
-		if child is WorldEnvironment:
-			return child
+		var found := _find_world_environment(child)
+		if found != null:
+			return found
 	return null
 
 

@@ -34,21 +34,26 @@ static func gltf_mesh_placement(placement: Transform3D) -> Transform3D:
 	return Transform3D(placement.basis * GLTF_MESH_AXIS_FIX, placement.origin)
 
 
-static func get_transform_from_dict(t_dict: Dictionary) -> Transform3D:
+static func get_transform_from_dict(t_dict) -> Transform3D:
 	"""Constructs a Transform3D from a schema transform dictionary (Godot-space)."""
-	var trans_arr: Array = t_dict.get("translation", [0.0, 0.0, 0.0])
-	var quat_arr: Array = t_dict.get("rotation_quat", [0.0, 0.0, 0.0, 1.0])
-	var scale_arr: Array = t_dict.get("scale", [1.0, 1.0, 1.0])
+	if not (t_dict is Dictionary):
+		return Transform3D.IDENTITY
+	var trans_raw = t_dict.get("translation", [0.0, 0.0, 0.0])
+	var quat_raw = t_dict.get("rotation_quat", [0.0, 0.0, 0.0, 1.0])
+	var scale_raw = t_dict.get("scale", [1.0, 1.0, 1.0])
 
-	var translation := vec3_from_array(trans_arr, Vector3.ZERO)
-	var scale := vec3_from_array(scale_arr, Vector3.ONE)
+	var translation := vec3_from_array(trans_raw, Vector3.ZERO)
+	var scale := vec3_from_array(scale_raw, Vector3.ONE)
 
-	var qx: float = quat_arr[0] if quat_arr.size() > 0 else 0.0
-	var qy: float = quat_arr[1] if quat_arr.size() > 1 else 0.0
-	var qz: float = quat_arr[2] if quat_arr.size() > 2 else 0.0
-	var qw: float = quat_arr[3] if quat_arr.size() > 3 else 1.0
+	var quat_arr: Array = quat_raw if quat_raw is Array else [0.0, 0.0, 0.0, 1.0]
+	var qx: float = float(quat_arr[0]) if (quat_arr.size() > 0 and (quat_arr[0] is float or quat_arr[0] is int)) else 0.0
+	var qy: float = float(quat_arr[1]) if (quat_arr.size() > 1 and (quat_arr[1] is float or quat_arr[1] is int)) else 0.0
+	var qz: float = float(quat_arr[2]) if (quat_arr.size() > 2 and (quat_arr[2] is float or quat_arr[2] is int)) else 0.0
+	var qw: float = float(quat_arr[3]) if (quat_arr.size() > 3 and (quat_arr[3] is float or quat_arr[3] is int)) else 1.0
 	var quat := Quaternion(qx, qy, qz, qw)
-	if not quat.is_normalized():
+	if quat.length_squared() < 1e-12:
+		quat = Quaternion.IDENTITY
+	elif not quat.is_normalized():
 		quat = quat.normalized()
 
 	# scaled_local(), NOT scaled(): the schema's scale is a LOCAL scale (it names
@@ -182,19 +187,19 @@ static func uniform_factor(scale: Vector3) -> float:
 static func vec3_from_array(arr, def := Vector3.ZERO) -> Vector3:
 	if arr == null or not (arr is Array):
 		return def
-	var x: float = arr[0] if arr.size() > 0 else def.x
-	var y: float = arr[1] if arr.size() > 1 else def.y
-	var z: float = arr[2] if arr.size() > 2 else def.z
+	var x: float = float(arr[0]) if (arr.size() > 0 and (arr[0] is float or arr[0] is int)) else def.x
+	var y: float = float(arr[1]) if (arr.size() > 1 and (arr[1] is float or arr[1] is int)) else def.y
+	var z: float = float(arr[2]) if (arr.size() > 2 and (arr[2] is float or arr[2] is int)) else def.z
 	return Vector3(x, y, z)
 
 
 static func color_from_array(arr, def := Color.WHITE) -> Color:
 	if arr == null or not (arr is Array):
 		return def
-	var r: float = arr[0] if arr.size() > 0 else def.r
-	var g: float = arr[1] if arr.size() > 1 else def.g
-	var b: float = arr[2] if arr.size() > 2 else def.b
-	var a: float = arr[3] if arr.size() > 3 else 1.0
+	var r: float = float(arr[0]) if (arr.size() > 0 and (arr[0] is float or arr[0] is int)) else def.r
+	var g: float = float(arr[1]) if (arr.size() > 1 and (arr[1] is float or arr[1] is int)) else def.g
+	var b: float = float(arr[2]) if (arr.size() > 2 and (arr[2] is float or arr[2] is int)) else def.b
+	var a: float = float(arr[3]) if (arr.size() > 3 and (arr[3] is float or arr[3] is int)) else def.a
 	return Color(r, g, b, a)
 
 
@@ -372,7 +377,15 @@ static func load_texture_file(tex_path: String) -> Texture2D:
 	if tex_path == "":
 		return null
 	if tex_path.begins_with("res://"):
-		return load(tex_path) as Texture2D
+		var loaded := load(tex_path) as Texture2D
+		if loaded != null:
+			return loaded
+		var global_path := ProjectSettings.globalize_path(tex_path)
+		if global_path != "" and FileAccess.file_exists(global_path):
+			var fallback_img := Image.load_from_file(global_path)
+			if fallback_img:
+				return ImageTexture.create_from_image(fallback_img)
+		return null
 	var img := Image.load_from_file(tex_path)
 	if img:
 		return ImageTexture.create_from_image(img)

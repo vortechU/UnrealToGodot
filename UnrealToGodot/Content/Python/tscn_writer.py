@@ -334,7 +334,7 @@ def _decal_size_with_min_depth(size, transform, min_depth):
     the transform, so size[1] is routinely 0.02 against a scale of several
     hundred. Flooring size[1] alone would do nothing.
     """
-    out = [_num(size[i], 1.0) if len(size) > i else 1.0 for i in range(3)]
+    out = [max(abs(_num(size[i], 1.0)) if len(size) > i else 1.0, 0.01) for i in range(3)]
     try:
         min_depth = float(min_depth)
     except (TypeError, ValueError):
@@ -495,6 +495,23 @@ def _sanitize_node_name(name):
             out.append(ch)
     result = "".join(out).strip().strip("_")
     return result if result else "Node"
+
+
+def _sanitize_meta_key(key):
+    """Godot .tscn metadata keys must be valid unquoted identifiers ([A-Za-z0-9_],
+    not starting with a digit), matching import_gameplay.gd::_sanitize_meta_key."""
+    out = []
+    for ch in str(key or ""):
+        if ("a" <= ch <= "z") or ("A" <= ch <= "Z") or ("0" <= ch <= "9") or ch == "_":
+            out.append(ch)
+        else:
+            out.append("_")
+    result = "".join(out)
+    if not result:
+        return "_"
+    if "0" <= result[0] <= "9":
+        result = "_" + result
+    return result
 
 
 def _color_literal(rgb, alpha=1.0):
@@ -720,21 +737,31 @@ class _TscnWriter(object):
             return _f(value)
         return '"%s"' % _escape_string(value)
 
-    def _actor_metadata_lines(self, actor):
+    def _actor_metadata_lines(self, actor, extra_tags=None):
         lines = []
         cls = actor.get("class")
         if cls:
             lines.append('metadata/unreal_class = "%s"' % _escape_string(cls))
-        tags = actor.get("tags")
-        if isinstance(tags, (list, tuple)) and tags:
+        merged_tags = []
+        for source in (actor.get("tags"), extra_tags):
+            if isinstance(source, (list, tuple)):
+                for t in source:
+                    s = str(t)
+                    if s and s not in merged_tags:
+                        merged_tags.append(s)
+        if merged_tags:
             lines.append("metadata/unreal_tags = [%s]"
-                         % ", ".join('"%s"' % _escape_string(t) for t in tags))
+                         % ", ".join('"%s"' % _escape_string(t) for t in merged_tags))
         props = actor.get("properties")
         if isinstance(props, dict):
+            seen_keys = {"unreal_class", "unreal_tags"}
             for k, v in props.items():
                 if v is None:
                     continue
-                key = _sanitize_node_name(k)
+                key = _sanitize_meta_key(k)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
                 lines.append("metadata/%s = %s" % (key, self._meta_value_literal(v)))
         return lines
 
@@ -842,8 +869,10 @@ class _TscnWriter(object):
             self._build_foliage(self._container(root_path, FOLIAGE_CONTAINER,
                                                 self.layout.get("foliage")))
         if self.options.get("navigation"):
-            self._build_navigation(self._container(root_path, NAVIGATION_CONTAINER,
-                                                   self.layout.get("navigation")))
+            nav = self.layout.get("navigation")
+            nav_vols = nav.get("bounds_volumes") if isinstance(nav, dict) else None
+            if nav_vols:
+                self._build_navigation(self._container(root_path, NAVIGATION_CONTAINER, nav_vols))
         if self.options.get("landscape"):
             self._build_landscapes(root_path)
 
@@ -873,7 +902,7 @@ class _TscnWriter(object):
 
             if len(components) == 1:
                 self._build_single_component_actor(root_path, actor_name, actor_mat,
-                                                   components[0], meshes_lib, actor_meta, emit_meta)
+                                                   components[0], meshes_lib, actor, actor_meta, emit_meta)
             else:
                 self._build_multi_component_actor(root_path, actor_name, actor_mat,
                                                   components, meshes_lib, actor_meta, emit_meta)
@@ -882,7 +911,7 @@ class _TscnWriter(object):
         return comp.get("mesh_key") or comp.get("mesh_name") or ""
 
     def _build_single_component_actor(self, root_path, actor_name, actor_mat, comp,
-                                      meshes_lib, actor_meta, emit_meta):
+                                      meshes_lib, actor, actor_meta, emit_meta):
         mesh_key = self._component_mesh_key(comp)
         world = _component_world_mat(comp, actor_mat)
         res_path = self._mesh_res_path(mesh_key)
@@ -918,11 +947,11 @@ class _TscnWriter(object):
             self._add_node(_mesh_node_name(comp, mesh_key), None, body_path,
                            instance_id=ext_id, props=inst_props, metadata=inst_meta)
         else:
-            # Direct visual-only instance at the component's world transform
+            # Direct visual-only instance at the component's world transform.
+            # Merge actor + component tags into a single metadata/unreal_tags line
+            # so Godot never sees duplicate keys in the same [node] block.
             props = ["transform = " + _mat_to_transform3d(mesh_place)]
-            meta = list(actor_meta)
-            if emit_meta:
-                meta = self._component_metadata_lines(comp) + meta
+            meta = self._actor_metadata_lines(actor, extra_tags=comp.get("tags")) if emit_meta else []
             self._add_node(actor_name, None, root_path, instance_id=ext_id,
                            props=props, metadata=meta)
 
@@ -1054,7 +1083,8 @@ class _TscnWriter(object):
                 props.append("distance_fade_length = " + _f(max(0.01, float(fade_length))))
 
             if light.get("mobility"):
-                metadata.append('metadata/unreal_mobility = "%s"' % light.get("mobility"))
+                metadata.append('metadata/unreal_mobility = "%s"'
+                                % _escape_string(light.get("mobility")))
 
             if light.get("visible") is False:
                 props.append("visible = false")
@@ -1143,9 +1173,9 @@ class _TscnWriter(object):
         if sat is not None or con is not None:
             env_lines.append("adjustment_enabled = true")
             if isinstance(sat, (list, tuple)) and sat:
-                env_lines.append("adjustment_saturation = " + _f(_avg3(sat)))
+                env_lines.append("adjustment_saturation = " + _f(_clamp(_avg3(sat), 0.01, 8.0)))
             if isinstance(con, (list, tuple)) and con:
-                env_lines.append("adjustment_contrast = " + _f(_avg3(con)))
+                env_lines.append("adjustment_contrast = " + _f(_clamp(_avg3(con), 0.01, 8.0)))
 
         # Height fog -> Godot depth fog. The heuristic is `fog_density * 0.5`, so
         # UE's default 0.02 lands on Godot's default 0.01 (SCHEMA_V2.md). This
@@ -1232,15 +1262,15 @@ class _TscnWriter(object):
             flat = entry.get("godot_transforms") or []
             count = len(flat) // 12
             if entry.get("instance_count") is not None:
-                count = int(entry.get("instance_count"))
-                count = min(count, len(flat) // 12)
+                count = max(0, min(int(_num(entry.get("instance_count"), count)), len(flat) // 12))
 
             buffer_vals = []
             for i in range(count):
                 base = i * 12
-                f = flat[base:base + 12]
-                if len(f) < 12:
+                raw_f = flat[base:base + 12]
+                if len(raw_f) < 12:
                     break
+                f = [_num(v) for v in raw_f]
                 # schema stores basis COLUMNS then origin; MultiMesh wants 3x4 ROW-major.
                 # Post-multiply the basis by the glTF axis correction (_MESH_AXIS_FIX)
                 # so foliage meshes match the layout meshes: local X -> -Z, Y -> Y,
