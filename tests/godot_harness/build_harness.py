@@ -333,7 +333,7 @@ layout = {
             # Plain StaticMeshActor. UE reports the root component's relative
             # transform as the WORLD transform -- identical to the actor's.
             # The old importer composed them into (40, 6, -100).
-            "name": "Buoy_1", "class": "StaticMeshActor",
+            "name": "Buoy_1", "actor_id": "ID_BUOY_1", "class": "StaticMeshActor",
             "godot_transform": t(20, 3, -50),
             "components": [{"name": "SM0", "mesh_key": "SM_Rock", "mesh_name": "SM_Rock",
                             "godot_relative_transform": t(20, 3, -50),
@@ -344,7 +344,7 @@ layout = {
         },
         {
             # Same, but no collision -> visual-only branch.
-            "name": "Crate_1", "class": "StaticMeshActor",
+            "name": "Crate_1", "actor_id": "ID_CRATE_1", "class": "StaticMeshActor",
             "godot_transform": t(7, 1, 2),
             "components": [{"name": "SM0", "mesh_key": "SM_Crate", "mesh_name": "SM_Crate",
                             "godot_relative_transform": t(7, 1, 2),
@@ -360,7 +360,8 @@ layout = {
             # here too. Component placements are absolute, so the world positions
             # asserted below must come out identical either way -- that is the
             # point of the check.
-            "name": "BP_Pier", "class": "BP_Pier_C",
+            "name": "BP_Pier", "actor_id": "ID_BP_PIER", "class": "BP_Pier_C",
+            "blueprint_asset": "/Game/Blueprints/BP_Pier.BP_Pier_C",
             "godot_transform": ts(10, 0, 0, 2.0, 1.0, 0.5),
             "components": [
                 {"name": "Deck", "mesh_key": "SM_Crate", "mesh_name": "SM_Crate",
@@ -604,6 +605,37 @@ layout = {
 
 with open(os.path.join(HARNESS, "level_layout.json"), "w", encoding="utf-8") as f:
     json.dump(layout, f, indent=2)
+
+# Second layout for Phase 4 incremental re-import test: Buoy_1 moved, Crate_1 removed,
+# Fresh_Actor added.
+layout_v2 = {
+    "format_version": 2,
+    "level_name": "HarnessLevel",
+    "meshes": layout["meshes"],
+    "actors": [
+        {
+            "name": "Buoy_1", "actor_id": "ID_BUOY_1", "class": "StaticMeshActor",
+            "godot_transform": t(99, 5, -10),
+            "components": [{"name": "SM0", "mesh_key": "SM_Rock", "mesh_name": "SM_Rock",
+                            "godot_relative_transform": t(99, 5, -10),
+                            "godot_world_transform": t(99, 5, -10),
+                            "material_overrides": []}],
+        },
+        {
+            "name": "Fresh_Actor", "actor_id": "ID_FRESH_1", "class": "StaticMeshActor",
+            "godot_transform": t(-12, 0, 4),
+            "components": [{"name": "SM0", "mesh_key": "SM_Crate", "mesh_name": "SM_Crate",
+                            "godot_relative_transform": t(-12, 0, 4),
+                            "godot_world_transform": t(-12, 0, 4),
+                            "material_overrides": []}],
+        },
+    ],
+    "lights": [], "post_process": [], "landscapes": [], "foliage": [],
+    "decals": [], "reflection_probes": [], "cameras": [], "audio": [],
+    "height_fog": None, "sky_light": None, "has_sky_atmosphere": False, "navigation": None,
+}
+with open(os.path.join(HARNESS, "level_layout_v2.json"), "w", encoding="utf-8") as f:
+    json.dump(layout_v2, f, indent=2)
 
 # --- the test script Godot will run ------------------------------------------
 TEST_GD = '''extends SceneTree

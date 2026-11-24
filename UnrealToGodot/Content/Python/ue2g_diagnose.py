@@ -163,10 +163,22 @@ def audit_layout(rep, path, strict=True):
         return "present" if value else "none"
 
     rep.line("  feature sections:")
-    for key in ("lights", "decals", "landscapes", "foliage", "navigation",
+    for key in ("lights", "decals", "reflection_probes", "cameras", "audio",
+                "landscapes", "foliage", "navigation",
                 "post_process", "height_fog", "sky_light"):
         if key in data:
             rep.line("    %-22s %s" % (key, _count(data.get(key))))
+
+    ws = data.get("world_streaming")
+    if isinstance(ws, dict):
+        unloaded = ws.get("unloaded_sublevels") or []
+        if unloaded:
+            rep.warn("%d streaming sublevel(s) were unloaded during export and omitted "
+                     "(e.g. %s). Load them in Unreal and re-export to include them."
+                     % (len(unloaded), ", ".join(str(x) for x in unloaded[:5])))
+        if ws.get("is_world_partition"):
+            rep.warn("Level uses World Partition: only cells loaded in the Unreal Editor "
+                     "at export time were included.")
 
     # The importer must never compose actor * relative; it relies on this key.
     missing_world = 0

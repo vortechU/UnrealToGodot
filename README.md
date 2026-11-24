@@ -42,7 +42,9 @@ Both plugins stamp and verify a schema `format_version`. A mismatched plugin/add
 - **Batch Mesh glTF Export & LOD Chains** — Exports selected meshes or every mesh used in the active level to glTF (with optional `_LOD<n>.gltf` chains and per-LOD screen-size switch distances wired into Godot's `visibility_range`), using deterministic `_<hash>` filenames when asset packs reuse mesh names.
 - **Physics & Skeletal Ragdoll Extraction** — Converts Unreal static-mesh collision primitives (Boxes, Spheres, Capsules, and Convex Hulls) into `CollisionShape3D` nodes under `StaticBody3D` (baking non-uniform scale into shapes so Jolt never logs errors or averages axes), and rebuilds exported skeletal `UPhysicsAsset` (`_physics.json`) bodies onto `Skeleton3D` via `PhysicalBoneSimulator3D` + `PhysicalBone3D`.
 - **Blueprint & Multi-Component Actors** — Reconstructs complex Blueprint actors as a parent `Node3D` with each component placed at its relative transform offset.
-- **Clean, Grouped Scene Tree** — Organizes imported nodes into dedicated containers (`UnrealStaticMeshes`, `UnrealLights`, `UnrealDecals`, `UnrealFoliage`, and `UnrealNavigation`) so key scene elements aren't buried under thousands of props.
+- **Clean, Grouped Scene Tree & Outliner Folders** — Organizes imported nodes into dedicated containers (`UnrealStaticMeshes`, `UnrealLights`, `UnrealDecals`, `UnrealReflectionProbes`, `UnrealCameras`, `UnrealAudio`, `UnrealFoliage`, and `UnrealNavigation`) and optionally mirrors Unreal's World Outliner folder hierarchy as nested `Node3D` groups.
+- **Spline Meshes, Reflection Probes, Cameras & Ambient Audio** — Deforms `SplineMeshComponent` geometry along cubic Hermite curves (roads, pipes, cables), converts Box/Sphere reflection captures into `ReflectionProbe` nodes, exports `CameraActor`/`CineCameraActor` with exact horizontal FOV (`KEEP_WIDTH`), and optionally transfers `AmbientSound` / `SoundWave` (`.wav`) to `AudioStreamPlayer3D`.
+- **Incremental Re-Import & Blueprint Prefabs** — Stamps stable Unreal actor IDs so re-importing into an existing scene can update transforms/metadata in place without duplicating nodes or wiping Godot scripts/children, and optionally extracts repeated multi-component Blueprints into shared `res://prefabs/*.tscn` sub-scenes.
 
 ### Materials, Lighting & Atmosphere
 
@@ -213,8 +215,8 @@ Heightmaps and paint-layer weightmaps export as float EXRs, and the terrain surf
 
 ### Workflow Boundaries
 
-- **Only loaded levels are exported:** The exporter reads actors from the currently loaded world. Unloaded **World Partition** cells and unloaded streaming sublevels are silently omitted—load everything you want exported first.
-- **Imports are one-shot, not incremental:** The schema does not yet track stable actor IDs, so re-running an import into the same scene duplicates actors instead of updating them. Iterate by importing into a fresh scene.
+- **Only loaded levels are exported (with diagnostics):** The exporter reads actors from the currently loaded world and now inspects World Partition / streaming sublevels, warning in `ue2g_report.txt` and the dock preview whenever unloaded sublevels or World Partition cells are detected.
+- **Incremental re-import:** Enable **Update existing scene (incremental)** in the Godot importer dock to match actors by `unreal_actor_id` and update them in place (preserving custom Godot scripts and children), with optional pruning of removed actors. Leave it off for a clean one-shot import into a fresh scene.
 
 ---
 

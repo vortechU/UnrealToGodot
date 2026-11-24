@@ -123,6 +123,26 @@ check("region uses identity rotation and unit scale to match world AABB extent",
 check("extent_m matches converted half-extents",
       vol["extent_m"] == [6.0, 4.0, 5.0], vol["extent_m"])
 
+print("\n=== 4. audit_layout flags unloaded sublevels & World Partition ===")
+wp_dir = tempfile.mkdtemp()
+wp_json = os.path.join(wp_dir, "WP_layout.json")
+with open(wp_json, "w", encoding="utf-8") as f:
+    json.dump({
+        "format_version": 2, "level_name": "WP", "meshes": {},
+        "actors": [{"name": "A", "components": [{"godot_world_transform": {"translation": [0, 0, 0]}}]}],
+        "world_streaming": {
+            "is_world_partition": True,
+            "loaded_sublevels": ["/Game/Sub_A"],
+            "unloaded_sublevels": ["/Game/Sub_B", "/Game/Sub_C"],
+        },
+    }, f)
+wp_rep = D.Report()
+D.audit_layout(wp_rep, wp_json)
+check("unloaded sublevels trigger an export warning",
+      any("streaming sublevel" in w for w in wp_rep.warnings), wp_rep.warnings)
+check("World Partition triggers a partial-cell warning",
+      any("World Partition" in w for w in wp_rep.warnings), wp_rep.warnings)
+
 print("\n" + "=" * 60)
 if FAIL:
     print("FAILURES (%d): %s" % (len(FAIL), FAIL))

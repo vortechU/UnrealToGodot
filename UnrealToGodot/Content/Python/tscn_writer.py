@@ -743,6 +743,9 @@ class _TscnWriter(object):
 
     def _actor_metadata_lines(self, actor, extra_tags=None):
         lines = []
+        aid = actor.get("actor_id")
+        if aid:
+            lines.append('metadata/unreal_actor_id = "%s"' % _escape_string(aid))
         cls = actor.get("class")
         if cls:
             lines.append('metadata/unreal_class = "%s"' % _escape_string(cls))

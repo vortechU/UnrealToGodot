@@ -7,6 +7,7 @@ var dock_instance: Control
 func _enter_tree() -> void:
 	# Instantiate our pure code-based UI dock
 	dock_instance = ImporterDockClass.new()
+	dock_instance.editor_undo_redo = get_undo_redo()
 	# add_control_to_dock() titles the tab with the control's node name. Without
 	# this the dock inherits Godot's auto-generated name and the tab reads
 	# "@ScrollContainer@64", which tells the user nothing about what it is.

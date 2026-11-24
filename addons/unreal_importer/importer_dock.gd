@@ -8,6 +8,8 @@ var textures_edit: LineEdit
 var convert_transforms_check: CheckBox
 var import_btn: Button
 var status_label: Label
+var preview_label: Label
+var editor_undo_redo: EditorUndoRedoManager = null
 
 # Feature toggle fields (see docs/SCHEMA_V2.md import options)
 var lights_check: CheckBox
@@ -26,12 +28,17 @@ var cameras_check: CheckBox
 var audio_check: CheckBox
 var splines_check: CheckBox
 var preserve_folders_check: CheckBox
+var update_existing_check: CheckBox
+var prune_removed_check: CheckBox
+var extract_prefabs_check: CheckBox
 var flip_normal_green_check: CheckBox
 var save_external_mats_check: CheckBox
 var energy_scale_spin: SpinBox
 var decal_depth_spin: SpinBox
 var texture_limit_option: OptionButton
 var shrink_files_check: CheckBox
+
+const DOCK_CONFIG_PATH := "user://unreal_importer_dock.cfg"
 
 # Refactored importer script class reference
 const ImporterClass = preload("res://addons/unreal_importer/import_unreal_layout.gd")
@@ -185,6 +192,9 @@ func _enter_tree() -> void:
 	audio_check = _make_check(features,"Ambient Audio", "Create AudioStreamPlayer3D nodes from exported AmbientSound / AudioComponent actors and bind exported audio/*.wav streams.", true)
 	splines_check = _make_check(features,"Spline Meshes (Hermite deform)", "Deform SplineMeshComponent meshes along their exported Unreal cubic Hermite splines (roads, pipes, cables).", true)
 	preserve_folders_check = _make_check(features,"Mirror Unreal Outliner Folders", "Recreate Unreal World Outliner folders as nested Node3D containers under UnrealStaticMeshes.", true)
+	update_existing_check = _make_check(features,"Update existing scene (incremental)", "Match existing nodes by unreal_actor_id and update their transforms/metadata in place instead of duplicating actors, preserving scripts and custom child nodes.", false)
+	prune_removed_check = _make_check(features,"    Remove deleted actors on update", "When incremental update is enabled, delete existing imported actors whose unreal_actor_id is no longer in the JSON.", false)
+	extract_prefabs_check = _make_check(features,"Extract Blueprints as .tscn prefabs", "Saves multi-component Blueprint / PackedLevelActor templates once to res://prefabs/ and instances them so editing one prefab updates all copies.", false)
 	flip_normal_green_check = _make_check(features,"Flip normal map green channel (DX -> GL)", "Converts Unreal DirectX (-Y) normal maps to Godot OpenGL (+Y) via Godot's non-destructive process/normal_map_invert_y import flag (skipping maps whose Unreal Flip Green Channel flag was already enabled).", true)
 	save_external_mats_check = _make_check(features,"Save shared materials as .tres files", "Writes shared StandardMaterial3D resources to res://materials/ and reuses existing .tres files on re-import, keeping .tscn files smaller and allowing cross-scene material edits.", false)
 
@@ -258,6 +268,30 @@ func _enter_tree() -> void:
 	import_btn.pressed.connect(_on_import_pressed)
 	vbox.add_child(import_btn)
 
+	# --- Pre-import Dry-Run Preview & Report Row ---
+	var util_row := HBoxContainer.new()
+	var preview_btn := Button.new()
+	preview_btn.text = "Preview JSON"
+	preview_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	preview_btn.tooltip_text = "Inspect the selected layout JSON without modifying the scene: shows actor/mesh counts, missing models, and texture disk size."
+	preview_btn.pressed.connect(_on_preview_pressed)
+	util_row.add_child(preview_btn)
+
+	var report_btn := Button.new()
+	report_btn.text = "Open Import Report"
+	report_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	report_btn.tooltip_text = "Opens res://ue2g_import_report.txt from the last import run."
+	report_btn.pressed.connect(_on_open_report_pressed)
+	util_row.add_child(report_btn)
+	vbox.add_child(util_row)
+
+	preview_label = Label.new()
+	preview_label.text = ""
+	preview_label.visible = false
+	preview_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	preview_label.add_theme_color_override("font_color", Color(0.75, 0.85, 0.95))
+	vbox.add_child(preview_label)
+
 	# --- Utility: bind meshes into MultiMeshes of directly-generated .tscn scenes ---
 	var bind_foliage_btn := Button.new()
 	bind_foliage_btn.text = "Bind Foliage Meshes (.tscn scenes)"
@@ -278,6 +312,118 @@ func _enter_tree() -> void:
 	status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	status_label.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6))
 	vbox.add_child(status_label)
+
+	_load_dock_settings()
+
+
+func _exit_tree() -> void:
+	_save_dock_settings()
+
+
+func _save_dock_settings(config_path: String = DOCK_CONFIG_PATH) -> void:
+	if json_edit == null:
+		return
+	var cfg := ConfigFile.new()
+	cfg.set_value("paths", "json", json_edit.text)
+	cfg.set_value("paths", "models", models_edit.text)
+	cfg.set_value("paths", "textures", textures_edit.text)
+	cfg.set_value("options", "convert_transforms", convert_transforms_check.button_pressed)
+	cfg.set_value("options", "lights", lights_check.button_pressed)
+	cfg.set_value("options", "environment", environment_check.button_pressed)
+	cfg.set_value("options", "decals", decals_check.button_pressed)
+	cfg.set_value("options", "terrain", terrain_check.button_pressed)
+	cfg.set_value("options", "terrain_mode", terrain_mode_option.selected)
+	cfg.set_value("options", "foliage", foliage_check.button_pressed)
+	cfg.set_value("options", "navigation", navigation_check.button_pressed)
+	cfg.set_value("options", "navigation_bake", navigation_bake_check.button_pressed)
+	cfg.set_value("options", "metadata", metadata_check.button_pressed)
+	cfg.set_value("options", "lods", lods_check.button_pressed)
+	cfg.set_value("options", "skel_physics", skel_physics_check.button_pressed)
+	cfg.set_value("options", "probes", probes_check.button_pressed)
+	cfg.set_value("options", "cameras", cameras_check.button_pressed)
+	cfg.set_value("options", "audio", audio_check.button_pressed)
+	cfg.set_value("options", "splines", splines_check.button_pressed)
+	cfg.set_value("options", "preserve_folders", preserve_folders_check.button_pressed)
+	cfg.set_value("options", "update_existing", update_existing_check.button_pressed)
+	cfg.set_value("options", "prune_removed", prune_removed_check.button_pressed)
+	cfg.set_value("options", "extract_prefabs", extract_prefabs_check.button_pressed)
+	cfg.set_value("options", "flip_normal_green", flip_normal_green_check.button_pressed)
+	cfg.set_value("options", "save_external_mats", save_external_mats_check.button_pressed)
+	cfg.set_value("options", "energy_scale", energy_scale_spin.value)
+	cfg.set_value("options", "decal_min_depth_m", decal_depth_spin.value)
+	cfg.set_value("options", "texture_limit_index", texture_limit_option.selected)
+	cfg.set_value("options", "shrink_files", shrink_files_check.button_pressed)
+	cfg.save(config_path)
+
+
+func _load_dock_settings(config_path: String = DOCK_CONFIG_PATH) -> void:
+	var cfg := ConfigFile.new()
+	if cfg.load(config_path) != OK:
+		return
+	json_edit.text = str(cfg.get_value("paths", "json", json_edit.text))
+	models_edit.text = str(cfg.get_value("paths", "models", models_edit.text))
+	textures_edit.text = str(cfg.get_value("paths", "textures", textures_edit.text))
+	convert_transforms_check.button_pressed = bool(cfg.get_value("options", "convert_transforms", false))
+	lights_check.button_pressed = bool(cfg.get_value("options", "lights", true))
+	environment_check.button_pressed = bool(cfg.get_value("options", "environment", true))
+	decals_check.button_pressed = bool(cfg.get_value("options", "decals", true))
+	terrain_check.button_pressed = bool(cfg.get_value("options", "terrain", true))
+	terrain_mode_option.selected = clampi(int(cfg.get_value("options", "terrain_mode", 0)), 0, terrain_mode_option.item_count - 1)
+	foliage_check.button_pressed = bool(cfg.get_value("options", "foliage", true))
+	navigation_check.button_pressed = bool(cfg.get_value("options", "navigation", true))
+	navigation_bake_check.button_pressed = bool(cfg.get_value("options", "navigation_bake", false))
+	metadata_check.button_pressed = bool(cfg.get_value("options", "metadata", true))
+	lods_check.button_pressed = bool(cfg.get_value("options", "lods", true))
+	skel_physics_check.button_pressed = bool(cfg.get_value("options", "skel_physics", true))
+	probes_check.button_pressed = bool(cfg.get_value("options", "probes", true))
+	cameras_check.button_pressed = bool(cfg.get_value("options", "cameras", true))
+	audio_check.button_pressed = bool(cfg.get_value("options", "audio", true))
+	splines_check.button_pressed = bool(cfg.get_value("options", "splines", true))
+	preserve_folders_check.button_pressed = bool(cfg.get_value("options", "preserve_folders", true))
+	update_existing_check.button_pressed = bool(cfg.get_value("options", "update_existing", false))
+	prune_removed_check.button_pressed = bool(cfg.get_value("options", "prune_removed", false))
+	extract_prefabs_check.button_pressed = bool(cfg.get_value("options", "extract_prefabs", false))
+	flip_normal_green_check.button_pressed = bool(cfg.get_value("options", "flip_normal_green", true))
+	save_external_mats_check.button_pressed = bool(cfg.get_value("options", "save_external_mats", false))
+	energy_scale_spin.value = float(cfg.get_value("options", "energy_scale", 1.0))
+	decal_depth_spin.value = float(cfg.get_value("options", "decal_min_depth_m", EnvironmentClass.DEFAULT_DECAL_MIN_DEPTH_M))
+	texture_limit_option.selected = clampi(int(cfg.get_value("options", "texture_limit_index", TEXTURE_LIMIT_DEFAULT_INDEX)), 0, texture_limit_option.item_count - 1)
+	shrink_files_check.button_pressed = bool(cfg.get_value("options", "shrink_files", true))
+
+
+func _on_preview_pressed() -> void:
+	var summary: Dictionary = ImporterClass.summarize_layout_json(json_edit.text, models_edit.text, textures_edit.text)
+	preview_label.visible = true
+	if not bool(summary.get("ok", false)):
+		preview_label.text = "Preview error: " + str(summary.get("error", "Unknown error"))
+		preview_label.add_theme_color_override("font_color", Color(0.95, 0.4, 0.4))
+		return
+	var tex_mb := float(summary.get("texture_bytes", 0)) / 1048576.0
+	var lines := PackedStringArray([
+		"Level: %s (schema v%d)" % [summary["level_name"], int(summary["format_version"])],
+		"Actors: %d | Unique meshes: %d (missing: %d)" % [int(summary["actors"]), int(summary["unique_meshes"]), int(summary["missing_meshes"])],
+		"Lights: %d | Decals: %d | Probes: %d | Cameras: %d | Audio: %d" % [
+			int(summary["lights"]), int(summary["decals"]), int(summary["reflection_probes"]),
+			int(summary["cameras"]), int(summary["audio"])],
+		"Foliage groups: %d | Landscapes: %d | Textures: %.1f MB" % [
+			int(summary["foliage_groups"]), int(summary["landscapes"]), tex_mb],
+	])
+	if int(summary.get("unloaded_sublevels", 0)) > 0:
+		lines.append("Warning: %d streaming sublevel(s) were unloaded during export." % int(summary["unloaded_sublevels"]))
+	if bool(summary.get("is_world_partition", false)):
+		lines.append("Note: World Partition level (only loaded cells exported).")
+	preview_label.text = "\n".join(lines)
+	preview_label.add_theme_color_override("font_color",
+		Color(0.95, 0.75, 0.3) if int(summary["missing_meshes"]) > 0 else Color(0.75, 0.9, 0.8))
+
+
+func _on_open_report_pressed() -> void:
+	var report_path := ProjectSettings.globalize_path("res://ue2g_import_report.txt")
+	if not FileAccess.file_exists(report_path):
+		status_label.text = "Status: No import report found yet (run an import first)."
+		status_label.add_theme_color_override("font_color", Color(0.9, 0.7, 0.2))
+		return
+	OS.shell_open(report_path)
 
 func _on_build_skel_physics_pressed() -> void:
 	var scene_root: Node = EditorInterface.get_edited_scene_root()
@@ -385,6 +531,8 @@ func _on_browse_json() -> void:
 	
 	dialog.file_selected.connect(func(path):
 		json_edit.text = ProjectSettings.localize_path(path)
+		_save_dock_settings()
+		_on_preview_pressed()
 	)
 	dialog.visibility_changed.connect(func():
 		if not dialog.visible:
@@ -550,6 +698,11 @@ func _on_import_pressed() -> void:
 	var importer = ImporterClass.new()
 	importer.USE_GDSCRIPT_TRANSFORM_CONVERSION = convert_transforms_check.button_pressed
 
+	_save_dock_settings()
+	var pre_children: Array[Node] = []
+	for c in scene_root.get_children():
+		pre_children.append(c)
+
 	var terrain_modes := ["auto", "terrain3d", "hterrain", "mesh"]
 	var options := {
 		"apply_lights": lights_check.button_pressed,
@@ -568,6 +721,9 @@ func _on_import_pressed() -> void:
 		"apply_audio": audio_check.button_pressed,
 		"apply_spline_meshes": splines_check.button_pressed,
 		"preserve_folders": preserve_folders_check.button_pressed,
+		"update_existing": update_existing_check.button_pressed,
+		"prune_removed": prune_removed_check.button_pressed,
+		"extract_prefabs": extract_prefabs_check.button_pressed,
 		"flip_normal_green": flip_normal_green_check.button_pressed,
 		"save_external_materials": save_external_mats_check.button_pressed,
 		"light_energy_scale": energy_scale_spin.value,
@@ -578,6 +734,20 @@ func _on_import_pressed() -> void:
 	# awaited: do_import yields a frame when it hands a landscape to Terrain3D
 	# (the plugin builds its data object one frame after the node enters the tree).
 	var success: bool = await importer.do_import(json_edit.text, models_edit.text, textures_edit.text, scene_root, options)
+
+	if success and editor_undo_redo != null:
+		var added_nodes: Array[Node] = []
+		for c in scene_root.get_children():
+			if not pre_children.has(c):
+				added_nodes.append(c)
+		if not added_nodes.is_empty():
+			editor_undo_redo.create_action("Import Unreal Level Layout")
+			for n in added_nodes:
+				editor_undo_redo.add_do_method(scene_root, "add_child", n)
+				editor_undo_redo.add_do_property(n, "owner", scene_root)
+				editor_undo_redo.add_do_reference(n)
+				editor_undo_redo.add_undo_method(scene_root, "remove_child", n)
+			editor_undo_redo.commit_action(false)
 	
 	import_btn.disabled = false
 	if success:

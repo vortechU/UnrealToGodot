@@ -60,7 +60,8 @@ read and write exactly these structures.
     "audio": [ ... ],
     "landscapes": [ ... ],
     "foliage": [ ... ],
-    "navigation": { ... } | null
+    "navigation": { ... } | null,
+    "world_streaming": { "is_world_partition": false, "loaded_sublevels": [...], "unloaded_sublevels": [...] } // optional
 }
 ```
 
@@ -161,7 +162,8 @@ only ever resolves as a sibling of the `.gltf`. Verified: Godot loads a
 
 ```json
 {
-    "name": "...", "class": "...",
+    "name": "...", "actor_id": "<guid-or-path>", "class": "...",
+    "blueprint_asset": "/Game/BP/BP_Foo.BP_Foo_C", // optional; Blueprint / PackedLevelActor template
     "folder_path": "Architecture/Interior",        // optional World Outliner folder path
     "unreal_transform": { ... }, "godot_transform": { ... },
     "tags": ["patrol_point"],                      // actor.tags, stringified

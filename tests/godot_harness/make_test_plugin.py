@@ -274,8 +274,9 @@ func _run_tests() -> void:
 	_test_lights(root)
 	_test_foliage(root)
 	_test_materials(root)
-	_test_lods_and_skeletal_physics(root)
+	await _test_lods_and_skeletal_physics(root)
 	_test_phase3_scene_parity(root)
+	await _test_phase4_workflow(root)
 	_test_terrain(root)
 
 	print("\\n============================================")
@@ -704,6 +705,91 @@ func _test_phase3_scene_parity(root: Node) -> void:
 			absf(aud.volume_db + 6.0) < 0.01 and absf(aud.pitch_scale - 1.1) < 0.01
 			and absf(aud.max_distance - 35.0) < 0.01 and aud.autoplay,
 			"db=%s pitch=%s dist=%s auto=%s" % [aud.volume_db, aud.pitch_scale, aud.max_distance, aud.autoplay])
+
+
+func _test_phase4_workflow(root: Node) -> void:
+	print("\\n--- Phase 4: incremental update, Blueprint prefabs, dry-run preview & dock config ---")
+	# 1. Pre-import JSON dry-run summary
+	var summary: Dictionary = Importer.summarize_layout_json(
+		"res://level_layout.json", "res://models/", "res://textures/")
+	check("dry-run JSON summary parses cleanly", bool(summary.get("ok", false)))
+	check("dry-run summary counts actors, probes, cameras, audio accurately",
+		int(summary.get("actors", 0)) >= 8 and int(summary.get("reflection_probes", 0)) == 1
+		and int(summary.get("cameras", 0)) == 1 and int(summary.get("audio", 0)) == 1
+		and int(summary.get("missing_meshes", -1)) == 0, str(summary))
+
+	# 2. Incremental non-destructive re-import on a fresh scene root
+	var inc_root := Node3D.new()
+	inc_root.name = "IncRoot"
+	get_tree().get_root().add_child(inc_root)
+	var imp_inc = Importer.new()
+	var base_opts := {
+		"apply_metadata": false, "build_terrain": false, "apply_foliage": false,
+		"apply_lights": false, "apply_decals": false, "apply_environment": false,
+		"apply_reflection_probes": false, "apply_cameras": false, "apply_audio": false,
+	}
+	await imp_inc.do_import("res://level_layout.json", "res://models/", "res://textures/", inc_root, base_opts)
+	var buoy_before := find_node(inc_root, "Buoy_1")
+	check("incremental setup imported Buoy_1 with unreal_actor_id",
+		buoy_before != null and str(buoy_before.get_meta("unreal_actor_id", "")) == "ID_BUOY_1")
+	if buoy_before:
+		var custom := Node3D.new()
+		custom.name = "UserCustomScriptNode"
+		buoy_before.add_child(custom)
+
+	var upd_opts := base_opts.duplicate()
+	upd_opts["update_existing"] = true
+	upd_opts["prune_removed"] = true
+	await imp_inc.do_import("res://level_layout_v2.json", "res://models/", "res://textures/", inc_root, upd_opts)
+	await get_tree().process_frame
+
+	var buoy_after := find_node(inc_root, "Buoy_1")
+	check("incremental update preserved existing Buoy_1 node instance and custom child",
+		buoy_after == buoy_before and buoy_after.get_node_or_null("UserCustomScriptNode") != null)
+	check("incremental update moved Buoy_1 in place to (99, 5, -10)",
+		buoy_after is Node3D and near((buoy_after as Node3D).global_transform.origin, Vector3(99, 5, -10)),
+		str((buoy_after as Node3D).global_transform.origin) if buoy_after is Node3D else "none")
+	check("incremental update added Fresh_Actor", find_node(inc_root, "Fresh_Actor") != null)
+	check("incremental update with prune_removed removed deleted Crate_1",
+		find_node(inc_root, "Crate_1") == null)
+	inc_root.queue_free()
+
+	# 3. Blueprint prefab extraction (.tscn sub-scene)
+	var pref_root := Node3D.new()
+	pref_root.name = "PrefabRoot"
+	get_tree().get_root().add_child(pref_root)
+	var pref_opts := base_opts.duplicate()
+	pref_opts["extract_prefabs"] = true
+	await Importer.new().do_import("res://level_layout.json", "res://models/", "res://textures/", pref_root, pref_opts)
+	var bp_inst := find_node(pref_root, "BP_Pier")
+	check("Blueprint prefab file res://prefabs/BP_Pier_C.tscn saved on disk",
+		FileAccess.file_exists("res://prefabs/BP_Pier_C.tscn"))
+	check("BP_Pier instantiated from shared .tscn prefab",
+		bp_inst != null and bp_inst.scene_file_path == "res://prefabs/BP_Pier_C.tscn",
+		bp_inst.scene_file_path if bp_inst else "null")
+	pref_root.queue_free()
+
+	# 4. Dock settings persistence round-trip
+	const DockClass = preload("res://addons/unreal_importer/importer_dock.gd")
+	var cfg_path := "res://test_dock_settings.cfg"
+	var d1 = DockClass.new()
+	get_tree().get_root().add_child(d1)
+	d1.json_edit.text = "res://custom_map_layout.json"
+	d1.energy_scale_spin.value = 2.25
+	d1.update_existing_check.button_pressed = true
+	d1.extract_prefabs_check.button_pressed = true
+	d1._save_dock_settings(cfg_path)
+	d1.queue_free()
+
+	var d2 = DockClass.new()
+	get_tree().get_root().add_child(d2)
+	d2._load_dock_settings(cfg_path)
+	check("dock settings persist paths, spinboxes, and toggles across reload",
+		d2.json_edit.text == "res://custom_map_layout.json"
+		and absf(d2.energy_scale_spin.value - 2.25) < 0.001
+		and d2.update_existing_check.button_pressed
+		and d2.extract_prefabs_check.button_pressed)
+	d2.queue_free()
 
 
 func _dump(n: Node, depth: int) -> void:

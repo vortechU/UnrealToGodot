@@ -49,6 +49,10 @@ const DEFAULT_IMPORT_OPTIONS := {
 	"apply_audio": true,
 	"apply_spline_meshes": true,
 	"preserve_folders": true,
+	"update_existing": false,
+	"prune_removed": false,
+	"extract_prefabs": false,
+	"prefabs_folder": "res://prefabs/",
 	"flip_normal_green": true,
 	"save_external_materials": false,
 	"materials_folder": "res://materials/",
@@ -69,6 +73,7 @@ var _normal_map_targets: Dictionary = {}
 var _alpha_merged_cache: Dictionary = {}
 var _external_normal_cache: Dictionary = {}
 var _external_mat_paths: Dictionary = {}
+var _prefab_cache: Dictionary = {}
 var active_scene_root: Node
 var active_textures_folder: String
 var active_models_folder: String
@@ -152,6 +157,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 	_alpha_merged_cache.clear()
 	_external_normal_cache.clear()
 	_external_mat_paths.clear()
+	_prefab_cache.clear()
 
 	# Configure DirectX -> OpenGL normal map Y-flip via Godot's non-destructive
 	# process/normal_map_invert_y import parameter before materials load them.
@@ -172,11 +178,22 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 				% [int(flip_res["changed"]), int(flip_res["total"]), str(flip_enabled)])
 	
 	var imported_count: int = 0
+	var updated_count: int = 0
+	var pruned_count: int = 0
+	var prefabs_built: int = 0
 	var lod_chains_wired: int = 0
 	var skel_physics_bones: int = 0
 	var missing_meshes: Dictionary = {}
 	var gameplay_helper = _load_feature("import_gameplay.gd")
 	var skel_physics_helper = _load_feature("import_skeletal_physics.gd")
+
+	var update_existing := bool(import_options.get("update_existing", false))
+	var prune_removed := bool(import_options.get("prune_removed", false))
+	var extract_prefabs := bool(import_options.get("extract_prefabs", false))
+	var existing_by_id: Dictionary = {}
+	var seen_actor_ids: Dictionary = {}
+	if update_existing:
+		_index_existing_actors(active_scene_root, existing_by_id)
 
 	# Every mesh actor goes under one container, the way lights (UnrealLights),
 	# decals (UnrealDecals), foliage and navigation already do. A level is mostly
@@ -192,10 +209,14 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 			continue
 		var comps = actor_data.get("components", [])
 		if comps is Array and (comps as Array).size() > 0:
-			var container := Node3D.new()
-			container.name = STATIC_MESH_CONTAINER
-			Common.add_owned_child(active_scene_root, container, active_scene_root)
-			mesh_root = container
+			var existing_container := active_scene_root.get_node_or_null(STATIC_MESH_CONTAINER) if update_existing else null
+			if existing_container != null:
+				mesh_root = existing_container
+			else:
+				var container := Node3D.new()
+				container.name = STATIC_MESH_CONTAINER
+				Common.add_owned_child(active_scene_root, container, active_scene_root)
+				mesh_root = container
 			break
 
 	# Iterate and instance actors
@@ -203,6 +224,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 		if not (actor_data is Dictionary):
 			continue
 		var actor_name: String = Common.get_str(actor_data, "name", "Actor")
+		var actor_id: String = Common.get_str(actor_data, "actor_id", actor_name)
 		var actor_class: String = Common.get_str(actor_data, "class", "StaticMeshActor")
 		var comps_raw = actor_data.get("components", [])
 		var components: Array = comps_raw if comps_raw is Array else []
@@ -215,7 +237,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 			var folder_path := Common.get_str(actor_data, "folder_path", "")
 			if folder_path != "":
 				actor_parent = _resolve_folder_parent(mesh_root, folder_path, folder_nodes)
-			
+
 		# Resolve the parent actor's transform
 		var actor_transform: Transform3D = Transform3D.IDENTITY
 		if USE_GDSCRIPT_TRANSFORM_CONVERSION:
@@ -230,9 +252,18 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 			var g_trans = actor_data.get("godot_transform")
 			if g_trans is Dictionary:
 				actor_transform = get_transform_from_dict(g_trans)
-			
+
+		# Incremental re-import: update existing actor node in place, preserving user scripts & children.
+		if update_existing and actor_id != "" and existing_by_id.has(actor_id):
+			var existing_node: Node = existing_by_id[actor_id]
+			if is_instance_valid(existing_node):
+				seen_actor_ids[actor_id] = true
+				_update_existing_actor_node(existing_node, actor_parent, actor_transform, actor_data, components, gameplay_helper)
+				updated_count += 1
+				continue
+
 		# Optimisation: If it is a simple single-mesh actor, instance it directly.
-		# If it's a complex actor (multiple meshes / components), create a parent Node3D.
+		# If it's a complex actor (multiple meshes / components), create a parent Node3D (or shared prefab).
 		if components.size() == 1:
 			var comp_data = components[0]
 			if not (comp_data is Dictionary):
@@ -303,6 +334,9 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 						instanced_mesh, mesh_key, models_folder, active_scene_root, meshes_lib))
 
 				imported_count += 1
+				if actor_id != "":
+					target_node.set_meta("unreal_actor_id", actor_id)
+					seen_actor_ids[actor_id] = true
 				if gameplay_helper:
 					gameplay_helper.apply_actor_metadata(target_node, actor_data, import_options)
 					if gameplay_helper.has_method("apply_component_metadata"):
@@ -311,17 +345,33 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 				if physics_body:
 					physics_body.queue_free()
 		else:
-			# Multi-mesh Blueprint actor
+			# Multi-mesh Blueprint actor (optionally extracted as a shared .tscn prefab)
+			var actor_frame := Common.physics_body_transform(actor_transform)
+			var bp_key := _prefab_template_key(actor_data)
+			if extract_prefabs and bp_key != "":
+				var prefab_scene := _get_or_create_blueprint_prefab(
+					bp_key, actor_class, actor_transform, actor_frame, components,
+					models_folder, meshes_lib, skel_physics_helper)
+				if prefab_scene != null:
+					var prefab_inst := prefab_scene.instantiate() as Node3D
+					if prefab_inst != null:
+						prefab_inst.name = actor_name
+						actor_parent.add_child(prefab_inst)
+						prefab_inst.owner = active_scene_root
+						prefab_inst.transform = actor_frame
+						if actor_id != "":
+							prefab_inst.set_meta("unreal_actor_id", actor_id)
+							seen_actor_ids[actor_id] = true
+						if gameplay_helper:
+							gameplay_helper.apply_actor_metadata(prefab_inst, actor_data, import_options)
+						imported_count += 1
+						prefabs_built += 1
+						continue
+
 			var actor_node := Node3D.new()
 			actor_node.name = actor_name
 			actor_parent.add_child(actor_node)
 			actor_node.owner = active_scene_root
-			# A scale on the actor is INHERITED by the bodies beneath it, where Jolt
-			# would hit it again -- stripping it at the body would achieve nothing.
-			# Component placements are absolute, so the actor frame is free: drop the
-			# unsafe scale here and it reappears in each component's local transform,
-			# which is where setup_physics_body can bake it into the shapes.
-			var actor_frame := Common.physics_body_transform(actor_transform)
 			actor_node.transform = actor_frame
 
 			# Components hang off actor_node, so their world placement has to be
@@ -394,10 +444,22 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					
 			if actor_node.get_child_count() > 0:
 				imported_count += 1
+				if actor_id != "":
+					actor_node.set_meta("unreal_actor_id", actor_id)
+					seen_actor_ids[actor_id] = true
 				if gameplay_helper:
 					gameplay_helper.apply_actor_metadata(actor_node, actor_data, import_options)
 			else:
 				actor_node.queue_free()
+
+	# Incremental re-import pruning: remove actors whose unreal_actor_id vanished from the layout.
+	if update_existing and prune_removed:
+		for old_id in existing_by_id:
+			if not seen_actor_ids.has(old_id):
+				var old_node: Node = existing_by_id[old_id]
+				if is_instance_valid(old_node) and old_node != active_scene_root:
+					old_node.queue_free()
+					pruned_count += 1
 			
 	# Feature modules: lights/environment/decals, terrain, foliage, navigation.
 	# Each is optional — a missing module file simply disables that feature.
@@ -445,6 +507,12 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 		report.fact("actors in json", actors.size())
 		report.fact("mesh entries in json", meshes_lib.size())
 		report.fact("actors imported", imported_count)
+		if updated_count > 0:
+			report.fact("actors updated in place", updated_count)
+		if pruned_count > 0:
+			report.fact("actors pruned", pruned_count)
+		if prefabs_built > 0:
+			report.fact("Blueprint prefab instances", prefabs_built)
 		if lod_chains_wired > 0:
 			report.fact("LOD chains wired", lod_chains_wired)
 		if skel_physics_bones > 0:
@@ -965,6 +1033,212 @@ func _apply_component_render_flags(target_node: Node, instanced_mesh: Node, comp
 			# Only set visibility_range_end when no LOD band already capped it.
 			if has_max_draw and absf(mi.visibility_range_end) < 1e-4:
 				mi.visibility_range_end = float(max_draw)
+
+
+func _index_existing_actors(node: Node, out: Dictionary) -> void:
+	"""Recursively indexes existing nodes by their unreal_actor_id metadata."""
+	if node == null:
+		return
+	if node.has_meta("unreal_actor_id"):
+		var aid := str(node.get_meta("unreal_actor_id"))
+		if aid != "":
+			out[aid] = node
+	for child in node.get_children():
+		_index_existing_actors(child, out)
+
+
+func _update_existing_actor_node(existing_node: Node, desired_parent: Node,
+		actor_transform: Transform3D, actor_data: Dictionary,
+		components: Array, gameplay_helper) -> void:
+	"""Updates an existing actor's transform, folder parent, visibility, and
+	metadata in place without destroying user scripts or custom child nodes."""
+	if desired_parent != null and existing_node.get_parent() != desired_parent:
+		if existing_node.get_parent() != null:
+			existing_node.get_parent().remove_child(existing_node)
+		desired_parent.add_child(existing_node)
+		existing_node.owner = active_scene_root
+
+	if existing_node is Node3D:
+		var n3d := existing_node as Node3D
+		if components.size() == 1 and components[0] is Dictionary:
+			var comp0: Dictionary = components[0]
+			var world := component_world_transform(comp0, actor_transform)
+			var mesh_place := Common.gltf_mesh_placement(world)
+			if existing_node is StaticBody3D:
+				n3d.transform = Common.physics_body_transform(mesh_place)
+			else:
+				n3d.transform = mesh_place
+			if comp0.has("visible"):
+				n3d.visible = bool(comp0.get("visible", true))
+		else:
+			n3d.transform = Common.physics_body_transform(actor_transform)
+
+	if gameplay_helper:
+		gameplay_helper.apply_actor_metadata(existing_node, actor_data, import_options)
+
+
+func _prefab_template_key(actor_data: Dictionary) -> String:
+	"""Returns a stable prefab template key for a Blueprint / PackedLevelActor, or ''."""
+	var bp := Common.get_str(actor_data, "blueprint_asset", "")
+	if bp != "":
+		return bp
+	var cls := Common.get_str(actor_data, "class", "")
+	if cls.ends_with("_C") or cls.contains("PackedLevelActor"):
+		return cls
+	return ""
+
+
+func _get_or_create_blueprint_prefab(bp_key: String, actor_class: String,
+		actor_transform: Transform3D, actor_frame: Transform3D, components: Array,
+		models_folder: String, meshes_lib: Dictionary, skel_physics_helper) -> PackedScene:
+	"""Builds (once) and saves a reusable res://prefabs/<Class>.tscn PackedScene
+	for a multi-component Blueprint actor, or reuses an existing one on disk."""
+	if _prefab_cache.has(bp_key):
+		return _prefab_cache[bp_key] as PackedScene
+
+	var prefabs_folder := str(import_options.get("prefabs_folder", "res://prefabs/"))
+	if not prefabs_folder.begins_with("res://"):
+		return null
+
+	var raw_name := actor_class if actor_class != "" else bp_key.get_file().get_basename()
+	var safe := ""
+	for i in raw_name.length():
+		var c := raw_name.unicode_at(i)
+		var ch := raw_name[i]
+		var ok := (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or (c >= 48 and c <= 57) or ch == "_" or ch == "-"
+		safe += ch if ok else "_"
+	if safe == "":
+		safe = "BlueprintPrefab"
+	var res_path := prefabs_folder.path_join(safe + ".tscn")
+
+	if ResourceLoader.exists(res_path):
+		var existing = ResourceLoader.load(res_path)
+		if existing is PackedScene:
+			_prefab_cache[bp_key] = existing
+			return existing as PackedScene
+
+	var prefab_root := Node3D.new()
+	prefab_root.name = safe
+	var saved_owner := active_scene_root
+	active_scene_root = prefab_root
+
+	var actor_inverse := Transform3D.IDENTITY
+	if absf(actor_frame.basis.determinant()) > 1e-12:
+		actor_inverse = actor_frame.affine_inverse()
+
+	for comp_data in components:
+		if not (comp_data is Dictionary):
+			continue
+		var comp_name: String = Common.get_str(comp_data, "name", "Component")
+		var mesh_name: String = Common.get_str(comp_data, "mesh_name", "")
+		var mesh_key: String = Common.get_str(comp_data, "mesh_key", mesh_name)
+		var comp_transform := actor_inverse * component_world_transform(comp_data, actor_transform)
+		var mesh_place := Common.gltf_mesh_placement(comp_transform)
+		var gltf_path := find_model_for(models_folder, mesh_key, mesh_name)
+		if gltf_path == "":
+			continue
+		var want_collision := bool(comp_data.get("collision_enabled", true))
+		var physics_body = setup_physics_body(prefab_root, comp_name, mesh_place, mesh_key, meshes_lib) if want_collision else null
+		var instanced_mesh = instance_gltf(gltf_path)
+		if instanced_mesh:
+			var overrides_raw = comp_data.get("material_overrides", [])
+			var overrides: Array = overrides_raw if overrides_raw is Array else []
+			apply_materials_to_instance(instanced_mesh, mesh_key, overrides, meshes_lib)
+			if physics_body:
+				instanced_mesh.name = mesh_name if mesh_name != "" else (mesh_key if mesh_key != "" else "Mesh")
+				physics_body.add_child(instanced_mesh)
+				physics_body.owner = prefab_root
+				instanced_mesh.owner = prefab_root
+				_set_owner_recursive(instanced_mesh, prefab_root)
+				instanced_mesh.transform = Transform3D(
+					Basis.from_scale(Common.physics_body_scale(mesh_place)), Vector3.ZERO)
+			else:
+				instanced_mesh.name = comp_name
+				prefab_root.add_child(instanced_mesh)
+				instanced_mesh.owner = prefab_root
+				_set_owner_recursive(instanced_mesh, prefab_root)
+				instanced_mesh.transform = mesh_place
+			var target: Node = physics_body if physics_body else instanced_mesh
+			_apply_component_render_flags(target, instanced_mesh, comp_data)
+			if bool(import_options.get("apply_skeletal_physics", true)) and skel_physics_helper:
+				skel_physics_helper.attach_to_instance(instanced_mesh, mesh_key, models_folder, prefab_root, meshes_lib)
+		elif physics_body:
+			physics_body.queue_free()
+
+	active_scene_root = saved_owner
+
+	if prefab_root.get_child_count() == 0:
+		prefab_root.free()
+		return null
+
+	var packed := PackedScene.new()
+	var pack_err := packed.pack(prefab_root)
+	prefab_root.free()
+	if pack_err != OK:
+		return null
+
+	var dir_global := ProjectSettings.globalize_path(prefabs_folder)
+	if dir_global != "":
+		DirAccess.make_dir_recursive_absolute(dir_global)
+	var save_err := ResourceSaver.save(packed, res_path)
+	if save_err == OK:
+		var reloaded = ResourceLoader.load(res_path)
+		if reloaded is PackedScene:
+			_prefab_cache[bp_key] = reloaded
+			return reloaded as PackedScene
+	_prefab_cache[bp_key] = packed
+	return packed
+
+
+static func summarize_layout_json(json_path: String, models_folder: String, textures_folder: String) -> Dictionary:
+	"""Dry-run pre-import summary of a layout JSON: counts actors, unique meshes,
+	missing models on disk, feature items, and texture folder disk size."""
+	var out := {
+		"ok": false, "error": "", "level_name": "", "format_version": 0,
+		"actors": 0, "unique_meshes": 0, "missing_meshes": 0,
+		"lights": 0, "decals": 0, "reflection_probes": 0, "cameras": 0, "audio": 0,
+		"foliage_groups": 0, "landscapes": 0, "texture_bytes": 0,
+		"unloaded_sublevels": 0, "is_world_partition": false,
+	}
+	if not FileAccess.file_exists(json_path):
+		out["error"] = "JSON file not found: " + json_path
+		return out
+	var parsed = JSON.parse_string(FileAccess.get_file_as_string(json_path))
+	if not (parsed is Dictionary):
+		out["error"] = "Invalid JSON format."
+		return out
+	var data: Dictionary = parsed
+	out["ok"] = true
+	out["level_name"] = Common.get_str(data, "level_name", "(unknown)")
+	out["format_version"] = int(data.get("format_version", 0))
+	var actors = data.get("actors", [])
+	out["actors"] = (actors as Array).size() if actors is Array else 0
+	var meshes = data.get("meshes", {})
+	if meshes is Dictionary:
+		out["unique_meshes"] = (meshes as Dictionary).size()
+		var miss := 0
+		for key in (meshes as Dictionary).keys():
+			if Common.find_model_path(models_folder, str(key)) == "":
+				miss += 1
+		out["missing_meshes"] = miss
+	for pair in [["lights", "lights"], ["decals", "decals"],
+			["reflection_probes", "reflection_probes"], ["cameras", "cameras"],
+			["audio", "audio"], ["foliage", "foliage_groups"], ["landscapes", "landscapes"]]:
+		var arr = data.get(pair[0], [])
+		out[pair[1]] = (arr as Array).size() if arr is Array else 0
+	var ws = data.get("world_streaming")
+	if ws is Dictionary:
+		out["is_world_partition"] = bool((ws as Dictionary).get("is_world_partition", false))
+		var unl = (ws as Dictionary).get("unloaded_sublevels", [])
+		out["unloaded_sublevels"] = (unl as Array).size() if unl is Array else 0
+	var total_bytes := 0
+	for tex_path in TextureLimit.find_textures(textures_folder):
+		var f := FileAccess.open(tex_path, FileAccess.READ)
+		if f != null:
+			total_bytes += f.get_length()
+			f.close()
+	out["texture_bytes"] = total_bytes
+	return out
 
 
 func _set_visibility_range_recursive(node: Node, range_begin: float, range_end: float) -> void:

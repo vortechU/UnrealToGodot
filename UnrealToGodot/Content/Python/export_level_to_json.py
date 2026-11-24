@@ -1129,6 +1129,97 @@ def extract_actor_folder_path(actor):
     return "/".join(parts)
 
 
+def extract_actor_id(actor):
+    """Returns a stable identifier for incremental re-import (actor GUID or persistent path)."""
+    if actor is None:
+        return ""
+    guid = ue2g_common.safe_get_prop(actor, "actor_guid", None)
+    if guid is not None:
+        gstr = str(guid).strip()
+        if gstr and gstr.lower() != "none" and not all(c in "0-" for c in gstr):
+            return gstr
+    if hasattr(actor, "get_path_name"):
+        try:
+            p = str(actor.get_path_name() or "").strip()
+            if p:
+                return p
+        except Exception:
+            pass
+    return ue2g_common.safe_get_name(actor)
+
+
+def extract_blueprint_asset(actor):
+    """Returns the Blueprint / PackedLevelActor class path for prefab extraction, or ''."""
+    if actor is None:
+        return ""
+    try:
+        cls = actor.get_class()
+        cls_name = str(cls.get_name() or "")
+        if cls_name.endswith("_C") or "PackedLevelActor" in cls_name:
+            if hasattr(cls, "get_path_name"):
+                return str(cls.get_path_name() or cls_name)
+            return cls_name
+    except Exception:
+        pass
+    return ""
+
+
+def inspect_world_streaming(world):
+    """Detects World Partition and unloaded streaming sublevels on `world`.
+
+    Returns None for simple single-level worlds, or:
+        {"is_world_partition": bool, "loaded_sublevels": [...], "unloaded_sublevels": [...]}
+    """
+    if world is None:
+        return None
+    is_wp = False
+    try:
+        wp = ue2g_common.safe_get_prop(world, "world_partition", None)
+        if wp is not None:
+            is_wp = True
+    except Exception:
+        pass
+
+    loaded = []
+    unloaded = []
+    try:
+        levels = ue2g_common.safe_get_prop(world, "streaming_levels", None)
+        if levels is None and hasattr(world, "get_streaming_levels"):
+            levels = world.get_streaming_levels()
+        for lvl in (levels or []):
+            if lvl is None:
+                continue
+            pkg = ue2g_common.safe_get_prop(lvl, "world_asset_package_name", None)
+            if not pkg and hasattr(lvl, "get_world_asset_package_f_name"):
+                try:
+                    pkg = lvl.get_world_asset_package_f_name()
+                except Exception:
+                    pkg = None
+            name = str(pkg or ue2g_common.safe_get_name(lvl))
+            is_loaded = False
+            if hasattr(lvl, "is_level_loaded"):
+                try:
+                    is_loaded = bool(lvl.is_level_loaded())
+                except Exception:
+                    is_loaded = False
+            elif ue2g_common.safe_get_prop(lvl, "loaded_level", None) is not None:
+                is_loaded = True
+            if is_loaded:
+                loaded.append(name)
+            else:
+                unloaded.append(name)
+    except Exception:
+        pass
+
+    if not is_wp and not loaded and not unloaded:
+        return None
+    return {
+        "is_world_partition": is_wp,
+        "loaded_sublevels": sorted(set(loaded)),
+        "unloaded_sublevels": sorted(set(unloaded)),
+    }
+
+
 def extract_component_material_overrides(comp, collected_textures=None):
     """
     Extracts material overrides from a component.
@@ -1243,6 +1334,7 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
     # 2. Setup subsystems and world
     actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
     
+    world = None
     try:
         world = unreal.EditorLevelLibrary.get_editor_world()
         world_name = world.get_name()
@@ -1406,6 +1498,7 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                 
                 actor_data = {
                     "name": actor_label,
+                    "actor_id": extract_actor_id(actor),
                     "class": actor_class,
                     "unreal_transform": unreal_transform_to_dict(actor_transform),
                     "godot_transform": unreal_to_godot_transform(actor_transform),
@@ -1414,6 +1507,9 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                 folder_path = extract_actor_folder_path(actor)
                 if folder_path:
                     actor_data["folder_path"] = folder_path
+                bp_asset = extract_blueprint_asset(actor)
+                if bp_asset:
+                    actor_data["blueprint_asset"] = bp_asset
 
                 if gameplay_mod and opts.get("metadata"):
                     try:
@@ -1549,6 +1645,19 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
             unreal.log_warning(f"Navigation export failed: {str(e)}")
 
     # 6. Build final layout JSON (schema v2 — see docs/SCHEMA_V2.md)
+    world_streaming = inspect_world_streaming(world)
+    if isinstance(world_streaming, dict):
+        unloaded_lvls = world_streaming.get("unloaded_sublevels") or []
+        if unloaded_lvls:
+            unreal.log_warning(
+                "Unreal to Godot: %d streaming sublevel(s) are currently unloaded and "
+                "were omitted from this export: %s"
+                % (len(unloaded_lvls), ", ".join(unloaded_lvls[:5])))
+        if world_streaming.get("is_world_partition"):
+            unreal.log_warning(
+                "Unreal to Godot: '%s' uses World Partition; only currently loaded cells "
+                "were exported." % world_name)
+
     layout_data = {
         "format_version": 2,
         "level_name": world_name,
@@ -1570,6 +1679,8 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
         "foliage": foliage_data,
         "navigation": navigation_data
     }
+    if world_streaming is not None:
+        layout_data["world_streaming"] = world_streaming
 
     # Every texture reference above still holds a bare ASSET name. Now that the
     # whole level has been scanned, the collision-safe export filenames are known,

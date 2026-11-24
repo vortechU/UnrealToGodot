@@ -2013,6 +2013,40 @@ check("audio collected with dB conversion, attenuation radius, and SoundWave que
       and abs(p3_env["audio"][0]["attenuation_radius_m"] - 35.0) < 0.01
       and _fake_sw in p3_sounds, p3_env["audio"])
 
+print("\n=== 15. Phase 4: actor_id, blueprint_asset & world_streaming ===")
+guid_actor = types.SimpleNamespace(
+    get_editor_property=lambda k: "A1B2C3D4-1111-2222-3333-444455556666" if k == "actor_guid" else None,
+    get_path_name=lambda: "/Game/Maps/Demo.Demo:PersistentLevel.Crate_1",
+    get_class=lambda: types.SimpleNamespace(get_name=lambda: "BP_Lamp_C", get_path_name=lambda: "/Game/BP/BP_Lamp.BP_Lamp_C"),
+)
+check("extract_actor_id prefers non-zero actor_guid",
+      EL.extract_actor_id(guid_actor) == "A1B2C3D4-1111-2222-3333-444455556666")
+path_only_actor = types.SimpleNamespace(
+    get_editor_property=lambda k: None,
+    get_path_name=lambda: "/Game/Maps/Demo.Demo:PersistentLevel.Crate_2",
+)
+check("extract_actor_id falls back to persistent path",
+      EL.extract_actor_id(path_only_actor) == "/Game/Maps/Demo.Demo:PersistentLevel.Crate_2")
+check("extract_blueprint_asset reads _C Blueprint class path",
+      EL.extract_blueprint_asset(guid_actor) == "/Game/BP/BP_Lamp.BP_Lamp_C")
+
+fake_sub_loaded = types.SimpleNamespace(
+    get_editor_property=lambda k: "/Game/Maps/Sub_Loaded" if k == "world_asset_package_name" else None,
+    is_level_loaded=lambda: True,
+)
+fake_sub_unloaded = types.SimpleNamespace(
+    get_editor_property=lambda k: "/Game/Maps/Sub_Unloaded" if k == "world_asset_package_name" else None,
+    is_level_loaded=lambda: False,
+)
+fake_wp_world = types.SimpleNamespace(
+    get_editor_property=lambda k: object() if k == "world_partition" else ([fake_sub_loaded, fake_sub_unloaded] if k == "streaming_levels" else None)
+)
+ws = EL.inspect_world_streaming(fake_wp_world)
+check("inspect_world_streaming detects World Partition and separates loaded/unloaded sublevels",
+      ws is not None and ws["is_world_partition"] is True
+      and ws["loaded_sublevels"] == ["/Game/Maps/Sub_Loaded"]
+      and ws["unloaded_sublevels"] == ["/Game/Maps/Sub_Unloaded"], ws)
+
 print("\n" + "=" * 60)
 if FAIL:
     print("FAILURES (%d): %s" % (len(FAIL), FAIL))

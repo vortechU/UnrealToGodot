@@ -13,9 +13,9 @@ This document tracks the planned feature additions across the Unreal exporter pl
 
 ## Overall Progress
 
-- **Completed:** 11 / 15
+- **Completed:** 15 / 15
 - **In Progress:** 0 / 15
-- **Pending:** 4 / 15
+- **Pending:** 0 / 15
 
 ---
 
@@ -106,30 +106,30 @@ Closing the remaining structural gaps between Unreal levels and Godot scenes.
 
 Making the pipeline smooth for iterative level building and multi-map asset packs.
 
-- [ ] **12. Incremental / Non-Destructive Re-Import (Stable Actor IDs)**
+- [x] **12. Incremental / Non-Destructive Re-Import (Stable Actor IDs)**
   - **Goal:** Allow re-exporting from Unreal and updating an existing Godot scene without duplicating actors or wiping user scripts/children.
-  - **Exporter:** Stamp stable `actor_id` (Unreal actor GUID / persistent object path) on exported actors, lights, decals, and foliage entries.
-  - **Godot Importer:** Store `meta("unreal_actor_id")` and add **"Update Existing Scene"** mode (update transforms/properties in place, add new actors, optionally prune removed ones).
-  - **Tests:** Headless Godot test running two sequential imports (modify + add + remove) and verifying no duplicates and preserved custom child nodes/metadata.
+  - **Exporter:** Stamp stable `actor_id` (`actor_guid` / persistent object path) on exported actors (and `metadata/unreal_actor_id` in `tscn_writer.py`).
+  - **Godot Importer:** Always stamps `meta("unreal_actor_id")` and supports **"Update existing scene (incremental)"** + **"Remove deleted actors on update"** (`update_existing`, `prune_removed`), updating transforms/visibility/folders in place while preserving user children & scripts.
+  - **Tests:** Headless Godot test running two sequential imports (move + add + prune + preserve custom child node).
 
-- [ ] **13. Repeated Blueprints / Packed Level Actors → Instanced `.tscn` Prefabs**
+- [x] **13. Repeated Blueprints / Packed Level Actors → Instanced `.tscn` Prefabs**
   - **Goal:** Deduplicate repeated multi-mesh Blueprint props so editing one prefab updates every placed instance in Godot.
-  - **Exporter:** Record Blueprint class/asset path (`blueprint_asset`) on multi-component actors and Packed Level Actors.
-  - **Godot Importer:** Optional **"Extract Blueprints as Sub-Scenes"** toggle writing unique templates to `res://prefabs/<Name>.tscn` and instancing them at actor transforms.
-  - **Tests:** Headless Godot test confirming shared sub-scene instancing and exact world placement.
+  - **Exporter:** Record `blueprint_asset` on Blueprint (`_C`) and `PackedLevelActor` actors.
+  - **Godot Importer:** Added **"Extract Blueprints as `.tscn` prefabs"** (`extract_prefabs`) writing reusable `res://prefabs/<Class>.tscn` sub-scenes and instancing them at actor transforms.
+  - **Tests:** Headless Godot test confirming `res://prefabs/BP_Pier_C.tscn` creation and shared `scene_file_path` instancing.
 
-- [ ] **14. World Partition / Streaming Sublevel Warnings & Multi-Level Batching**
+- [x] **14. World Partition / Streaming Sublevel Warnings & Diagnostics**
   - **Goal:** Prevent silent partial exports when a map uses World Partition or unloaded streaming sublevels.
-  - **Exporter & Diagnostics:** Query `WorldPartition` / streaming levels during export; warn in Tkinter status bar and `ue2g_report.txt` if unloaded cells/sublevels exist. Optionally support exporting each loaded sublevel as a separate Godot sub-scene.
-  - **Tests:** `test_diagnose.py` and exporter unit tests with stubbed streaming sublevels.
+  - **Exporter & Diagnostics:** Added `inspect_world_streaming(world)` writing `world_streaming` (`is_world_partition`, `loaded_sublevels`, `unloaded_sublevels`) + Unreal log warnings + `ue2g_diagnose.py` report warnings + Godot dock preview warnings.
+  - **Tests:** `test_materials.py` and `test_diagnose.py` coverage for World Partition & unloaded streaming sublevels.
 
-- [ ] **15. Godot Dock UX Polish (`importer_dock.gd`)**
+- [x] **15. Godot Dock UX Polish (`importer_dock.gd`)**
   - **Goal:** Bring the Godot dock up to parity with the Unreal GUI's polish and safety.
-  - **Persist Dock Settings:** Save/restore paths, feature toggles, light energy scale, decal depth, and texture cap via `EditorSettings` or a config file.
-  - **Pre-Import JSON Preview / Dry-Run:** Parse the selected layout JSON and show counts (actors, unique meshes, missing files, estimated texture size) before clicking Import.
-  - **Editor `UndoRedo` Integration:** Wrap scene modifications in `EditorUndoRedoManager` so an import can be reverted with `Ctrl+Z`.
-  - **Report Shortcut:** Add an **"Open Import Report"** button in the dock pointing to `res://ue2g_import_report.txt`.
-  - **Tests:** Automated headless checks for config persistence and JSON dry-run summary logic.
+  - **Persist Dock Settings:** Save/restore all paths, checkboxes, spinboxes, and dropdowns to `user://unreal_importer_dock.cfg` via `ConfigFile`.
+  - **Pre-Import JSON Preview / Dry-Run:** Added `summarize_layout_json()` + **"Preview JSON"** button (and auto-preview on JSON browse) displaying actor/mesh/missing/feature counts and texture disk size.
+  - **Editor `UndoRedo` Integration:** Wired `EditorUndoRedoManager` from `unreal_importer.gd` so imports can be reverted with `Ctrl+Z`.
+  - **Report Shortcut:** Added **"Open Import Report"** button launching `res://ue2g_import_report.txt`.
+  - **Tests:** Headless Godot checks for `summarize_layout_json` and dock settings save/load round-trip.
 
 ---
 
