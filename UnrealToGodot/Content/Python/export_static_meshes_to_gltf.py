@@ -170,9 +170,43 @@ def inject_texture_references(gltf_path, params_by_material, textures_rel="../te
         if normal:
             mat["normalTexture"] = {"index": texture_index(normal)}
 
+        emissive_tex = final_name(params, "emissive_texture")
+        if emissive_tex:
+            mat["emissiveTexture"] = {"index": texture_index(emissive_tex)}
+
+        emissive_color = params.get("emissive_color")
+        emissive_energy = params.get("emissive_energy", 1.0)
+        try:
+            emissive_energy = max(0.0, float(emissive_energy))
+        except (TypeError, ValueError):
+            emissive_energy = 1.0
+        if emissive_tex or (isinstance(emissive_color, (list, tuple)) and len(emissive_color) >= 3
+                            and max(_clamp01(emissive_color[0], 0.0),
+                                    _clamp01(emissive_color[1], 0.0),
+                                    _clamp01(emissive_color[2], 0.0)) > 0.0
+                            and emissive_energy > 0.0):
+            if isinstance(emissive_color, (list, tuple)) and len(emissive_color) >= 3:
+                ec = [_clamp01(emissive_color[i] * emissive_energy, 0.0) for i in range(3)]
+            else:
+                ec = [_clamp01(emissive_energy, 1.0)] * 3
+            mat["emissiveFactor"] = ec
+
+        blend_mode = str(params.get("blend_mode") or "opaque").lower()
+        if blend_mode == "masked":
+            mat["alphaMode"] = "MASK"
+            mat["alphaCutoff"] = _clamp01(params.get("opacity_mask_clip_value"), 0.3333)
+        elif blend_mode in ("translucent", "additive"):
+            mat["alphaMode"] = "BLEND"
+
+        if bool(params.get("two_sided", False)):
+            mat["doubleSided"] = True
+
         color = params.get("albedo_color")
         if isinstance(color, (list, tuple)) and len(color) >= 3:
             alpha = color[3] if len(color) > 3 else 1.0
+            opacity = params.get("opacity", 1.0)
+            if blend_mode in ("translucent", "additive") and opacity is not None:
+                alpha = _clamp01(alpha, 1.0) * _clamp01(opacity, 1.0)
             pbr["baseColorFactor"] = [_clamp01(color[0], 1.0), _clamp01(color[1], 1.0),
                                       _clamp01(color[2], 1.0), _clamp01(alpha, 1.0)]
 

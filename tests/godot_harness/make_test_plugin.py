@@ -563,6 +563,28 @@ func _test_materials(root: Node) -> void:
 	check("metallic scalar passes the map through (1.0, not the 0.0 default)",
 		is_equal_approx(bm.metallic, 1.0), str(bm.metallic))
 
+	# D: Phase 1 -- masked alpha cutout, two-sided culling, emissive, and normal Y-flip.
+	check("masked material uses TRANSPARENCY_ALPHA_SCISSOR",
+		bm.transparency == BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR, str(bm.transparency))
+	check("masked material preserves UE opacity_mask_clip_value",
+		absf(bm.alpha_scissor_threshold - 0.45) < 0.001, str(bm.alpha_scissor_threshold))
+	check("two-sided material disables backface culling",
+		bm.cull_mode == BaseMaterial3D.CULL_DISABLED, str(bm.cull_mode))
+	check("emissive material enables emission with multiply operator and energy",
+		bm.emission_enabled and bm.emission_texture != null
+		and bm.emission_operator == BaseMaterial3D.EMISSION_OP_MULTIPLY
+		and absf(bm.emission_energy_multiplier - 2.5) < 0.001,
+		"enabled=%s op=%s energy=%s" % [bm.emission_enabled, bm.emission_operator, bm.emission_energy_multiplier])
+
+	# Normal map .import flag: DX normal gets process/normal_map_invert_y=true,
+	# while OpenGL-authored (flip_green_channel=true) does not.
+	var dx_imp := FileAccess.get_file_as_string("res://textures/TX_Test_NRM.png.import")
+	check("DirectX normal map .import sets process/normal_map_invert_y=true",
+		dx_imp.contains("process/normal_map_invert_y=true"), dx_imp)
+	var gl_imp := FileAccess.get_file_as_string("res://textures/TX_Test_NRM_GL.png.import")
+	check("OpenGL-authored normal map does NOT invert Y again",
+		not gl_imp.contains("process/normal_map_invert_y=true"), gl_imp)
+
 
 func _dump(n: Node, depth: int) -> void:
 	var pos := ""

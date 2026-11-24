@@ -42,6 +42,9 @@ const DEFAULT_IMPORT_OPTIONS := {
 	"apply_navigation": true,
 	"navigation_bake": false,
 	"apply_metadata": true,
+	"flip_normal_green": true,
+	"save_external_materials": false,
+	"materials_folder": "res://materials/",
 	"light_energy_scale": 1.0,
 }
 
@@ -50,9 +53,14 @@ const DEFAULT_IMPORT_OPTIONS := {
 var USE_GDSCRIPT_TRANSFORM_CONVERSION: bool = false
 
 const ImportReport = preload("res://addons/unreal_importer/import_report.gd")
+const TextureLimit = preload("res://addons/unreal_importer/texture_import_limit.gd")
 
 # Material sharing cache
 var material_cache: Dictionary = {}
+var _normal_map_targets: Dictionary = {}
+var _alpha_merged_cache: Dictionary = {}
+var _external_normal_cache: Dictionary = {}
+var _external_mat_paths: Dictionary = {}
 var active_scene_root: Node
 var active_textures_folder: String
 var active_models_folder: String
@@ -132,6 +140,28 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 	var meshes_lib: Dictionary = data.get("meshes", {}) if data.get("meshes") is Dictionary else {}
 	print("Starting import of ", actors.size(), " actors from Unreal...")
 	material_cache.clear()
+	_normal_map_targets = _collect_normal_map_targets(data)
+	_alpha_merged_cache.clear()
+	_external_normal_cache.clear()
+	_external_mat_paths.clear()
+
+	# Configure DirectX -> OpenGL normal map Y-flip via Godot's non-destructive
+	# process/normal_map_invert_y import parameter before materials load them.
+	if not _normal_map_targets.is_empty():
+		var flip_enabled := bool(import_options.get("flip_normal_green", true))
+		var search_folders := [textures_folder, models_folder, json_path.get_base_dir().path_join("textures")]
+		var flip_res: Dictionary = TextureLimit.apply_normal_map_flip(
+			search_folders, _normal_map_targets, flip_enabled)
+		if int(flip_res.get("reimported", 0)) > 0 and Engine.is_editor_hint():
+			var fs := EditorInterface.get_resource_filesystem()
+			while fs and fs.is_scanning():
+				if scene_root and scene_root.get_tree():
+					await scene_root.get_tree().process_frame
+				else:
+					break
+		if int(flip_res.get("changed", 0)) > 0:
+			print("Unreal Importer: updated normal map Y-flip on %d/%d normal map(s) (enabled=%s)"
+				% [int(flip_res["changed"]), int(flip_res["total"]), str(flip_enabled)])
 	
 	var imported_count: int = 0
 	var missing_meshes: Dictionary = {}
@@ -843,6 +873,8 @@ func get_or_create_material(mat_name: String, mat_path: String, params: Dictiona
 	"""
 	Material instantiation cache manager. Reuses existing StandardMaterial3D/ORMMaterial3D instances
 	by path or name to preserve shared materials across mesh instances.
+	When options.save_external_materials is enabled, saves shared materials as reusable
+	res://materials/<name>.tres files and reuses already-saved .tres files on disk.
 	"""
 	var has_path := mat_path != "" and mat_path != "None"
 	var has_name := mat_name != "" and mat_name != "None"
@@ -850,22 +882,172 @@ func get_or_create_material(mat_name: String, mat_path: String, params: Dictiona
 		return material_cache[mat_path]
 	if has_name and material_cache.has(mat_name):
 		return material_cache[mat_name]
-		
+
+	var tres_path := ""
+	if bool(import_options.get("save_external_materials", false)) and (has_name or has_path):
+		tres_path = _external_material_res_path(mat_name, mat_path)
+		if tres_path != "" and ResourceLoader.exists(tres_path):
+			var existing_res = ResourceLoader.load(tres_path)
+			if existing_res is BaseMaterial3D:
+				if has_path:
+					material_cache[mat_path] = existing_res
+				elif has_name:
+					material_cache[mat_name] = existing_res
+				return existing_res as BaseMaterial3D
+
 	var mat = create_godot_material(params, existing_mat)
 	mat.resource_name = mat_name
-	
+
+	if tres_path != "":
+		var dir_global := ProjectSettings.globalize_path(tres_path.get_base_dir())
+		if dir_global != "":
+			DirAccess.make_dir_recursive_absolute(dir_global)
+		var save_err := ResourceSaver.save(mat, tres_path)
+		if save_err == OK:
+			var reloaded = ResourceLoader.load(tres_path)
+			if reloaded is BaseMaterial3D:
+				mat = reloaded as BaseMaterial3D
+		else:
+			push_warning("Unreal Importer: could not save external material %s (%s)"
+				% [tres_path, error_string(save_err)])
+
 	if has_path:
 		material_cache[mat_path] = mat
 	elif has_name:
 		material_cache[mat_name] = mat
-		
+
 	return mat
+
+
+func _external_material_res_path(mat_name: String, mat_path: String) -> String:
+	"""Returns a collision-safe res://materials/<name>.tres path for a material."""
+	var folder := str(import_options.get("materials_folder", "res://materials/"))
+	if not folder.begins_with("res://"):
+		return ""
+	var raw_stem := mat_name if (mat_name != "" and mat_name != "None") else mat_path.get_file().get_basename()
+	var safe := ""
+	for i in raw_stem.length():
+		var c := raw_stem.unicode_at(i)
+		var ch := raw_stem[i]
+		var ok := (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or (c >= 48 and c <= 57) or ch == "_" or ch == "-"
+		safe += ch if ok else "_"
+	safe = safe.strip_edges()
+	if safe == "":
+		safe = "Material"
+	var key := safe.to_lower()
+	var identity := mat_path if (mat_path != "" and mat_path != "None") else mat_name
+	if _external_mat_paths.has(key) and _external_mat_paths[key] != identity:
+		safe = "%s_%s" % [safe, identity.md5_text().substr(0, 8)]
+	else:
+		_external_mat_paths[key] = identity
+	return folder.path_join(safe + ".tres")
+
+
+func _collect_normal_map_targets(data: Dictionary) -> Dictionary:
+	"""Collects lowercase normal-map filename stems -> bool (should_invert_y).
+
+	Reads explicit `texture_metadata` first (carrying Unreal's own
+	`flip_green_channel` flag), and falls back to scanning normal_texture /
+	decal normal references so older v2 layouts without texture_metadata still
+	get DirectX -> OpenGL Y-flipping.
+	"""
+	var targets := {}
+	var tex_meta = data.get("texture_metadata")
+	if tex_meta is Dictionary:
+		for raw_name in tex_meta:
+			var entry = tex_meta[raw_name]
+			if entry is Dictionary and bool(entry.get("is_normal_map", false)):
+				var ue_flipped := bool(entry.get("flip_green_channel", false))
+				targets[str(raw_name).to_lower()] = not ue_flipped
+
+	# Fallback scan of material/decal normal slots (for layouts predating texture_metadata).
+	var record_normal := func(raw_name) -> void:
+		var s := _safe_str(raw_name)
+		if s == "":
+			return
+		var key := s.to_lower()
+		if not targets.has(key):
+			targets[key] = true
+
+	var meshes = data.get("meshes")
+	if meshes is Dictionary:
+		for mesh_entry in meshes.values():
+			if not (mesh_entry is Dictionary):
+				continue
+			for mat in (mesh_entry.get("materials") if mesh_entry.get("materials") is Array else []):
+				if mat is Dictionary and mat.get("parameters") is Dictionary:
+					record_normal.call(mat["parameters"].get("normal_texture"))
+	for actor in (data.get("actors") if data.get("actors") is Array else []):
+		if not (actor is Dictionary):
+			continue
+		for comp in (actor.get("components") if actor.get("components") is Array else []):
+			if not (comp is Dictionary):
+				continue
+			for ov in (comp.get("material_overrides") if comp.get("material_overrides") is Array else []):
+				if ov is Dictionary and ov.get("parameters") is Dictionary:
+					record_normal.call(ov["parameters"].get("normal_texture"))
+	for fol in (data.get("foliage") if data.get("foliage") is Array else []):
+		if not (fol is Dictionary):
+			continue
+		for ov in (fol.get("material_overrides") if fol.get("material_overrides") is Array else []):
+			if ov is Dictionary and ov.get("parameters") is Dictionary:
+				record_normal.call(ov["parameters"].get("normal_texture"))
+	for decal in (data.get("decals") if data.get("decals") is Array else []):
+		if decal is Dictionary and decal.get("textures") is Dictionary:
+			record_normal.call(decal["textures"].get("normal"))
+	return targets
+
+
+func _load_normal_texture(tex_path: String, tex_stem: String) -> Texture2D:
+	"""Loads a normal map, inverting green in memory for external (non-res://)
+	files that have no Godot .import file."""
+	var want_flip: bool = bool(import_options.get("flip_normal_green", true)) \
+		and bool(_normal_map_targets.get(tex_stem.to_lower(), true))
+	if not tex_path.begins_with("res://") and want_flip:
+		if _external_normal_cache.has(tex_path):
+			return _external_normal_cache[tex_path]
+		var img := Image.load_from_file(tex_path)
+		if img != null:
+			var flipped := TextureLimit.invert_green_channel(img)
+			var tex := ImageTexture.create_from_image(flipped)
+			_external_normal_cache[tex_path] = tex
+			return tex
+	return load_texture(tex_path)
+
+
+func _combine_albedo_and_opacity(albedo_path: String, opacity_path: String) -> Texture2D:
+	"""Packs a standalone grayscale Unreal opacity texture into the alpha channel
+	of albedo_texture (or white RGB if no albedo texture is set), since Godot's
+	StandardMaterial3D reads alpha exclusively from albedo_texture.a."""
+	var cache_key := "%s|%s" % [albedo_path, opacity_path]
+	if _alpha_merged_cache.has(cache_key):
+		return _alpha_merged_cache[cache_key]
+	var op_img := Common.load_image_file(opacity_path)
+	if op_img == null:
+		return null
+	var alb_img: Image = Common.load_image_file(albedo_path) if albedo_path != "" else null
+	var w := alb_img.get_width() if alb_img != null else op_img.get_width()
+	var h := alb_img.get_height() if alb_img != null else op_img.get_height()
+	if w <= 0 or h <= 0:
+		return null
+	if op_img.get_width() != w or op_img.get_height() != h:
+		op_img = op_img.duplicate()
+		op_img.resize(w, h, Image.INTERPOLATE_BILINEAR)
+	var out := Image.create(w, h, false, Image.FORMAT_RGBA8)
+	for y in h:
+		for x in w:
+			var rgb := alb_img.get_pixel(x, y) if alb_img != null else Color.WHITE
+			var a := op_img.get_pixel(x, y).r
+			out.set_pixel(x, y, Color(rgb.r, rgb.g, rgb.b, a))
+	var merged := ImageTexture.create_from_image(out)
+	_alpha_merged_cache[cache_key] = merged
+	return merged
+
 
 func create_godot_material(params: Dictionary, existing_mat: Material = null) -> BaseMaterial3D:
 	"""
 	Creates a new StandardMaterial3D (or duplicates existing_mat if it is a BaseMaterial3D),
-	maps Unreal scalar/vector settings to Godot, and attempts to find and bind
-	bulk-exported texture files in the textures or models directory.
+	maps Unreal scalar/vector/surface settings to Godot, and binds exported textures.
 	"""
 	var mat: BaseMaterial3D
 	if existing_mat and existing_mat is BaseMaterial3D:
@@ -897,28 +1079,63 @@ func create_godot_material(params: Dictionary, existing_mat: Material = null) ->
 		if tiling_raw.size() > 1 and (tiling_raw[1] is float or tiling_raw[1] is int):
 			tile_v = float(tiling_raw[1])
 	mat.uv1_scale = Vector3(tile_u, tile_v, 1.0)
-	
-	# 4. Find and load textures (Only override if a valid file path is resolved on disk)
+
+	# 4. Blend mode, alpha cutout, opacity & two-sided culling
+	var blend_mode := _safe_str(params.get("blend_mode")).to_lower()
+	match blend_mode:
+		"masked":
+			mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR
+			mat.alpha_scissor_threshold = clampf(
+				Common.get_num(params, "opacity_mask_clip_value", 0.3333), 0.0, 1.0)
+		"translucent":
+			mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+			var op := clampf(Common.get_num(params, "opacity", 1.0), 0.0, 1.0)
+			if op < 1.0:
+				mat.albedo_color.a *= op
+		"additive":
+			mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+			mat.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+			var op := clampf(Common.get_num(params, "opacity", 1.0), 0.0, 1.0)
+			if op < 1.0:
+				mat.albedo_color.a *= op
+	if bool(params.get("two_sided", false)):
+		mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+
+	# 5. Find and load textures (Only override if a valid file path is resolved on disk)
 	var albedo_tex: String = _safe_str(params.get("albedo_texture"))
 	var normal_tex: String = _safe_str(params.get("normal_texture"))
 	var roughness_tex: String = _safe_str(params.get("roughness_texture"))
 	var metallic_tex: String = _safe_str(params.get("metallic_texture"))
+	var opacity_tex: String = _safe_str(params.get("opacity_texture"))
+	var emissive_tex: String = _safe_str(params.get("emissive_texture"))
 	
 	# A texture the exporter named but that is not on disk used to fail in
 	# silence, leaving a flat material and no clue why. Every miss is recorded.
+	var albedo_path := ""
 	if albedo_tex != "":
-		var tex_path = find_texture_path(active_textures_folder, albedo_tex)
-		if tex_path != "":
-			var tex = load_texture(tex_path)
+		albedo_path = find_texture_path(active_textures_folder, albedo_tex)
+		if albedo_path != "":
+			var tex = load_texture(albedo_path)
 			if tex:
 				mat.albedo_texture = tex
 		else:
 			_note_missing_texture(albedo_tex)
 
+	# Separate opacity mask: Godot reads alpha from albedo_texture.a, so pack
+	# the grayscale opacity texture into albedo's alpha channel when needed.
+	if opacity_tex != "" and (blend_mode == "masked" or blend_mode == "translucent" or blend_mode == "additive"):
+		var opacity_path := find_texture_path(active_textures_folder, opacity_tex)
+		if opacity_path != "":
+			var merged := _combine_albedo_and_opacity(albedo_path, opacity_path)
+			if merged != null:
+				mat.albedo_texture = merged
+		else:
+			_note_missing_texture(opacity_tex)
+
 	if normal_tex != "":
 		var tex_path = find_texture_path(active_textures_folder, normal_tex)
 		if tex_path != "":
-			var tex = load_texture(tex_path)
+			var tex = _load_normal_texture(tex_path, normal_tex)
 			if tex:
 				mat.normal_enabled = true
 				mat.normal_texture = tex
@@ -942,6 +1159,35 @@ func create_godot_material(params: Dictionary, existing_mat: Material = null) ->
 				mat.metallic_texture = tex
 		else:
 			_note_missing_texture(metallic_tex)
+
+	# 6. Emissive map, colour & energy
+	var emissive_raw = params.get("emissive_color")
+	var has_emissive_color := false
+	var emissive_col := Color.BLACK
+	if emissive_raw is Array and emissive_raw.size() >= 3:
+		emissive_col = Common.color_from_array(emissive_raw, Color.BLACK)
+		has_emissive_color = maxf(emissive_col.r, maxf(emissive_col.g, emissive_col.b)) > 0.0
+	var emissive_energy := maxf(0.0, Common.get_num(params, "emissive_energy", 1.0))
+
+	if emissive_tex != "":
+		var tex_path := find_texture_path(active_textures_folder, emissive_tex)
+		if tex_path != "":
+			var tex := load_texture(tex_path)
+			if tex:
+				mat.emission_enabled = true
+				mat.emission_texture = tex
+				# Godot defaults to EMISSION_OP_ADD, which adds `emission` onto
+				# dark pixels of emission_texture. Multiply matches Unreal's
+				# EmissiveTexture * EmissiveColor shader idiom.
+				mat.emission_operator = BaseMaterial3D.EMISSION_OP_MULTIPLY
+				mat.emission = emissive_col if has_emissive_color else Color.WHITE
+				mat.emission_energy_multiplier = emissive_energy
+		else:
+			_note_missing_texture(emissive_tex)
+	elif has_emissive_color and emissive_energy > 0.0:
+		mat.emission_enabled = true
+		mat.emission = emissive_col
+		mat.emission_energy_multiplier = emissive_energy
 
 	_apply_packed_texture(mat, params)
 	return mat

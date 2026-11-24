@@ -47,6 +47,7 @@ read and write exactly these structures.
     "total_actors": 0,
     "total_mesh_instances": 0,
     "meshes": { "<mesh_key>": { ... } },
+    "texture_metadata": { "<texture_stem>": { "is_normal_map": true, "flip_green_channel": false } },
     "actors": [ ... ],
     "lights": [ ... ],
     "post_process": [ ... ],
@@ -95,9 +96,25 @@ for v1 files).
     "packed_texture": "TX_Foo_RMA" | null,   // one texture holding 3 channels
     "packed_channels": { "roughness": 0, "metallic": 1, "ao": 2 } | null,
     "tiling": [u, v],
+    "blend_mode": "opaque" | "masked" | "translucent" | "additive",
+    "two_sided": false,
+    "opacity": 1.0,                    // scalar 0..1 multiplied into translucent/additive alpha
+    "opacity_mask_clip_value": 0.3333, // UE OpacityMaskClipValue -> alpha_scissor_threshold
+    "opacity_texture": null,           // separate grayscale mask packed into albedo_texture.a
+    "emissive_color": [r, g, b] | null,
+    "emissive_texture": null,
+    "emissive_energy": 1.0,
     "texture_paths": { "albedo_texture": "/Game/Pack/T_Foo.T_Foo", ... }
 }
 ```
+
+**Normal map green-channel convention (`texture_metadata`).** Unreal exports raw
+source art, which uses DirectX tangent-space normals (`-Y` green) unless the
+texture's `flip_green_channel` flag is enabled in Unreal (meaning the source art
+was already authored as OpenGL `+Y`). `texture_metadata` records each normal map's
+`flip_green_channel` state by final exported filename stem so Godot can apply
+`process/normal_map_invert_y=true` non-destructively (and idempotently) only to
+DirectX normal maps, without ever double-flipping or mutating source PNGs.
 
 **Texture names are exported FILENAMES, not asset names.** Two different texture
 assets can share a name (two packs both shipping a `T_Concrete_D`); such names are

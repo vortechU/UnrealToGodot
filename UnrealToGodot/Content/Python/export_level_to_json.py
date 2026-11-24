@@ -222,6 +222,8 @@ def classify_packed_texture(param_name):
 _ROLE_SUBSTRINGS = (
     ("albedo_texture", ("albedo", "basecolor", "diff", "colour", "color", "maintex")),
     ("normal_texture", ("normal", "bump")),
+    ("emissive_texture", ("emissive", "emission", "glow")),
+    ("opacity_texture", ("opacity", "alpha", "translucen", "transparen")),
     ("roughness_texture", ("rough",)),
     ("metallic_texture", ("metal",)),
 )
@@ -232,6 +234,8 @@ _ROLE_LAST_TOKENS = (
     # No bare "c": packs name generic slots "Tex C", which is not a color map.
     ("albedo_texture", ("d", "alb", "bc", "col")),
     ("normal_texture", ("n", "nrm", "norm", "nor")),
+    ("emissive_texture", ("em", "emi", "emis")),
+    ("opacity_texture", ("op", "opa", "alp")),
     ("roughness_texture", ("r",)),
     ("metallic_texture", ("m",)),
 )
@@ -240,11 +244,14 @@ _ROLE_LAST_TOKENS = (
 # parameter name. "_B" for base colour is the dominant suffix in some packs
 # (TreatmentStation ships 41 of them) and must classify, but a material PARAMETER
 # called "Tex B" is a generic slot letter and means nothing -- the same trap the
-# bare-"c" note above records. Splitting the two candidate kinds lets the texture
-# name carry the convention without the parameter name inheriting the false
-# positive. ("bump" is caught by the substring pass before any of this runs.)
+# bare-"c" note above records. Same for "_E" (emissive) and "_O" (opacity).
+# Splitting the two candidate kinds lets the texture name carry the convention
+# without the parameter name inheriting the false positive. ("bump" is caught by
+# the substring pass before any of this runs.)
 _ROLE_LAST_TOKENS_TEXTURE_ONLY = (
     ("albedo_texture", ("b",)),
+    ("emissive_texture", ("e",)),
+    ("opacity_texture", ("a",)),
 )
 
 
@@ -305,16 +312,19 @@ def resolve_texture_role(param_name, tex_name):
 _TILING_TOKENS = ("tiling", "uvscale", "uv_scale", "uvtiling", "texturescale")
 
 # Vector parameters whose name contains "color" but which are NOT the base colour
-# tint. Without this, a material instance that only overrides "EmissiveColor"
-# (or SpecularColor, or "SSS Color") has that colour applied as the albedo tint of
-# every mesh using it -- the mesh comes into Godot stained with its glow colour.
-_NON_ALBEDO_VECTOR_TOKENS = ("emissive", "emission", "specular", "subsurface",
+# tint. Emissive vectors are routed to "emissive_color" before this filter;
+# remaining non-albedo vectors are dropped so they never stain albedo_color.
+_EMISSIVE_TOKENS = ("emissive", "emission", "glow")
+_NON_ALBEDO_VECTOR_TOKENS = ("specular", "subsurface",
                              "sss", "fresnel", "refraction", "rim")
 
 
 def classify_scalar_parameter(name):
     """Maps a scalar parameter name to its parameters[] key, else None."""
     lowered = str(name or "").lower()
+    for token in _EMISSIVE_TOKENS:
+        if token in lowered:
+            return "emissive_energy"
     if "roughness" in lowered or lowered == "rough":
         return "roughness"
     if "metallic" in lowered or lowered == "metal":
@@ -322,6 +332,11 @@ def classify_scalar_parameter(name):
     for token in _TILING_TOKENS:
         if token in lowered:
             return "tiling"
+    if ("clip" in lowered or "cutoff" in lowered or "scissor" in lowered) and (
+            "opacity" in lowered or "alpha" in lowered or "mask" in lowered):
+        return "opacity_mask_clip_value"
+    if "opacity" in lowered or lowered == "alpha" or lowered.endswith("_alpha"):
+        return "opacity"
     return None
 
 
@@ -330,11 +345,15 @@ def classify_vector_parameter(name):
 
     Tiling is checked before colour: "UV Tiling Color" style names exist, and a
     tiling parameter read as a tint is the more damaging misread of the two.
+    Emissive vectors are routed to "emissive_color" rather than "albedo_color".
     """
     lowered = str(name or "").lower()
     for token in _TILING_TOKENS:
         if token in lowered:
             return "tiling"
+    for token in _EMISSIVE_TOKENS:
+        if token in lowered:
+            return "emissive_color"
     for token in _NON_ALBEDO_VECTOR_TOKENS:
         if token in lowered:
             return None
@@ -342,6 +361,103 @@ def classify_vector_parameter(name):
             or "albedo" in lowered or "diffuse" in lowered):
         return "albedo_color"
     return None
+
+
+def _normalize_blend_mode(raw):
+    """Maps an Unreal EBlendMode enum / int / string to a schema blend_mode string."""
+    if raw is None:
+        return None
+    name = getattr(raw, "name", None)
+    text = str(name if name is not None else raw).upper()
+    if "MASK" in text or text == "1":
+        return "masked"
+    if "ADDITIVE" in text or text == "3":
+        return "additive"
+    if "TRANSLUCENT" in text or "ALPHA_COMPOSITE" in text or "MODULATE" in text or text in ("2", "4", "5"):
+        return "translucent"
+    if "OPAQUE" in text or text == "0":
+        return "opaque"
+    return None
+
+
+def _is_normal_map_texture(tex):
+    """Returns True when an Unreal Texture's compression/LOD settings mark it as a normal map."""
+    for prop in ("compression_settings", "lod_group"):
+        val = ue2g_common.safe_get_prop(tex, prop, None)
+        if val is None:
+            continue
+        name = getattr(val, "name", None)
+        text = str(name if name is not None else val).upper()
+        if "NORMALMAP" in text or "NORMAL_MAP" in text:
+            return True
+    return False
+
+
+def build_texture_metadata(collected_textures, texture_names, layout_data=None):
+    """Builds schema `texture_metadata` keyed by exported filename stem.
+
+    Records normal-map entries with Unreal's `flip_green_channel` flag:
+    - flip_green_channel == False (UE default): source art is DirectX (-Y), so
+      Godot should invert the green channel to match OpenGL (+Y).
+    - flip_green_channel == True: source art was authored OpenGL (+Y) and UE
+      flips it at cook time, so Godot must NOT invert it again.
+    """
+    meta = {}
+    tex_by_export_name = {}
+    for tex in (collected_textures or ()):
+        if tex is None:
+            continue
+        export_name = (texture_names or {}).get(tex)
+        if not export_name:
+            export_name = ue2g_common.sanitize_name(ue2g_common.safe_get_name(tex))
+        tex_by_export_name[export_name] = tex
+        if _is_normal_map_texture(tex):
+            flip_g = bool(ue2g_common.safe_get_prop(tex, "flip_green_channel", False))
+            meta[export_name] = {
+                "is_normal_map": True,
+                "flip_green_channel": flip_g,
+            }
+
+    # Also include any texture bound into a normal slot in the layout JSON, in
+    # case the texture asset left compression_settings at TC_Default.
+    if isinstance(layout_data, dict):
+        normal_names = set()
+        for mesh_entry in (layout_data.get("meshes") or {}).values():
+            for mat in (mesh_entry.get("materials") or []):
+                nt = (mat.get("parameters") or {}).get("normal_texture")
+                if nt:
+                    normal_names.add(str(nt))
+        for actor in (layout_data.get("actors") or []):
+            for comp in (actor.get("components") or []):
+                for ov in (comp.get("material_overrides") or []):
+                    nt = (ov.get("parameters") or {}).get("normal_texture")
+                    if nt:
+                        normal_names.add(str(nt))
+        for fol in (layout_data.get("foliage") or []):
+            for ov in (fol.get("material_overrides") or []):
+                nt = (ov.get("parameters") or {}).get("normal_texture")
+                if nt:
+                    normal_names.add(str(nt))
+        for decal in (layout_data.get("decals") or []):
+            nt = (decal.get("textures") or {}).get("normal")
+            if nt:
+                normal_names.add(str(nt))
+        for ls in (layout_data.get("landscapes") or []):
+            mat = ls.get("material")
+            if isinstance(mat, dict):
+                for t in (mat.get("textures") or []):
+                    if isinstance(t, dict) and t.get("role") == "normal" and t.get("texture"):
+                        normal_names.add(str(t["texture"]))
+
+        for name in normal_names:
+            if name not in meta:
+                tex = tex_by_export_name.get(name)
+                flip_g = bool(ue2g_common.safe_get_prop(tex, "flip_green_channel", False)) if tex else False
+                meta[name] = {
+                    "is_normal_map": True,
+                    "flip_green_channel": flip_g,
+                }
+    return meta
 
 
 def _path_of(asset):
@@ -440,14 +556,22 @@ def extract_material_parameters(material, collected_textures=None):
         "packed_texture": None,
         "packed_channels": None,
         "tiling": [1.0, 1.0],
+        "blend_mode": "opaque",
+        "two_sided": False,
+        "opacity": 1.0,
+        "opacity_mask_clip_value": 0.3333,
+        "opacity_texture": None,
+        "emissive_color": None,
+        "emissive_texture": None,
+        "emissive_energy": 1.0,
         "texture_paths": {}
     }
 
     visited = set()
-    # Tracks scalar/vector params that have been explicitly set, so the first
-    # (child-most) material that provides one wins — even if its value happens
-    # to equal a default (e.g. roughness exactly 0.5). Texture params already
-    # use a None sentinel below and need no tracking here.
+    # Tracks scalar/vector/surface params that have been explicitly set, so the
+    # first (child-most) material that provides one wins — even if its value
+    # happens to equal a default (e.g. roughness exactly 0.5). Texture params
+    # already use a None sentinel below and need no tracking here.
     assigned = set()
 
     def _assign_texture(param_name, tex):
@@ -472,6 +596,64 @@ def extract_material_parameters(material, collected_textures=None):
             parameters[key] = value
         assigned.add(key)
 
+    def _assign_vector(key, value):
+        if key is None or key in assigned:
+            return
+        try:
+            if key == "tiling":
+                parameters["tiling"] = [float(value.r), float(value.g)]
+            elif key == "emissive_color":
+                parameters["emissive_color"] = [float(value.r), float(value.g), float(value.b)]
+            else:
+                parameters["albedo_color"] = [float(value.r), float(value.g),
+                                              float(value.b), float(value.a)]
+            assigned.add(key)
+        except Exception:
+            pass
+
+    def _read_surface_properties(mat, is_instance):
+        """Reads blend_mode, two_sided, and opacity_mask_clip_value defensively."""
+        if is_instance:
+            bpo = ue2g_common.safe_get_prop(mat, "base_property_overrides", None)
+            if bpo is not None:
+                if "blend_mode" not in assigned and ue2g_common.safe_get_prop(bpo, "override_blend_mode", False):
+                    bm = _normalize_blend_mode(ue2g_common.safe_get_prop(bpo, "blend_mode", None))
+                    if bm is not None:
+                        parameters["blend_mode"] = bm
+                        assigned.add("blend_mode")
+                if "two_sided" not in assigned and ue2g_common.safe_get_prop(bpo, "override_two_sided", False):
+                    ts = ue2g_common.safe_get_prop(bpo, "two_sided", None)
+                    if ts is not None:
+                        parameters["two_sided"] = bool(ts)
+                        assigned.add("two_sided")
+                if "opacity_mask_clip_value" not in assigned and ue2g_common.safe_get_prop(bpo, "override_opacity_mask_clip_value", False):
+                    cv = ue2g_common.safe_get_prop(bpo, "opacity_mask_clip_value", None)
+                    if cv is not None:
+                        try:
+                            parameters["opacity_mask_clip_value"] = float(cv)
+                            assigned.add("opacity_mask_clip_value")
+                        except Exception:
+                            pass
+        else:
+            if "blend_mode" not in assigned:
+                bm = _normalize_blend_mode(ue2g_common.safe_get_prop(mat, "blend_mode", None))
+                if bm is not None:
+                    parameters["blend_mode"] = bm
+                    assigned.add("blend_mode")
+            if "two_sided" not in assigned:
+                ts = ue2g_common.safe_get_prop(mat, "two_sided", None)
+                if ts is not None:
+                    parameters["two_sided"] = bool(ts)
+                    assigned.add("two_sided")
+            if "opacity_mask_clip_value" not in assigned:
+                cv = ue2g_common.safe_get_prop(mat, "opacity_mask_clip_value", None)
+                if cv is not None:
+                    try:
+                        parameters["opacity_mask_clip_value"] = float(cv)
+                        assigned.add("opacity_mask_clip_value")
+                    except Exception:
+                        pass
+
     def _extract_recursive(mat, is_parent=False):
         if not mat or mat in visited:
             return
@@ -480,6 +662,8 @@ def extract_material_parameters(material, collected_textures=None):
         is_instance = isinstance(mat, unreal.MaterialInstance)
         if not is_instance and hasattr(unreal, "MaterialInstanceConstant"):
             is_instance = isinstance(mat, unreal.MaterialInstanceConstant)
+
+        _read_surface_properties(mat, is_instance)
 
         if not is_instance:
             # Base material: extract textures from its texture parameters. UE 5.7
@@ -505,18 +689,7 @@ def extract_material_parameters(material, collected_textures=None):
                 except Exception:
                     continue
             for pname, value in ue2g_common.iter_base_material_vectors(mat):
-                key = classify_vector_parameter(pname)
-                if key is None or key in assigned:
-                    continue
-                try:
-                    if key == "tiling":
-                        parameters["tiling"] = [float(value.r), float(value.g)]
-                    else:
-                        parameters["albedo_color"] = [float(value.r), float(value.g),
-                                                      float(value.b), float(value.a)]
-                except Exception:
-                    continue
-                assigned.add(key)
+                _assign_vector(classify_vector_parameter(pname), value)
             return
 
         # Material Instance: Parse overridden parameters
@@ -536,17 +709,8 @@ def extract_material_parameters(material, collected_textures=None):
             vectors = mat.get_editor_property("vector_parameter_values")
             if vectors:
                 for v in vectors:
-                    key = classify_vector_parameter(v.parameter_info.name)
-                    if key is None or key in assigned:
-                        continue
-                    val = v.parameter_value
-                    # A Vector2 material parameter arrives as a LinearColor with
-                    # the pair in .r/.g.
-                    if key == "tiling":
-                        parameters["tiling"] = [val.r, val.g]
-                    else:
-                        parameters["albedo_color"] = [val.r, val.g, val.b, val.a]
-                    assigned.add(key)
+                    _assign_vector(classify_vector_parameter(v.parameter_info.name),
+                                   v.parameter_value)
         except Exception:
             pass
 
@@ -1115,6 +1279,8 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
     # so rewrite the references to match the files that are about to be written.
     texture_names, texture_names_by_path = build_texture_export_names(collected_textures)
     finalize_layout_texture_names(layout_data, texture_names_by_path)
+    layout_data["texture_metadata"] = build_texture_metadata(
+        collected_textures, texture_names, layout_data)
 
     # Write to JSON file
     try:

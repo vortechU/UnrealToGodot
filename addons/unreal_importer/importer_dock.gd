@@ -19,6 +19,8 @@ var foliage_check: CheckBox
 var navigation_check: CheckBox
 var navigation_bake_check: CheckBox
 var metadata_check: CheckBox
+var flip_normal_green_check: CheckBox
+var save_external_mats_check: CheckBox
 var energy_scale_spin: SpinBox
 var decal_depth_spin: SpinBox
 var texture_limit_option: OptionButton
@@ -169,6 +171,8 @@ func _enter_tree() -> void:
 	navigation_check = _make_check(features,"Navigation Regions", "Create NavigationRegion3D nodes from Unreal NavMeshBoundsVolumes with matching agent settings.")
 	navigation_bake_check = _make_check(features,"    Bake navigation on import", "Bake the navigation meshes immediately after import (synchronous; can take a moment on large levels).", false)
 	metadata_check = _make_check(features,"Tags & Metadata", "Copy Unreal actor tags, classes and Blueprint variables onto nodes as metadata (get_meta()).")
+	flip_normal_green_check = _make_check(features,"Flip normal map green channel (DX -> GL)", "Converts Unreal DirectX (-Y) normal maps to Godot OpenGL (+Y) via Godot's non-destructive process/normal_map_invert_y import flag (skipping maps whose Unreal Flip Green Channel flag was already enabled).", true)
+	save_external_mats_check = _make_check(features,"Save shared materials as .tres files", "Writes shared StandardMaterial3D resources to res://materials/ and reuses existing .tres files on re-import, keeping .tscn files smaller and allowing cross-scene material edits.", false)
 
 	var energy_row := HBoxContainer.new()
 	var energy_lbl := Label.new()
@@ -518,6 +522,8 @@ func _on_import_pressed() -> void:
 		"apply_navigation": navigation_check.button_pressed,
 		"navigation_bake": navigation_bake_check.button_pressed,
 		"apply_metadata": metadata_check.button_pressed,
+		"flip_normal_green": flip_normal_green_check.button_pressed,
+		"save_external_materials": save_external_mats_check.button_pressed,
 		"light_energy_scale": energy_scale_spin.value,
 		"decal_min_depth_m": decal_depth_spin.value,
 	}

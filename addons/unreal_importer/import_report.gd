@@ -91,6 +91,10 @@ func audit_scene(root: Node) -> void:
 	var metal := 0
 	var ao := 0
 	var packed := 0
+	var emissive := 0
+	var alpha_masked := 0
+	var translucent := 0
+	var two_sided := 0
 	var out_of_range := 0
 	var out_of_range_example := ""
 
@@ -117,6 +121,14 @@ func audit_scene(root: Node) -> void:
 			# different channels. Sharing the resource is what proves it landed.
 			if bm.roughness_texture != null and bm.roughness_texture == bm.metallic_texture:
 				packed += 1
+			if bm.emission_enabled:
+				emissive += 1
+			if bm.transparency == BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR:
+				alpha_masked += 1
+			elif bm.transparency == BaseMaterial3D.TRANSPARENCY_ALPHA:
+				translucent += 1
+			if bm.cull_mode == BaseMaterial3D.CULL_DISABLED:
+				two_sided += 1
 			if bm.roughness < 0.0 or bm.roughness > 1.0:
 				out_of_range += 1
 				if out_of_range_example == "":
@@ -129,6 +141,14 @@ func audit_scene(root: Node) -> void:
 	_ratio("metallic texture", metal, slots)
 	_ratio("AO texture", ao, slots)
 	_ratio("packed map shared rough+metal", packed, slots)
+	if emissive > 0:
+		_ratio("emissive enabled", emissive, slots)
+	if alpha_masked > 0:
+		_ratio("alpha scissor (masked)", alpha_masked, slots)
+	if translucent > 0:
+		_ratio("translucent / additive", translucent, slots)
+	if two_sided > 0:
+		_ratio("two-sided (cull disabled)", two_sided, slots)
 
 	if slots > 0 and albedo == 0:
 		error("not one material slot got an albedo texture. If the layout JSON's "

@@ -344,7 +344,8 @@ def layout_texture_names(layout):
                 names.add(value)
 
     slots = ("albedo_texture", "normal_texture", "roughness_texture",
-             "metallic_texture", "packed_texture")
+             "metallic_texture", "packed_texture", "emissive_texture",
+             "opacity_texture")
     for mesh in (layout.get("meshes") or {}).values():
         for mat in mesh.get("materials", []) or []:
             _add(mat.get("parameters"), slots)

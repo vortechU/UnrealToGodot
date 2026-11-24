@@ -105,8 +105,11 @@ def write_png(path, rgb):
 
 # Source textures live in a SIBLING folder, exactly as the exporter lays them out.
 write_png(os.path.join(HARNESS, "textures", "TX_Test_ALB.png"), (200, 40, 40))
-write_png(os.path.join(HARNESS, "textures", "TX_Test_NRM.png"), (128, 128, 255))
+write_png(os.path.join(HARNESS, "textures", "TX_Test_NRM.png"), (128, 200, 255))
+write_png(os.path.join(HARNESS, "textures", "TX_Test_NRM_GL.png"), (128, 200, 255))
 write_png(os.path.join(HARNESS, "textures", "TX_Test_RMA.png"), (60, 200, 90))
+write_png(os.path.join(HARNESS, "textures", "TX_Test_EMI.png"), (255, 180, 40))
+write_png(os.path.join(HARNESS, "textures", "TX_Test_OPA.png"), (128, 128, 128))
 
 # --- minimal valid glTF: one triangle with UVs, buffer as a data URI ----------
 positions = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]
@@ -242,9 +245,20 @@ layout = {
                     "packed_texture": "TX_Test_RMA",
                     "packed_channels": {"roughness": 0, "metallic": 1, "ao": 2},
                     "tiling": [1.0, 1.0],
+                    "blend_mode": "masked",
+                    "two_sided": True,
+                    "opacity_mask_clip_value": 0.45,
+                    "opacity_texture": "TX_Test_OPA",
+                    "emissive_color": [0.5, 1.0, 0.25],
+                    "emissive_texture": "TX_Test_EMI",
+                    "emissive_energy": 2.5,
                 },
             }],
         },
+    },
+    "texture_metadata": {
+        "TX_Test_NRM": {"is_normal_map": True, "flip_green_channel": False},
+        "TX_Test_NRM_GL": {"is_normal_map": True, "flip_green_channel": True},
     },
     "actors": [
         {

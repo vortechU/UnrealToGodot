@@ -63,8 +63,10 @@ static func find_textures(folder: String) -> PackedStringArray:
 	return out
 
 
-static func _rewrite_import_file(import_path: String, size_limit: int) -> bool:
-	## Sets process/size_limit inside an existing .import file.
+static func _rewrite_import_param(import_path: String, param_key: String, value_str: String,
+		add_if_missing: bool = true) -> bool:
+	## Sets `<param_key>=<value_str>` inside the [params] section of an existing
+	## Godot .import file.
 	##
 	## Rewritten as text rather than through ConfigFile: a .import holds a
 	## [remap] section whose keys Godot regenerates, and round-tripping the
@@ -75,7 +77,8 @@ static func _rewrite_import_file(import_path: String, size_limit: int) -> bool:
 	if text == "":
 		return false
 
-	var target_line := "process/size_limit=%d" % size_limit
+	var prefix := param_key + "="
+	var target_line := "%s=%s" % [param_key, value_str]
 	var lines := text.split("\n")
 	var out: PackedStringArray = []
 	var in_params := false
@@ -84,17 +87,15 @@ static func _rewrite_import_file(import_path: String, size_limit: int) -> bool:
 	for line in lines:
 		var stripped := line.strip_edges()
 		if stripped.begins_with("["):
-			# Leaving [params] without having seen the key? Add it only when a
-			# non-zero limit is requested (Godot defaults absent size_limit to 0).
 			if in_params and not written:
-				if size_limit > 0:
+				if add_if_missing:
 					out.append(target_line)
 					changed = true
 				written = true
 			in_params = stripped == "[params]"
 			out.append(line)
 			continue
-		if in_params and stripped.begins_with("process/size_limit="):
+		if in_params and stripped.begins_with(prefix):
 			if stripped != target_line:
 				changed = true
 			out.append(target_line)
@@ -103,7 +104,7 @@ static func _rewrite_import_file(import_path: String, size_limit: int) -> bool:
 		out.append(line)
 
 	if in_params and not written:
-		if size_limit > 0:
+		if add_if_missing:
 			out.append(target_line)
 			changed = true
 		written = true
@@ -116,6 +117,77 @@ static func _rewrite_import_file(import_path: String, size_limit: int) -> bool:
 	f.store_string("\n".join(out))
 	f.close()
 	return true
+
+
+static func _rewrite_import_file(import_path: String, size_limit: int) -> bool:
+	## Sets process/size_limit inside an existing .import file.
+	## Godot defaults an absent size_limit to 0, so only insert when > 0.
+	return _rewrite_import_param(import_path, "process/size_limit", str(size_limit), size_limit > 0)
+
+
+static func apply_normal_map_flip(folders: Array, normal_targets: Dictionary,
+		flip_enabled: bool = true) -> Dictionary:
+	## Sets process/normal_map_invert_y on imported normal maps inside `folders`.
+	##
+	## `normal_targets` maps lowercase texture filename stem -> bool (true when
+	## the Unreal source art is DirectX -Y and needs Y inversion in Godot, false
+	## when Unreal's own flip_green_channel was already true so the source PNG is
+	## already OpenGL +Y).
+	##
+	## Non-destructive and idempotent: the source PNG bytes on disk are never
+	## mutated, so re-running import never double-flips a normal map, and
+	## unticking the dock option cleanly sets process/normal_map_invert_y=false.
+	var result := {"total": 0, "changed": 0, "reimported": 0}
+	if normal_targets.is_empty():
+		return result
+
+	var to_reimport := PackedStringArray()
+	var seen_paths := {}
+	for folder in folders:
+		var folder_str := str(folder)
+		if folder_str == "":
+			continue
+		for tex_path in find_textures(folder_str):
+			if seen_paths.has(tex_path):
+				continue
+			seen_paths[tex_path] = true
+			var stem := tex_path.get_file().get_basename().to_lower()
+			if not normal_targets.has(stem):
+				continue
+			result["total"] += 1
+			var want_invert: bool = flip_enabled and bool(normal_targets[stem])
+			var val_str := "true" if want_invert else "false"
+			if _rewrite_import_param(tex_path + ".import", "process/normal_map_invert_y",
+					val_str, want_invert):
+				to_reimport.append(tex_path)
+	result["changed"] = to_reimport.size()
+
+	var res_reimport := PackedStringArray()
+	for p in to_reimport:
+		if p.begins_with("res://"):
+			res_reimport.append(p)
+	if not res_reimport.is_empty() and Engine.is_editor_hint():
+		var fs := EditorInterface.get_resource_filesystem()
+		if fs:
+			fs.reimport_files(res_reimport)
+			result["reimported"] = res_reimport.size()
+	return result
+
+
+static func invert_green_channel(image: Image) -> Image:
+	## In-memory DirectX -> OpenGL Y-flip for external (non-res://) normal maps
+	## that have no Godot .import file. Returns a new Image with G = 1.0 - G.
+	if image == null:
+		return null
+	var out: Image = image.duplicate()
+	if out.is_compressed():
+		out.decompress()
+	for y in out.get_height():
+		for x in out.get_width():
+			var c := out.get_pixel(x, y)
+			c.g = 1.0 - c.g
+			out.set_pixel(x, y, c)
+	return out
 
 
 static func target_size(width: int, height: int, size_limit: int) -> Vector2i:

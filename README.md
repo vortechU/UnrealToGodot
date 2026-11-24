@@ -46,7 +46,7 @@ Both plugins stamp and verify a schema `format_version`. A mismatched plugin/add
 
 ### Materials, Lighting & Atmosphere
 
-- **PBR Material & Texture Binding** — Maps Unreal material parameters (albedo, normal, roughness, metallic, ORM/RMA, tiling) and auto-exported textures onto Godot `StandardMaterial3D` / `ORMMaterial3D` resources with case-insensitive file matching.
+- **PBR Material & Texture Binding** — Maps Unreal material parameters (albedo, normal, roughness, metallic, ORM/RMA, tiling, emissive, blend mode/alpha cutout, opacity masks, and two-sided culling) and auto-exported textures onto Godot `StandardMaterial3D` / `ORMMaterial3D` resources with case-insensitive file matching, non-destructive DirectX → OpenGL normal-map Y-flipping, and optional reusable `.tres` material saving.
 - **Lighting & Post-Processing** — Converts every light component (including lights nested inside Blueprint props, not only standalone light actors) into `DirectionalLight3D`, `OmniLight3D`, or `SpotLight3D`. Carries unit-normalized intensity (lumens, candela, unitless, EV, nits), linear color, cone angles, source size, specular/volumetric scattering, shadow distance, distance fade, and visibility. Translates `PostProcessVolume`, height fog, and sky settings into a Godot `WorldEnvironment` (bloom, SSAO, exposure, fog, sky, and color temperature).
 - **Decals** — Exports every decal component (including those on Blueprint props) as Godot `Decal` nodes preserving bounds, projection axis, textures, tint/opacity, visibility, sorting priority, and distance fade.
 

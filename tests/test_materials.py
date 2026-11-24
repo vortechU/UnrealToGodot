@@ -553,8 +553,8 @@ class _ValueParam:
         self.parameter_value = value
 
 
-check("'EmissiveColor' is NOT the albedo tint",
-      EL.classify_vector_parameter("EmissiveColor") is None)
+check("'EmissiveColor' routes to emissive_color, NOT albedo tint",
+      EL.classify_vector_parameter("EmissiveColor") == "emissive_color")
 check("'SpecularColor' is NOT the albedo tint",
       EL.classify_vector_parameter("SpecularColor") is None)
 check("'SSS Color' is NOT the albedo tint",
@@ -1692,6 +1692,136 @@ env_with_decals = EE.collect_environment([decal_actor], tex_when_on,
 check("enabling decals with lights off collects decals and their textures",
       len(env_with_decals["decals"]) == 1 and decal_tex in tex_when_on,
       (len(env_with_decals["decals"]), tex_when_on))
+
+print("\n=== 12. Phase 1: Blend modes, two-sided, emissive, opacity & normal-map metadata ===")
+check("emissive texture classified by parameter name",
+      EL.classify_texture_role("EmissiveMap") == "emissive_texture")
+check("emissive texture classified by trailing '_E' on texture asset only",
+      EL.classify_texture_role("T_Panel_E", is_texture_name=True) == "emissive_texture"
+      and EL.classify_texture_role("Tex E", is_texture_name=False) is None)
+check("opacity texture classified by parameter name",
+      EL.classify_texture_role("OpacityMask") == "opacity_texture")
+check("emissive scalar maps to emissive_energy",
+      EL.classify_scalar_parameter("EmissiveIntensity") == "emissive_energy")
+check("opacity scalar maps to opacity",
+      EL.classify_scalar_parameter("Opacity") == "opacity")
+check("clip scalar maps to opacity_mask_clip_value",
+      EL.classify_scalar_parameter("OpacityMaskClipValue") == "opacity_mask_clip_value")
+
+
+class _EnumVal:
+    def __init__(self, name):
+        self.name = name
+
+
+class _BasePropOverrides:
+    def __init__(self, **props):
+        self._p = props
+
+    def get_editor_property(self, key):
+        return self._p.get(key)
+
+
+class _SurfaceBaseMat:
+    """Standalone base-Material stub (avoids the shadowed _BaseMat at line 805)."""
+    def __init__(self, texparams, scalars=None, vectors=None, surface=None):
+        self._texparams = texparams or {}
+        self._scalarparams = scalars or {}
+        self._vectorparams = vectors or {}
+        self._surface = surface or {}
+
+    def get_editor_property(self, key):
+        if key in self._surface:
+            return self._surface[key]
+        if key == "expressions":
+            raise Exception("expressions is protected")
+        return None
+
+    def get_name(self):
+        return "M_Foliage_Master"
+
+
+foliage_base = _SurfaceBaseMat(
+    {"Diff": _Tex("T_Leaf_D"), "OpacityMask": _Tex("T_Leaf_A"), "Emissive": _Tex("T_Leaf_E")},
+    scalars={"EmissivePower": 2.5},
+    vectors={"EmissiveColor": _LC(0.2, 1.0, 0.4, 1.0)},
+    surface={"blend_mode": _EnumVal("BLEND_MASKED"), "two_sided": True, "opacity_mask_clip_value": 0.45},
+)
+fp = EL.extract_material_parameters(foliage_base)
+check("base material masked blend_mode extracted", fp["blend_mode"] == "masked", fp["blend_mode"])
+check("base material two_sided extracted", fp["two_sided"] is True, fp["two_sided"])
+check("base material opacity_mask_clip_value extracted",
+      abs(fp["opacity_mask_clip_value"] - 0.45) < 1e-6, fp["opacity_mask_clip_value"])
+check("base material opacity_texture extracted", fp["opacity_texture"] == "T_Leaf_A", fp["opacity_texture"])
+check("base material emissive_texture extracted", fp["emissive_texture"] == "T_Leaf_E", fp["emissive_texture"])
+check("base material emissive_color extracted without staining albedo",
+      fp["emissive_color"] == [0.2, 1.0, 0.4] and fp["albedo_color"] == [1.0, 1.0, 1.0, 1.0],
+      (fp["emissive_color"], fp["albedo_color"]))
+check("base material emissive_energy extracted", abs(fp["emissive_energy"] - 2.5) < 1e-6, fp["emissive_energy"])
+
+# MaterialInstance base_property_overrides must override parent base material.
+glass_mi = _MI({
+    "texture_parameter_values": [],
+    "scalar_parameter_values": [_ValueParam("Opacity", 0.35)],
+    "vector_parameter_values": [],
+    "base_property_overrides": _BasePropOverrides(
+        override_blend_mode=True, blend_mode=_EnumVal("BLEND_TRANSLUCENT"),
+        override_two_sided=True, two_sided=False,
+    ),
+    "parent": foliage_base,
+})
+gp = EL.extract_material_parameters(glass_mi)
+check("MI base_property_overrides blend_mode overrides parent",
+      gp["blend_mode"] == "translucent", gp["blend_mode"])
+check("MI base_property_overrides two_sided=False overrides parent True",
+      gp["two_sided"] is False, gp["two_sided"])
+check("MI opacity scalar extracted", abs(gp["opacity"] - 0.35) < 1e-6, gp["opacity"])
+
+# glTF preview injection writes alphaMode, alphaCutoff, doubleSided, and emissive.
+p1_gltf = os.path.join(tmp, "phase1_mat.gltf")
+with open(p1_gltf, "w", encoding="utf-8") as f:
+    json.dump({"asset": {"version": "2.0"},
+               "materials": [{"name": "M_Leaf"}, {"name": "M_Glass"}]}, f)
+EX.inject_texture_references(p1_gltf, {"M_Leaf": fp, "M_Glass": gp}, "../textures")
+with open(p1_gltf, encoding="utf-8") as f:
+    p1_doc = json.load(f)
+m_leaf, m_glass = p1_doc["materials"][0], p1_doc["materials"][1]
+check("glTF masked material gets alphaMode=MASK and alphaCutoff",
+      m_leaf.get("alphaMode") == "MASK" and abs(m_leaf.get("alphaCutoff", 0) - 0.45) < 1e-6, m_leaf)
+check("glTF two-sided material gets doubleSided=True", m_leaf.get("doubleSided") is True, m_leaf)
+check("glTF emissive material wires emissiveTexture + emissiveFactor",
+      "emissiveTexture" in m_leaf and m_leaf.get("emissiveFactor") == [0.5, 1.0, 1.0], m_leaf)
+check("glTF translucent material gets alphaMode=BLEND and opacity in baseColorFactor.a",
+      m_glass.get("alphaMode") == "BLEND"
+      and abs(m_glass["pbrMetallicRoughness"]["baseColorFactor"][3] - 0.35) < 1e-6, m_glass)
+
+
+class _NormalTex(_Tex):
+    def __init__(self, name, compression="TC_NORMALMAP", flip_green=False):
+        _Tex.__init__(self, name)
+        self._props = {
+            "compression_settings": _EnumVal(compression),
+            "flip_green_channel": flip_green,
+        }
+
+    def get_editor_property(self, key):
+        return self._props.get(key)
+
+
+n_dx = _NormalTex("T_Wall_N", compression="TC_NORMALMAP", flip_green=False)
+n_gl = _NormalTex("T_Trim_N", compression="TC_NORMALMAP", flip_green=True)
+n_slot_only = _NormalTex("T_Loose_N", compression="TC_DEFAULT", flip_green=False)
+tex_meta = EL.build_texture_metadata(
+    [n_dx, n_gl, n_slot_only],
+    {n_dx: "T_Wall_N", n_gl: "T_Trim_N", n_slot_only: "T_Loose_N"},
+    {"meshes": {"SM_A": {"materials": [{"parameters": {"normal_texture": "T_Loose_N"}}]}}},
+)
+check("DirectX normal map recorded with flip_green_channel=False",
+      tex_meta.get("T_Wall_N") == {"is_normal_map": True, "flip_green_channel": False}, tex_meta)
+check("OpenGL-authored normal map preserves flip_green_channel=True",
+      tex_meta.get("T_Trim_N") == {"is_normal_map": True, "flip_green_channel": True}, tex_meta)
+check("normal slot fallback catches TC_DEFAULT normal maps too",
+      tex_meta.get("T_Loose_N") == {"is_normal_map": True, "flip_green_channel": False}, tex_meta)
 
 print("\n" + "=" * 60)
 if FAIL:

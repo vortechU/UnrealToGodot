@@ -687,6 +687,21 @@ ssao_written = float(re.search(r"ssao_intensity = ([0-9.eE+-]+)", env_blk).group
 assert abs(ssao_written - 1.0) < 1e-9, f"ao_intensity 0.5 must double to 1.0, got {ssao_written}"
 print("environment block OK: tonemap ACES, fog 0.02->0.01, ssao 0.5->1.0")
 
+# Pin Phase 1 addon material/normal-flip/external-.tres contracts so nothing drifts.
+LAYOUT_GD_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "addons", "unreal_importer", "import_unreal_layout.gd")
+TEX_LIM_GD_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "addons", "unreal_importer", "texture_import_limit.gd")
+layout_gd = io.open(LAYOUT_GD_PATH, encoding="utf-8").read()
+tex_lim_gd = io.open(TEX_LIM_GD_PATH, encoding="utf-8").read()
+for marker in ("TRANSPARENCY_ALPHA_SCISSOR", "TRANSPARENCY_ALPHA", "BLEND_MODE_ADD",
+               "CULL_DISABLED", "EMISSION_OP_MULTIPLY", "emission_energy_multiplier",
+               "save_external_materials", "flip_normal_green"):
+    assert marker in layout_gd, "import_unreal_layout.gd missing Phase 1 marker %r" % marker
+assert "process/normal_map_invert_y" in tex_lim_gd, \
+    "texture_import_limit.gd missing process/normal_map_invert_y"
+print("Phase 1 addon material/normal/tres markers OK")
+
 print(f"OK: {ext_count} ext_resources, {sub_count} sub_resources, {len(nodes)} nodes, load_steps={load_steps}")
 print("--- excerpt ---")
 print("\n".join(text.splitlines()[:40]))
