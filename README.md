@@ -43,7 +43,7 @@ Both plugins stamp and verify a schema `format_version`. A mismatched plugin/add
 - **Physics & Skeletal Ragdoll Extraction** — Converts Unreal static-mesh collision primitives (Boxes, Spheres, Capsules, and Convex Hulls) into `CollisionShape3D` nodes under `StaticBody3D` (baking non-uniform scale into shapes so Jolt never logs errors or averages axes), and rebuilds exported skeletal `UPhysicsAsset` (`_physics.json`) bodies onto `Skeleton3D` via `PhysicalBoneSimulator3D` + `PhysicalBone3D`.
 - **Blueprint & Multi-Component Actors** — Reconstructs complex Blueprint actors as a parent `Node3D` with each component placed at its relative transform offset.
 - **Clean, Grouped Scene Tree & Outliner Folders** — Organizes imported nodes into dedicated containers (`UnrealStaticMeshes`, `UnrealLights`, `UnrealDecals`, `UnrealReflectionProbes`, `UnrealCameras`, `UnrealAudio`, `UnrealFoliage`, and `UnrealNavigation`) and optionally mirrors Unreal's World Outliner folder hierarchy as nested `Node3D` groups.
-- **Spline Meshes, Reflection Probes, Cameras & Ambient Audio** — Deforms `SplineMeshComponent` geometry along cubic Hermite curves (roads, pipes, cables), converts Box/Sphere reflection captures into `ReflectionProbe` nodes, exports `CameraActor`/`CineCameraActor` with exact horizontal FOV (`KEEP_WIDTH`), and optionally transfers `AmbientSound` / `SoundWave` (`.wav`) to `AudioStreamPlayer3D`.
+- **Spline Meshes, Cables, Reflection Probes, Cameras & Ambient Audio** — Deforms `SplineMeshComponent` geometry along cubic Hermite curves (roads, pipes), rebuilds hanging `CableComponent` wires as meshes, converts Box/Sphere reflection captures into `ReflectionProbe` nodes, exports `CameraActor`/`CineCameraActor` with exact horizontal FOV (`KEEP_WIDTH`), and optionally transfers `AmbientSound` / `SoundWave` (`.wav`) to `AudioStreamPlayer3D`.
 - **Incremental Re-Import & Blueprint Prefabs** — Stamps stable Unreal actor IDs so re-importing into an existing scene can update transforms/metadata in place without duplicating nodes or wiping Godot scripts/children, and optionally extracts repeated multi-component Blueprints into shared `res://prefabs/*.tscn` sub-scenes.
 
 ### Materials, Lighting & Atmosphere
@@ -184,7 +184,7 @@ If you enabled **Generate Godot `.tscn` scene directly** during export, open the
 - **Foliage:** Click **Bind Foliage Meshes (`.tscn` scenes)** once in the Unreal Importer dock. Because `.tscn` files cannot directly reference meshes nested inside glTF scenes, this binds each foliage MultiMesh in place using its `source_model` metadata.
 - **Landscapes:** Landscapes appear as placeholder `Node3D` nodes storing the heightmap/weightmap metadata (a text scene cannot decode float EXRs into geometry). Run a dock import with only **Terrain** enabled to build them, or import the `terrain/*.exr` files directly through your terrain plugin.
 
-The direct scene uses the materials inside the glTF files, so it does not carry per-placement material overrides, packed roughness/metallic maps, texture tiling, decal atlas crops, vertex paint, LOD chains, spline bending, or per-mesh shadow and draw-distance settings. For those, import the layout JSON through the dock instead.
+The direct scene uses the materials inside the glTF files, so it does not carry per-placement material overrides, packed roughness/metallic maps, texture tiling, decal atlas crops, vertex paint, LOD chains, spline bending, cables, or per-mesh shadow and draw-distance settings. For those, import the layout JSON through the dock instead.
 
 ---
 

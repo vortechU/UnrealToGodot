@@ -558,7 +558,7 @@ def build_texture_metadata(collected_textures, texture_names, layout_data=None):
                     nt = (ov.get("parameters") or {}).get("normal_texture")
                     if nt:
                         normal_names.add(str(nt))
-        for fol in (layout_data.get("foliage") or []):
+        for fol in (layout_data.get("foliage") or []) + (layout_data.get("cables") or []):
             for ov in (fol.get("material_overrides") or []):
                 nt = (ov.get("parameters") or {}).get("normal_texture")
                 if nt:
@@ -633,7 +633,7 @@ def finalize_layout_texture_names(layout_data, name_by_path):
         for comp in (actor.get("components") or []):
             for override in (comp.get("material_overrides") or []):
                 apply_texture_export_names(override.get("parameters"), name_by_path)
-    for foliage in (layout_data.get("foliage") or []):
+    for foliage in (layout_data.get("foliage") or []) + (layout_data.get("cables") or []):
         for override in (foliage.get("material_overrides") or []):
             apply_texture_export_names(override.get("parameters"), name_by_path)
     for decal in (layout_data.get("decals") or []):
@@ -1278,6 +1278,49 @@ def extract_spline_mesh_params(comp):
     }
 
 
+def collect_cables(all_actors, collected_textures=None):
+    """The level's CableComponents, as the line each one currently hangs along."""
+    cable_cls = getattr(unreal, "CableComponent", None)
+    if cable_cls is None:
+        return []
+    cables = []
+    for actor in all_actors:
+        if actor is None:
+            continue
+        try:
+            comps = list(actor.get_components_by_class(cable_cls) or [])
+        except Exception:
+            continue
+        for comp in comps:
+            try:
+                if ue2g_common.safe_get_prop(comp, "is_editor_only", False):
+                    continue
+                points = [ue2g_common.vector_to_godot(p)
+                          for p in (comp.get_cable_particle_locations() or [])]
+                flags = extract_component_render_flags(comp, actor)
+                if len(points) < 2 or not flags["visible"]:
+                    continue
+                material = comp.get_material(0)
+                cables.append({
+                    "name": "%s_%s" % (actor.get_actor_label(), comp.get_name()),
+                    "points": points,
+                    "width_m": float(ue2g_common.safe_get_prop(comp, "cable_width", 10.0)) * ue2g_common.CM_TO_M,
+                    "sides": int(ue2g_common.safe_get_prop(comp, "num_sides", 4)),
+                    "tile_material": float(ue2g_common.safe_get_prop(comp, "tile_material", 1.0)),
+                    "cast_shadow": flags["cast_shadow"],
+                    "max_draw_distance_m": flags["max_draw_distance_m"],
+                    "material_overrides": [{
+                        "slot_index": 0,
+                        "material_name": material.get_name(),
+                        "material_path": material.get_path_name(),
+                        "parameters": extract_material_parameters(material, collected_textures),
+                    }] if material else [],
+                })
+            except Exception as e:
+                unreal.log_warning(f"Could not export a cable of {ue2g_common.safe_get_name(actor)}: {str(e)}")
+    return cables
+
+
 def extract_actor_folder_path(actor):
     """Returns normalized World Outliner folder path (e.g. 'Architecture/Walls') or ''."""
     if actor is None or not hasattr(actor, "get_folder_path"):
@@ -1868,6 +1911,8 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
         except Exception as e:
             unreal.log_warning(f"Foliage export failed: {str(e)}")
 
+    cables_data = collect_cables(all_actors, collected_textures)
+
     navigation_data = None
     if gameplay_mod and opts.get("navigation"):
         try:
@@ -1909,6 +1954,7 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
         "audio": environment_data.get("audio", []),
         "landscapes": landscapes_data,
         "foliage": foliage_data,
+        "cables": cables_data,
         "navigation": navigation_data
     }
     if world_streaming is not None:

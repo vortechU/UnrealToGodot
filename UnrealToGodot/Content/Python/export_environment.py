@@ -1425,6 +1425,63 @@ def _decal_modulate(comp, params, material):
     return [max(0.0, c) for c in modulate]
 
 
+def _decal_color_grade(material):
+    """
+    (brightness, hue shift) the graph applies between a decal's albedo sample and
+    its base color. (1.0, 0.0) when it applies none or the engine cannot say.
+
+    Wall-paint packs grade one shared atlas per decal this way. Vector tints are
+    not read here: extract_material_parameters already has them.
+    """
+    base = _base_material_of(material)
+    mel = getattr(unreal, "MaterialEditingLibrary", None)
+    prop = getattr(getattr(unreal, "MaterialProperty", None), "MP_BASE_COLOR", None)
+    if base is None or prop is None or not hasattr(mel, "get_inputs_for_material_expression"):
+        return 1.0, 0.0
+    graph = ue2g_common.MaterialGraph(base)
+    kind = ue2g_common.node_kind
+
+    def has_sample(node, depth=0):
+        if kind(node).startswith("TextureSample"):
+            return True
+        return depth < 12 and any(has_sample(c, depth + 1) for _n, c, _o in graph.inputs(node))
+
+    def scalar(node):
+        if kind(node) == "Constant":
+            return _f(ue2g_common.safe_get_prop(node, "r", 1.0), 1.0)
+        if kind(node) == "ScalarParameter":
+            return _decal_scalar_param(
+                material, base, str(ue2g_common.safe_get_prop(node, "parameter_name", "")))
+        return None
+
+    brightness, hue = 1.0, 0.0
+    node = mel.get_material_property_input_node(base, prop)
+    for _step in range(12):
+        if node is None or kind(node).startswith("TextureSample"):
+            break
+        inputs = list(graph.inputs(node))
+        color = [c for _n, c, _o in inputs if has_sample(c)]
+        rest = [c for _n, c, _o in inputs if not has_sample(c)]
+        if len(color) != 1:
+            break
+        value = scalar(rest[0]) if len(rest) == 1 else None
+        if kind(node) == "Multiply":
+            if not rest:
+                value = _f(ue2g_common.safe_get_prop(
+                    node, "const_b" if inputs[0][0] == "A" else "const_a", 1.0), 1.0)
+            if value is not None:
+                brightness *= max(value, 0.0)
+        elif kind(node) == "MaterialFunctionCall":
+            function = ue2g_common.safe_get_prop(node, "material_function", None)
+            if ue2g_common.safe_get_name(function) != "HueShift":
+                break
+            hue += value or 0.0
+        elif kind(node) not in ("Clamp", "Saturate", "Desaturation", "Reroute"):
+            break
+        node = color[0]
+    return brightness, hue % 1.0
+
+
 def _bake_decal_scale(size_m, godot_transform):
     """
     Moves a decal's scale into its size, leaving only the sign behind (a mirror).
@@ -1592,6 +1649,14 @@ def _build_decal_entry(actor, comp, name, collected_textures):
                 textures["flip_v"] = flip_v
         except Exception as e:
             _log_actor_warning(actor, "failed to read decal atlas crop", e)
+        try:
+            brightness, hue = _decal_color_grade(material)
+            if abs(brightness - 1.0) > 1e-3:
+                textures["brightness"] = brightness
+            if 1e-3 < hue < 1.0 - 1e-3:
+                textures["hue_shift"] = hue
+        except Exception as e:
+            _log_actor_warning(actor, "failed to read decal color grade", e)
 
     godot_transform = _decal_transform(_component_world_transform(actor, comp))
     fade_begin, fade_length = _decal_distance_fade(

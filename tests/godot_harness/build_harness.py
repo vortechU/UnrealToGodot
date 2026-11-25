@@ -495,6 +495,18 @@ layout = {
             "aspect_ratio": 1.777778,
         },
     ],
+    "cables": [
+        {
+            "name": "Post_Cable",
+            "points": [[1, 5, 0], [1, 4.5, -2], [1, 5, -4]],
+            "width_m": 0.1, "sides": 5, "tile_material": 10.0,
+            "cast_shadow": False, "max_draw_distance_m": 40.0,
+            "material_overrides": [{
+                "slot_index": 0, "material_name": "MI_Cable", "material_path": "/Game/MI_Cable.MI_Cable",
+                "parameters": {"albedo_color": [0.1, 0.2, 0.3, 1.0], "roughness": 0.4, "metallic": 0.0},
+            }],
+        },
+    ],
     "audio": [
         {
             "name": "AmbientWind",

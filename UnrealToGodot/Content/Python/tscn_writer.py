@@ -1020,6 +1020,9 @@ class _TscnWriter(object):
         if self.options.get("audio", True):
             self._build_audio(self._container(root_path, AUDIO_CONTAINER,
                                               self.layout.get("audio")))
+        if self.layout.get("cables"):
+            _warn("%d cable(s) skipped: their meshes cannot be baked into a static .tscn; "
+                  "use the Godot addon importer." % len(self.layout["cables"]))
         if self.options.get("foliage"):
             self._build_foliage(self._container(root_path, FOLIAGE_CONTAINER,
                                                 self.layout.get("foliage"), [NAV_SOURCE_GROUP]))
@@ -1371,6 +1374,7 @@ class _TscnWriter(object):
 
         if self._uses_lumen():
             env_lines.append("sdfgi_enabled = true")
+            env_lines.append("sdfgi_y_scale = 2")
             env_lines.append("ssr_enabled = true")
             env_lines.append("ssr_fade_out = 0.0")
 
@@ -1469,6 +1473,7 @@ class _TscnWriter(object):
                     size, decal.get("godot_transform"),
                     self.options.get("decal_min_depth_m", DEFAULT_DECAL_MIN_DEPTH_M))
                 props.append("size = " + _vec3_literal(size))
+            props += ["upper_fade = 0.01", "lower_fade = 0.01"]
             if decal.get("sort_order") is not None:
                 props.append("sorting_offset = " + _f(_num(decal.get("sort_order"))))
             # Mirrors import_environment.gd's _apply_decals -- the two paths must
@@ -1478,6 +1483,9 @@ class _TscnWriter(object):
                 props.append("visible = false")
             modulate = decal.get("modulate")
             if isinstance(modulate, (list, tuple)) and modulate:
+                # The addon bakes the grade into the texture, which clamps at white.
+                grade = max(0.0, _num((decal.get("textures") or {}).get("brightness"), 1.0))
+                modulate = [_num(c) * grade for c in modulate[:3]] + list(modulate[3:])
                 props.append("modulate = " + _color_literal(modulate))
             fade_begin = decal.get("distance_fade_begin_m")
             fade_length = decal.get("distance_fade_length_m")
@@ -1496,6 +1504,9 @@ class _TscnWriter(object):
                       "writer cannot bake -- the whole atlas will be bound. Use the "
                       "Godot addon importer for this level's decals."
                       % (name, textures.get("uv_rect")))
+            if textures.get("hue_shift"):
+                _warn("decal '%s': material shifts the hue of its texture, which the .tscn "
+                      "writer cannot bake. Use the Godot addon importer." % name)
             for tex_key, godot_prop in (("albedo", "texture_albedo"), ("normal", "texture_normal"),
                                         ("orm", "texture_orm"), ("emission", "texture_emission")):
                 tex_name = textures.get(tex_key)

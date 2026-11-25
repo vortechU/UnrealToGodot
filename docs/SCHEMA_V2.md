@@ -62,6 +62,7 @@ read and write exactly these structures.
     "audio": [ ... ],
     "landscapes": [ ... ],
     "foliage": [ ... ],
+    "cables": [ ... ],
     "navigation": { ... } | null,
     "world_streaming": { "is_world_partition": false, "loaded_sublevels": [...], "unloaded_sublevels": [...] } // optional
 }
@@ -424,7 +425,8 @@ and lights the scene with `gradient * intensity * color`. Without a gradient:
 `gi_method` `"lumen"` turns on `Environment.sdfgi_enabled` and screen-space reflections
 (`ssr_fade_out` 0: the default stops a few meters out, Lumen does not), and sets reflection probes to
 `AMBIENT_DISABLED`: in Unreal a capture only reflects, while Godot's probes would replace
-SDFGI's ambient. SDFGI needs the Forward+ renderer.
+SDFGI's ambient. `sdfgi_y_scale` is 100%: the default squashes the probes vertically, which
+loses bounced light in streets and alleys. SDFGI needs the Forward+ renderer.
 
 ## decals
 
@@ -443,6 +445,7 @@ SDFGI's ambient. SDFGI needs the Forward+ renderer.
     "textures": { "albedo": "T_Blood" | null, "normal": null, "orm": null, "emission": null,
                   "uv_rect": [u0, v0, w, h],   // atlas crop; ABSENT when the whole texture is used
                   "flip_u": false, "flip_v": false,
+                  "brightness": 1.5, "hue_shift": 0.2,   // ABSENT when 1 and 0
                   "texture_paths": { "albedo": "/Game/Pack/T_Blood.T_Blood", ... } }
 }
 ```
@@ -527,12 +530,16 @@ Godot's decal atlas keys off the texture's RID and ignores the region. The addon
 in `import_environment.gd`'s `_crop_decal_texture`, caching by (path, rect, flips) so decals
 sharing a cell share one texture. The `.tscn` writer cannot bake pixels and warns instead.
 
-Deliberately **not** mapped: Godot's `upper_fade`/`lower_fade` are left at their engine
-defaults (0.3 each, confirmed against 4.7.1). UE clips hard at the decal box, so a faithful
-import would zero them, but the soft falloff is what keeps projections onto curved geometry
-from showing a hard seam. Zeroing them was tested on a GPU as a fix for the shredding
-described below and made **no measurable difference** (2103 px of decal vs 2107), so they
-are not the lever they look like.
+`brightness` and `hue_shift` (a fraction of a turn) are what the graph does to the albedo
+sample on its way to the base color: scalars it is multiplied by, and Unreal's `HueShift`
+function. Wall-paint packs grade one shared atlas per decal this way. They are absent when
+the graph does neither. The addon bakes both into the cropped texture, where they clamp at
+white as in Unreal; the `.tscn` writer multiplies `brightness` into `modulate` and warns
+about a hue.
+
+`upper_fade` and `lower_fade` are set to 0.01, because Unreal does not fade a decal with
+depth: at Godot's default of 0.3, a decal whose box is off-centre on its wall comes out
+faint. Not 0, where Godot's fade is `pow(0, 0)`, a NaN pixel at the edge of the box.
 
 ### Minimum projection depth (import option, not a schema field)
 
@@ -759,6 +766,25 @@ skipped — UE 5.7 exposes `num_custom_data_floats` but no getter for the values
 (verified by probing the component API), so Godot's `MultiMesh.use_custom_data`
 channel cannot be filled from an export.
 
+## cables
+
+```json
+{
+    "name": "BP_Power_Post_Cable",
+    "points": [[x, y, z], ...],    // world space, meters: where the cable hangs at export
+    "width_m": 0.02,               // diameter
+    "sides": 5,
+    "tile_material": 100.0,        // texture repeats along the length
+    "cast_shadow": true,
+    "max_draw_distance_m": null,
+    "material_overrides": [ ... ]  // slot 0, as on an actor
+}
+```
+
+One entry per visible `CableComponent`. The line comes from the running simulation, which
+settles within seconds of opening the map. Godot: a tube under `UnrealCables`, static, switched
+with spline meshes. The `.tscn` writer skips cables and warns.
+
 ## navigation
 
 ```json
@@ -808,7 +834,7 @@ func apply(data: Dictionary, root: Node, scene_owner: Node, options: Dictionary)
 
 | Module | Consumes |
 |---|---|
-| `import_environment.gd` | `lights`, `post_process`, `height_fog`, `sky_light`, `has_sky_atmosphere`, `gi_method`, `decals` |
+| `import_environment.gd` | `lights`, `post_process`, `height_fog`, `sky_light`, `has_sky_atmosphere`, `gi_method`, `decals`, `cables` |
 | `import_terrain.gd` | `landscapes` |
 | `import_foliage.gd` | `foliage` (+ `meshes` for material data) |
 | `import_gameplay.gd` | `navigation` + per-actor metadata helper `apply_actor_metadata(node, actor_data, options)` |

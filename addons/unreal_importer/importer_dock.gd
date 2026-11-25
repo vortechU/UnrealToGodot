@@ -193,7 +193,7 @@ func _enter_tree() -> void:
 	probes_check = _make_check(features,"Reflection Probes", "Create ReflectionProbe nodes from exported BoxReflectionCapture and SphereReflectionCapture components.", true)
 	cameras_check = _make_check(features,"Cameras", "Create Camera3D nodes from exported CameraActor / CineCameraActor components with matching horizontal FOV.", true)
 	audio_check = _make_check(features,"Ambient Audio", "Create AudioStreamPlayer3D nodes from exported AmbientSound / AudioComponent actors and bind exported audio/*.wav streams.", true)
-	splines_check = _make_check(features,"Spline Meshes (Hermite deform)", "Deform SplineMeshComponent meshes along their exported Unreal cubic Hermite splines (roads, pipes, cables).", true)
+	splines_check = _make_check(features,"Spline Meshes & Cables", "Rebuild hanging cables, and deform SplineMeshComponent meshes along their exported Unreal cubic Hermite splines (roads, pipes, cables).", true)
 	preserve_folders_check = _make_check(features,"Mirror Unreal Outliner Folders", "Recreate Unreal World Outliner folders as nested Node3D containers under UnrealStaticMeshes.", true)
 	update_existing_check = _make_check(features,"Update existing scene (incremental)", "Match existing nodes by unreal_actor_id and update their transforms/metadata in place instead of duplicating actors, preserving scripts and custom child nodes.", false)
 	prune_removed_check = _make_check(features,"    Remove deleted actors on update", "When incremental update is enabled, delete existing imported actors whose unreal_actor_id is no longer in the JSON.", false)

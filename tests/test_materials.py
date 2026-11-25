@@ -1331,6 +1331,79 @@ for _k, _v in _prev.items():
     elif hasattr(u, _k):
         delattr(u, _k)
 
+# --- Downtown_Alley's wall paint: Clamp(Tint * Desaturate(HueShift(Lum * Sample))) ---
+_gp = lambda n: _Node("ScalarParameter", parameter_name=n)
+_paint_sample = _sample(_Tex("T_Graffiti_01_da"), "Decal Texture")
+_lum = _bin("Multiply", (_gp("Lum"), ""), (_paint_sample, "RGB"))
+_hue = _Node("MaterialFunctionCall", [("Hue Shift Percentage", _gp("Hue Shift"), ""), ("Texture", _lum, "")],
+             material_function=types.SimpleNamespace(get_name=lambda: "HueShift"))
+_desat = _Node("Desaturation", [("", _hue, ""), ("Fraction", _gp("Saturation"), "")])
+_tinted = _bin("Multiply", (_Node("VectorParameter", parameter_name="Color Tint"), ""), (_desat, ""))
+_paint_base = _GraphMat({"MP_BASE_COLOR": (_Node("Clamp", [("", _tinted, "")]), "")})
+_paint_mi = _graph_mi(_paint_base, texture_parameter_values=[_TexParam("Decal Texture", _Tex("T_Graffiti_01_da"))],
+                      scalar_parameter_values=[
+    _value_param("Lum", 1.5), _value_param("Hue Shift", 0.25), _value_param("Saturation", 0.0)])
+check("a decal's brightness and hue shift are read off its graph",
+      EE._decal_color_grade(_paint_mi) == (1.5, 0.25), EE._decal_color_grade(_paint_mi))
+check("...and reach its entry",
+      (_decal_textures(_paint_mi).get("brightness"), _decal_textures(_paint_mi).get("hue_shift")) == (1.5, 0.25),
+      _decal_textures(_paint_mi))
+_plain_tex = _decal_textures(_graph_mi(_GraphMat({"MP_BASE_COLOR": (_sample(_Tex("T_Plain")), "RGB")})))
+check("a plain decal carries neither", "brightness" not in _plain_tex and "hue_shift" not in _plain_tex, _plain_tex)
+_const = _Node("Multiply", [("A", _sample(_Tex("T_Half")), "RGB")], const_b=0.5)
+check("a constant on the open pin counts too",
+      EE._decal_color_grade(_graph_mi(_GraphMat({"MP_BASE_COLOR": (_const, "")}))) == (0.5, 0.0))
+
+
+# --- cables ---
+class _PathedMI(_GraphMI):
+    def get_path_name(self):
+        return "/Game/MI_Cable.MI_Cable"
+
+
+class _Cable:
+    def __init__(self, points, **props):
+        self._points, self._props = points, props
+
+    def get_editor_property(self, key):
+        if key not in self._props:
+            raise Exception("no property %r" % key)
+        return self._props[key]
+
+    def get_name(self):
+        return "Cable"
+
+    def get_cable_particle_locations(self):
+        return [_Vec(*p) for p in self._points]
+
+    def get_material(self, slot):
+        return _PathedMI(_paint_mi._p)
+
+
+def _cable_actor(*comps):
+    return types.SimpleNamespace(get_components_by_class=lambda cls: list(comps),
+                                 get_actor_label=lambda: "Post", get_name=lambda: "Post")
+
+
+check("no CableComponent in this Unreal, no cables", EL.collect_cables([_cable_actor(_Cable([]))]) == [])
+u.CableComponent = _Cable
+_line = [(0.0, 0.0, 300.0), (100.0, 0.0, 250.0), (200.0, 0.0, 300.0)]
+_cables = EL.collect_cables([None, _cable_actor(
+    _Cable(_line, visible=True, cable_width=2.0, num_sides=5, tile_material=100.0, cast_shadow=False),
+    _Cable(_line, visible=False), _Cable(_line[:1], visible=True), _Cable(_line, is_editor_only=True))])
+check("only the visible cable with a line is exported", len(_cables) == 1, _cables)
+_c = _cables[0]
+check("its line is in Godot space, meters",
+      all(abs(a - b) < 1e-9 for p, q in zip(_c["points"], [(0, 3, 0), (0, 2.5, -1), (0, 3, -2)]) for a, b in zip(p, q)), _c["points"])
+check("...with its width, sides, tiling, shadow and material",
+      (_c["name"], _c["width_m"], _c["sides"], _c["tile_material"], _c["cast_shadow"]) == ("Post_Cable", 0.02, 5, 100.0, False)
+      and _c["material_overrides"][0]["parameters"]["albedo_texture"] == "T_Graffiti_01_da", _c)
+EL.finalize_layout_texture_names({"cables": _cables}, {
+    _c["material_overrides"][0]["parameters"]["texture_paths"]["albedo_texture"]: "T_Renamed"})
+check("...whose texture follows a renamed file",
+      _c["material_overrides"][0]["parameters"]["albedo_texture"] == "T_Renamed", _c)
+del u.CableComponent
+
 for _name in _GRAPH_API:
     delattr(_FakeMEL, _name)
 del u.MaterialProperty

@@ -122,7 +122,7 @@ def human_bytes(n):
 
 
 FEATURE_SECTIONS = ("lights", "decals", "reflection_probes", "cameras", "audio",
-                    "landscapes", "foliage", "navigation",
+                    "landscapes", "foliage", "cables", "navigation",
                     "post_process", "height_fog", "sky_light")
 
 
@@ -239,7 +239,7 @@ def audit_layout(rep, path, strict=True):
             for ov in (comp.get("material_overrides") or []):
                 if isinstance(ov, dict):
                     _check_mat_params(ov.get("parameters"), aname)
-    for fol in (data.get("foliage") or []):
+    for fol in (data.get("foliage") or []) + (data.get("cables") or []):
         if not isinstance(fol, dict):
             continue
         fname = fol.get("name") or fol.get("mesh_key") or "Foliage"
@@ -448,7 +448,7 @@ def layout_texture_names(layout):
             for override in (comp.get("material_overrides") or []):
                 if isinstance(override, dict):
                     _add(override.get("parameters"), slots)
-    for foliage in (layout.get("foliage") or []):
+    for foliage in (layout.get("foliage") or []) + (layout.get("cables") or []):
         if isinstance(foliage, dict):
             for override in (foliage.get("material_overrides") or []):
                 if isinstance(override, dict):

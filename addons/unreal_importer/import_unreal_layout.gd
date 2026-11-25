@@ -32,7 +32,7 @@ const STATIC_MESH_CONTAINER: String = "UnrealStaticMeshes"
 
 # Containers the feature modules build from scratch on every import.
 const FEATURE_CONTAINERS: Array[String] = ["UnrealLights", "UnrealDecals",
-	"UnrealReflectionProbes", "UnrealCameras", "UnrealAudio", "UnrealFoliage",
+	"UnrealReflectionProbes", "UnrealCameras", "UnrealAudio", "UnrealCables", "UnrealFoliage",
 	"UnrealNavigation"]
 
 # Per-feature import toggles (see docs/SCHEMA_V2.md). The dock passes a matching
@@ -2071,7 +2071,8 @@ func _collect_normal_map_targets(data: Dictionary) -> Dictionary:
 			for ov in (comp.get("material_overrides") if comp.get("material_overrides") is Array else []):
 				if ov is Dictionary and ov.get("parameters") is Dictionary:
 					record_normal.call(ov["parameters"].get("normal_texture"))
-	for fol in (data.get("foliage") if data.get("foliage") is Array else []):
+	for fol in ((data.get("foliage") if data.get("foliage") is Array else [])
+			+ (data.get("cables") if data.get("cables") is Array else [])):
 		if not (fol is Dictionary):
 			continue
 		for ov in (fol.get("material_overrides") if fol.get("material_overrides") is Array else []):

@@ -728,7 +728,7 @@ lumen_writer = tscn_writer._TscnWriter({
 }, res_paths, options)
 lumen_writer._build_environment(".")
 lumen_subs = {kind: body for _, kind, body in lumen_writer._sub_resources}
-for line in ("sdfgi_enabled = true", "ssr_enabled = true", "ssr_fade_out = 0.0", "fog_mode = 1", "fog_depth_begin = 5.0", "fog_sky_affect = 0.0"):
+for line in ("sdfgi_enabled = true", "sdfgi_y_scale = 2", "ssr_enabled = true", "ssr_fade_out = 0.0", "fog_mode = 1", "fog_depth_begin = 5.0", "fog_sky_affect = 0.0"):
     assert line in lumen_subs["Environment"], (line, lumen_subs["Environment"])
 assert "shader_parameter/light_scale = Vector3(6.0, 3.0, 6.0)" in lumen_subs["ShaderMaterial"], \
     lumen_subs["ShaderMaterial"]

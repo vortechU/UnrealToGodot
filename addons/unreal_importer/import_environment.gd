@@ -115,6 +115,10 @@ var _decal_crop_cache: Dictionary = {}
 # size.y alone: layouts from before v1.0 keep Unreal's scale in the transform, where
 # size.y is 0.02 and the scale carries a factor of several hundred.
 const DEFAULT_DECAL_MIN_DEPTH_M := 0.10
+const DECAL_FADE := 0.01
+# shortcut: the hue of a decal is shifted pixel by pixel on the CPU, so its texture is
+# capped at this many pixels a side; move it to a shader if packs need more.
+const MAX_HUE_SHIFT_SIZE := 1024
 
 
 func apply(data: Dictionary, root: Node, scene_owner: Node, options: Dictionary) -> Dictionary:
@@ -134,6 +138,8 @@ func apply(data: Dictionary, root: Node, scene_owner: Node, options: Dictionary)
 		created += _apply_cameras(data.get("cameras", []), root, scene_owner)
 	if options.get("apply_audio", true):
 		created += _apply_audio(data.get("audio", []), root, scene_owner, options)
+	if options.get("apply_spline_meshes", true):
+		created += _apply_cables(data.get("cables", []), root, scene_owner, options)
 
 	return {"created": created, "warnings": warnings}
 
@@ -304,6 +310,9 @@ func _apply_environment(data: Dictionary, root: Node, scene_owner: Node, warning
 
 	# Lumen keeps sky light out of enclosed places; SDFGI is Godot's closest match.
 	env.sdfgi_enabled = _uses_lumen(data)
+	if env.sdfgi_enabled:
+		# The default squashes the probes vertically; in an alley that loses bounced light.
+		env.sdfgi_y_scale = Environment.SDFGI_Y_SCALE_100_PERCENT
 	# Lumen also reflects the scene in wet ground; the default fade stops a few meters out.
 	env.ssr_enabled = env.sdfgi_enabled
 	if env.ssr_enabled:
@@ -464,6 +473,10 @@ func _apply_decals(decals, root: Node, scene_owner: Node, options: Dictionary, w
 			if y_scale > 0.0001:
 				d_size.y = maxf(d_size.y, min_depth / y_scale)
 		decal.size = d_size
+		# Unreal does not fade a decal with depth. Not 0: Godot's fade is a power, and
+		# 0 to the power of 0 comes out as a NaN pixel at the edge of the box.
+		decal.upper_fade = DECAL_FADE
+		decal.lower_fade = DECAL_FADE
 		# UE SortOrder and Godot sorting_offset agree on direction: higher draws
 		# on top of decals sharing the same spot.
 		decal.sorting_offset = Common.get_num(entry, "sort_order", 0.0)
@@ -525,12 +538,15 @@ func _bind_decal_texture(decal: Decal, textures: Dictionary, key: String, folder
 	# keys off the texture's RID and ignores the region -- so the crop has to be
 	# baked into pixels right here or the decal renders the whole sheet.
 	var rect = textures.get("uv_rect")
-	if rect is Array and rect.size() == 4:
+	var brightness := Common.get_num(textures, "brightness", 1.0) if slot == Decal.TEXTURE_ALBEDO else 1.0
+	var hue := Common.get_num(textures, "hue_shift", 0.0) if slot == Decal.TEXTURE_ALBEDO else 0.0
+	var has_rect: bool = rect is Array and rect.size() == 4
+	if has_rect or brightness != 1.0 or hue != 0.0:
 		var cropped := _crop_decal_texture(
-			path, tex, rect,
+			path, tex, rect if has_rect else [0.0, 0.0, 1.0, 1.0],
 			bool(textures.get("flip_u", false)),
 			bool(textures.get("flip_v", false)),
-			is_normal)
+			is_normal, brightness, hue)
 		if cropped != null:
 			tex = cropped
 	decal.set_texture(slot, tex)
@@ -538,12 +554,16 @@ func _bind_decal_texture(decal: Decal, textures: Dictionary, key: String, folder
 
 func _crop_decal_texture(
 		path: String, tex: Texture2D, rect: Array,
-		flip_u: bool, flip_v: bool, is_normal: bool = false) -> Texture2D:
-	"""One atlas cell of `tex` as a standalone texture, or null if it cannot be cut."""
+		flip_u: bool, flip_v: bool, is_normal: bool = false,
+		brightness: float = 1.0, hue: float = 0.0) -> Texture2D:
+	"""One atlas cell of `tex` as a standalone texture, or null if it cannot be cut.
+	The material's color grade is baked in: a Decal's modulate cannot clamp at white."""
 	# 15 of the sci-fi station's 29 decals share a single cell, and every distinct
 	# ImageTexture costs its own slot in Godot's decal atlas, so caching here is
 	# what keeps that from becoming 15 copies of the same crop.
 	var cache_key := "%s|%s|%s|%s|%s" % [path, str(rect), flip_u, flip_v, is_normal]
+	if brightness != 1.0 or hue != 0.0:
+		cache_key += "|%s|%s" % [brightness, hue]
 	if _decal_crop_cache.has(cache_key):
 		return _decal_crop_cache[cache_key]
 
@@ -584,12 +604,106 @@ func _crop_decal_texture(
 				if flip_v:
 					c.g = 1.0 - c.g
 				out.set_pixel(px, py, c)
+	if brightness != 1.0:
+		# Unreal multiplies linear light; these pixels are sRGB.
+		out.adjust_bcs(pow(brightness, 1.0 / 2.2), 1.0, 1.0)
+	if hue != 0.0:
+		_shift_hue(out, hue)
 	if img.has_mipmaps():
 		out.generate_mipmaps()
 
 	var result := Common.save_generated_texture(out, path, cache_key)
 	_decal_crop_cache[cache_key] = result
 	return result
+
+
+static func _shift_hue(image: Image, shift: float) -> void:
+	"""Unreal's HueShift: turns linear RGB about its grey axis, `shift` turns."""
+	var longest := maxi(image.get_width(), image.get_height())
+	if longest > MAX_HUE_SHIFT_SIZE:
+		var k := float(MAX_HUE_SHIFT_SIZE) / longest
+		image.resize(maxi(1, int(image.get_width() * k)), maxi(1, int(image.get_height() * k)))
+	var turn := Basis(Vector3.ONE.normalized(), TAU * shift)
+	for y in image.get_height():
+		for x in image.get_width():
+			var c := image.get_pixel(x, y)
+			if c.a == 0.0:
+				continue
+			var l := c.srgb_to_linear()
+			var v := (turn * Vector3(l.r, l.g, l.b)).clamp(Vector3.ZERO, Vector3.ONE)
+			var s := Color(v.x, v.y, v.z).linear_to_srgb()
+			image.set_pixel(x, y, Color(s.r, s.g, s.b, c.a))
+
+
+func _apply_cables(cables, root: Node, scene_owner: Node, options: Dictionary) -> int:
+	if not (cables is Array) or cables.is_empty():
+		return 0
+	var container := Node3D.new()
+	container.name = "UnrealCables"
+	Common.add_owned_child(root, container, scene_owner)
+	var count := 0
+	for entry in cables:
+		if not (entry is Dictionary) or not (entry.get("points") is Array):
+			continue
+		var points := PackedVector3Array()
+		for p in entry["points"]:
+			points.append(Common.vec3_from_array(p))
+		if points.size() < 2:
+			continue
+		# Around the cable's own start, so the node can be moved.
+		var origin := points[0]
+		var mesh := _cable_mesh(points, origin, maxf(Common.get_num(entry, "width_m", 0.1), 0.001) * 0.5,
+			maxi(3, int(Common.get_num(entry, "sides", 4))), Common.get_num(entry, "tile_material", 1.0))
+		var node := MeshInstance3D.new()
+		node.name = Common.get_str(entry, "name", "Cable")
+		node.position = origin
+		node.mesh = mesh
+		var helper = options.get("material_helper")
+		for ov in entry.get("material_overrides", []):
+			if helper != null and ov is Dictionary and ov.get("parameters") is Dictionary:
+				mesh.surface_set_material(0, helper.get_or_create_material(
+					Common.get_str(ov, "material_name"), Common.get_str(ov, "material_path"), ov["parameters"]))
+		if not bool(entry.get("cast_shadow", true)):
+			node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		node.visibility_range_end = maxf(Common.get_num(entry, "max_draw_distance_m", 0.0), 0.0)
+		Common.add_owned_child(container, node, scene_owner)
+		count += 1
+	if count == 0:
+		container.queue_free()
+	return count
+
+
+static func _cable_mesh(points: PackedVector3Array, origin: Vector3, radius: float, sides: int, tile: float) -> ArrayMesh:
+	"""A tube along the points. Unreal runs U along a cable and V around it."""
+	var verts := PackedVector3Array()
+	var normals := PackedVector3Array()
+	var uvs := PackedVector2Array()
+	var indices := PackedInt32Array()
+	var last := points.size() - 1
+	for i in points.size():
+		var forward := points[mini(i + 1, last)] - points[maxi(i - 1, 0)]
+		forward = forward.normalized() if forward.length() > 0.00001 else Vector3.FORWARD
+		var right := forward.cross(Vector3.RIGHT if absf(forward.y) > 0.99 else Vector3.UP).normalized()
+		var up := right.cross(forward)
+		for s in sides + 1:
+			var a := TAU * s / sides
+			var n := right * cos(a) + up * sin(a)
+			verts.append(points[i] - origin + n * radius)
+			normals.append(n)
+			uvs.append(Vector2(tile * i / last, float(s) / sides))
+			if i < last and s < sides:
+				var v := i * (sides + 1) + s
+				indices.append_array([v, v + 1, v + sides + 1, v + 1, v + sides + 2, v + sides + 1])
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = verts
+	arrays[Mesh.ARRAY_NORMAL] = normals
+	arrays[Mesh.ARRAY_TEX_UV] = uvs
+	arrays[Mesh.ARRAY_INDEX] = indices
+	var tool := SurfaceTool.new()
+	tool.create_from_arrays(arrays)
+	tool.generate_tangents()
+	return tool.commit()
 
 
 func _apply_reflection_probes(probes, root: Node, scene_owner: Node, uses_lumen: bool) -> int:

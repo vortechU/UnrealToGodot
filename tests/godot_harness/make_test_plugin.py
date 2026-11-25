@@ -595,6 +595,17 @@ func _test_materials(root: Node) -> void:
 		strip.get_width() == 2 and strip.get_pixel(0, 0).r8 == 30
 		and strip.get_pixel(1, 0).r8 == 0 and strip.get_pixel(1, 0).a8 == 255,
 		"%s %s" % [strip.get_pixel(0, 0), strip.get_pixel(strip.get_width() - 1, 0)])
+	# A decal's color grade is baked, clamped at white; a third of a turn is red -> green.
+	var paint := Image.create_empty(2, 1, false, Image.FORMAT_RGBA8)
+	paint.set_pixel(0, 0, Color8(255, 0, 0, 128))
+	paint.set_pixel(1, 0, Color8(100, 100, 100))
+	var graded: Image = EnvImporter.new()._crop_decal_texture(
+		"paint", ImageTexture.create_from_image(paint), [0.0, 0.0, 1.0, 1.0], false, false, false, 1.5, 1.0 / 3.0).get_image()
+	check("a decal's hue shift turns its color and keeps its alpha",
+		graded.get_pixel(0, 0).is_equal_approx(Color8(0, 255, 0, 128)), str(graded.get_pixel(0, 0)))
+	check("a decal's brightness multiplies linear light",
+		absf(graded.get_pixel(1, 0).srgb_to_linear().r / Color8(100, 100, 100).srgb_to_linear().r - 1.5) < 0.1,
+		str(graded.get_pixel(1, 0)))
 	check("two-sided material disables backface culling",
 		bm.cull_mode == BaseMaterial3D.CULL_DISABLED, str(bm.cull_mode))
 	check("emissive material enables emission with multiply operator and energy",
@@ -768,6 +779,34 @@ func _test_phase3_scene_parity(root: Node) -> void:
 			cam.keep_aspect == Camera3D.KEEP_WIDTH and absf(cam.fov - 85.0) < 0.001
 			and absf(cam.near - 0.1) < 0.001 and absf(cam.far - 2000.0) < 0.01,
 			"aspect=%s fov=%s near=%s far=%s" % [cam.keep_aspect, cam.fov, cam.near, cam.far])
+
+	var faded := find_node(root, "Decal_0") as Decal
+	for d in root.find_children("*", "Decal", true, false):
+		faded = d
+	check("decals do not fade with depth, short of 0 (a NaN in Godot)",
+		faded != null and is_equal_approx(faded.upper_fade, 0.01) and is_equal_approx(faded.lower_fade, 0.01))
+	var cable := root.get_node_or_null("UnrealCables/Post_Cable") as MeshInstance3D
+	check("a cable is rebuilt under UnrealCables", cable != null and cable.mesh != null)
+	if cable and cable.mesh:
+		var box := cable.transform * cable.mesh.get_aabb()
+		check("...along its line and as thick as Unreal draws it",
+			absf(box.position.z + 4.0) < 0.06 and absf(box.end.z) < 0.06 and absf(box.size.x - 0.1) < 0.02
+			and absf(box.position.y - 4.45) < 0.03 and absf(box.end.y - 5.05) < 0.03, str(box))
+		check("...with its material, shadow flag and draw distance",
+			(cable.mesh.surface_get_material(0) as BaseMaterial3D) != null
+			and is_equal_approx((cable.mesh.surface_get_material(0) as BaseMaterial3D).roughness, 0.4)
+			and cable.cast_shadow == GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			and is_equal_approx(cable.visibility_range_end, 40.0))
+		var arr := cable.mesh.surface_get_arrays(0)
+		var vs: PackedVector3Array = arr[Mesh.ARRAY_VERTEX]
+		var ns: PackedVector3Array = arr[Mesh.ARRAY_NORMAL]
+		var ix: PackedInt32Array = arr[Mesh.ARRAY_INDEX]
+		var inside_out := 0
+		for i in range(0, ix.size(), 3):
+			# Godot's front faces wind clockwise.
+			if (vs[ix[i + 2]] - vs[ix[i]]).cross(vs[ix[i + 1]] - vs[ix[i]]).dot(ns[ix[i]]) <= 0.0:
+				inside_out += 1
+		check("...and faces outwards", ix.size() == 60 and inside_out == 0, "%d of %d" % [inside_out, ix.size() / 3])
 
 	var aud := find_node(root, "AmbientWind") as AudioStreamPlayer3D
 	check("AmbientWind AudioStreamPlayer3D exists under UnrealAudio",
