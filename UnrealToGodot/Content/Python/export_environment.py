@@ -77,22 +77,12 @@ ULightComponent, so the sky light is not caught twice by this scan.
 --------------------------------------------------------------------------
 Decal axis fix-up (see docs/SCHEMA_V2.md "decals" section)
 --------------------------------------------------------------------------
-UE decals project along their local **-X** axis. The shared coordinate
-conversion (ue2g_common.unreal_to_godot_transform) maps UE local +X onto
-Godot's local -Z (this is the fact that makes converted rotations usable
-as-is for lights/cameras, whose forward axis is UE local +X / Godot local
--Z). By linearity, UE local -X therefore maps onto Godot local +Z under the
-same conversion.
-
-Godot's Decal node instead projects along its own local **-Y** axis. So the
-plain converted rotation is not enough for decals: it points the "projection
-direction" at the converted node's local +Z, not -Y. `_decal_transform` folds
-in an extra fix-up quaternion (a -90 degree rotation about the local X axis)
-so that after composition, the converted node's local -Y lines up with where
-the decal's local +Z used to be. Because that fix-up re-labels the node's
-local Y and Z axes, the converted **scale** has to be conjugated by it too --
-its Y and Z components are swapped. See `_decal_transform`'s docstring for the
-full worked derivation and a numeric sanity check.
+UE lays a decal's texture out with U along local **+Z** and V along local **+Y**
+(Engine/Shaders/Private/DeferredDecal.usf: `SwizzlePos = DecalVector.zyx`), so the
+image is upright for a viewer looking along local +X. Godot's Decal has U along
+local +X, V along local +Z and projects along local **-Y**. `_decal_transform` folds
+in the fix-up rotation that lines those axes up, and permutes the converted **scale**
+by it too. See its docstring for the derivation.
 
 Beyond the transform, a decal carries its colour (`modulate` = DecalColor *
 material tint * opacity), its visibility, and a distance fade converted from
@@ -653,12 +643,9 @@ def _build_sky_light(actor):
 # Decals
 # ---------------------------------------------------------------------------
 
-# UE decals project along local -X; the shared conversion (ue2g_common.
-# unreal_to_godot_transform) maps UE local +X onto Godot local -Z, so it maps
-# UE local -X onto Godot local +Z. Godot's Decal instead projects along local
-# -Y. _DECAL_FIXUP_QUAT is a -90 degree rotation about the local X axis; see
-# _decal_transform() for the full derivation and a worked numeric example.
-_DECAL_FIXUP_QUAT = (-0.7071067811865476, 0.0, 0.0, 0.7071067811865476)
+# A 120 degree rotation about (1,1,1): local X -> Y -> Z -> X. See
+# _decal_transform() for the derivation.
+_DECAL_FIXUP_QUAT = (0.5, 0.5, 0.5, 0.5)
 
 
 def _quat_multiply(q1, q2):
@@ -683,48 +670,25 @@ def _decal_transform(u_transform):
     UE -> Godot projection-axis fix-up folded into the rotation.
 
     Worked derivation:
-      Let A = the actor's world rotation matrix (Unreal space) and
-      R_std = C . A . C^T the standard converted rotation returned by
-      ue2g_common.unreal_to_godot_transform (C is the fixed UE-world ->
-      Godot-world axis change with C . (ux,uy,uz) = (uy,uz,-ux)).
+      Let R_std = the standard converted rotation from
+      ue2g_common.unreal_to_godot_transform, whose axis change sends
+      (ux,uy,uz) to (uy,uz,-ux): UE local +X, +Y, +Z land on R_std's local
+      -Z, +X, +Y.
 
-      SCHEMA_V2.md notes that C maps UE local +X onto Godot's local -Z
-      (i.e. C . (1,0,0) = (0,0,-1)), which is exactly why the converted
-      rotation can be used as-is for lights/cameras (UE forward = local
-      +X, Godot forward = local -Z).
-
-      UE decals instead project along local **-X**. Since C . (1,0,0) =
-      (0,0,-1), linearity gives C . (-1,0,0) = (0,0,1). Working through
-      R_std . v0 = C . (A . (-e_x)) the same way the light/camera case is
-      derived shows the decal's real projection direction lands on
-      R_std's own local **+Z** axis, not -Z.
-
-      Godot's Decal projects along its local **-Y** axis. We want an
-      extra local rotation R_fix, applied before R_std so that
-      R_final = R_std . R_fix satisfies:
-          R_final . (0,-1,0) = R_std . (0,0,1)
-      which reduces to:
-          R_fix . (0,-1,0) = (0,0,1)   i.e.   R_fix . (0,1,0) = (0,0,-1)
-      A -90 degree rotation about the local X axis satisfies exactly
-      this (Rx(-90) maps +Y -> -Z), which is _DECAL_FIXUP_QUAT below.
-
-      Numeric sanity check (A = Identity, so R_std = Identity too):
-      an unrotated UE decal projects along local -X = world -X. Its
-      Godot-space direction is C . (-1,0,0) = (0,0,1), i.e. Godot world
-      +Z. With R_final = R_fix (since R_std = I here), the Decal node's
-      local -Y axis maps to R_fix . (0,-1,0) = (0,0,1) by construction --
-      also Godot world +Z. The two agree, confirming the fix-up.
+      The decal's image axes are U = UE +Z and V = UE +Y, i.e. R_std's +Y and
+      +X. A Godot Decal draws U along local +X and V along local +Z, so the
+      fix-up R_fix in R_final = R_std . R_fix must satisfy
+          R_fix . (1,0,0) = (0,1,0)   (U)
+          R_fix . (0,0,1) = (1,0,0)   (V)
+      which fixes the remaining column as R_fix . (0,1,0) = (0,0,1): UE -X.
+      Godot projects along -Y, so along UE +X, the way the image reads upright.
 
       The scale must travel with the rotation. unreal_to_godot_transform
-      returns the scale expressed along R_std's axes, as [usy, usz, usx].
-      The correct world basis is R_std . S_std . R_fix, and consumers build
-      it as R_final . S = (R_std . R_fix) . S, so:
+      returns it along R_std's axes, as [usy, usz, usx]. The correct world
+      basis is R_std . S_std . R_fix and consumers build R_final . S, so
           S = R_fix^T . S_std . R_fix
-      Conjugating a diagonal by Rx(-90) just swaps its Y and Z entries, so
-      the decal's scale is [usy, usx, usz]. Leaving it as [usy, usz, usx]
-      swaps the decal's projection depth with its height -- a graffiti decal
-      1 m tall with a 1.9 m projection depth renders 3.7 m tall and 0.5 m
-      deep instead (measured on L_Overview's MI_Graffiti_01).
+      which permutes the entries to [usz, usx, usy]. Leaving it unpermuted
+      swaps the decal's projection depth with its size on the wall.
 
     Takes the DecalComponent's WORLD transform, not the actor's: on a stock
     ADecalActor the component *is* the root and the two agree, but a Blueprint
@@ -743,9 +707,8 @@ def _decal_transform(u_transform):
 
     scale = list(std.get("scale", [1.0, 1.0, 1.0]))
     if len(scale) >= 3:
-        # R_fix^T . diag(sx, sy, sz) . R_fix  ==  diag(sx, sz, sy)
-        scale[1], scale[2] = scale[2], scale[1]
-        std["scale"] = scale
+        # R_fix^T . diag(sx, sy, sz) . R_fix  ==  diag(sy, sz, sx)
+        std["scale"] = [scale[1], scale[2], scale[0]]
 
     std["rotation_quat"] = list(q_final)
     return std
@@ -781,10 +744,9 @@ _GODOT_DECAL_ORM_CHANNELS = {"ao": 0, "roughness": 1, "metallic": 2}
 # The second form read here is the parameter-driven one, where the base material
 # holds TextureCoordinate(1,1) -> Divide -> Add -> sampler and the cell is chosen
 # per INSTANCE by scalar parameters (ModularSciFiStation's M_decal: "UV Divide",
-# "U Tile", "V Tile"). Expression INPUTS are protected in Python -- every pin on
-# Divide/Add/AppendVector raises "is protected and cannot be read" on UE 5.8, so
-# the wiring genuinely cannot be walked. What pinned the formula down instead was
-# the VALUES: across all 16 MI_* instances UV Divide is 4.0 and U/V Tile take only
+# "U Tile", "V Tile"). UE 5.8 walks that wiring directly (see _uv_rect_from_graph,
+# tried first); older engines cannot -- expression INPUTS are protected in Python --
+# so they infer it here. What pinned the formula down was the VALUES: across all 16 MI_* instances UV Divide is 4.0 and U/V Tile take only
 # {0, 0.25, 0.5, 0.75}, i.e. fractions rather than integer cell indices, which
 # fits uv/divide + (u,v) and not (uv + (u,v))/divide. Rendering the 4x4 grid over
 # T_numbers_01_basecolor confirmed it cell by cell -- MI_numbers_01_red lands on
@@ -888,13 +850,22 @@ def _decal_scalar_param(material, base, name):
 
     instance_getter = getattr(mel, "get_material_instance_scalar_parameter_value", None)
     mi_type = getattr(unreal, "MaterialInstance", None)
-    if instance_getter is not None and mi_type is not None and isinstance(material, mi_type):
-        try:
-            value = instance_getter(material, key)
-            if value is not None:
-                return float(value)
-        except Exception:
-            pass
+    # Child to parent: the library getter refuses a MaterialInstanceDynamic, so its
+    # overrides are read off the instance itself before asking about its parent.
+    for _ in range(16):
+        if mi_type is None or not isinstance(material, mi_type):
+            break
+        for override in ue2g_common.safe_get_prop(material, "scalar_parameter_values", None) or ():
+            if str(override.parameter_info.name).lower() == str(name).lower():
+                return float(override.parameter_value)
+        if instance_getter is not None:
+            try:
+                value = instance_getter(material, key)
+                if value is not None:
+                    return float(value)
+            except Exception:
+                pass
+        material = ue2g_common.safe_get_prop(material, "parent", None)
 
     default_getter = getattr(mel, "get_material_default_scalar_parameter_value", None)
     if default_getter is not None:
@@ -965,6 +936,108 @@ def _uv_rect_from_atlas_params(material, base, expressions, actor=None):
     return [max(u0, 0.0), max(v0, 0.0), size, size], False, False
 
 
+def _uv_affine(graph, node, material):
+    """
+    A UV expression as [(axis, scale, offset), ...] per component, each meaning
+    scale * uv[axis] + offset (axis None for a constant). None when the graph does
+    something a crop cannot express.
+    """
+    kind = ue2g_common.node_kind(node)
+    prop = ue2g_common.safe_get_prop
+    if kind == "TextureCoordinate":
+        return [(0, _f(prop(node, "u_tiling", 1.0), 1.0), 0.0),
+                (1, _f(prop(node, "v_tiling", 1.0), 1.0), 0.0)]
+    if kind == "Constant":
+        return [(None, 0.0, _f(prop(node, "r", 0.0), 0.0))]
+    if kind == "Constant2Vector":
+        return [(None, 0.0, _f(prop(node, c, 0.0), 0.0)) for c in ("r", "g")]
+    if kind == "ScalarParameter":
+        value = _decal_scalar_param(material, graph.base, str(prop(node, "parameter_name", "")))
+        return None if value is None else [(None, 0.0, value)]
+
+    children = {}
+    for name, child, _out in graph.inputs(node):
+        children[name] = _uv_affine(graph, child, material)
+        if children[name] is None:
+            return None
+    if kind in ("Reroute", "ComponentMask"):
+        if len(children) != 1:
+            return None
+        value = next(iter(children.values()))
+        if kind == "Reroute":
+            return value
+        # A scalar reads the same from every channel.
+        value = value * 4 if len(value) == 1 else value
+        return [c for c, keep in zip(value, "rgba") if prop(node, keep, False)] or None
+    if kind == "AppendVector":
+        return children["A"] + children["B"] if len(children) == 2 else None
+    if kind not in ("Add", "Subtract", "Multiply", "Divide"):
+        return None
+
+    # An unconnected pin reads the node's own constant.
+    a = children.get("A") or [(None, 0.0, _f(prop(node, "const_a", 0.0), 0.0))]
+    b = children.get("B") or [(None, 0.0, _f(prop(node, "const_b", 1.0), 1.0))]
+    size = max(len(a), len(b))
+    if any(len(v) not in (1, size) for v in (a, b)):
+        return None
+    result = []
+    for (ax, a_scale, a_off), (bx, b_scale, b_off) in zip(
+            a * size if len(a) == 1 else a, b * size if len(b) == 1 else b):
+        if kind in ("Add", "Subtract"):
+            if ax is not None and bx is not None and ax != bx:
+                return None
+            sign = 1.0 if kind == "Add" else -1.0
+            result.append((ax if ax is not None else bx,
+                           a_scale + sign * b_scale, a_off + sign * b_off))
+            continue
+        if kind == "Multiply" and ax is None:
+            ax, a_scale, a_off, bx, b_scale, b_off = bx, b_scale, b_off, ax, a_scale, a_off
+        if bx is not None or (kind == "Divide" and b_off == 0.0):
+            return None
+        factor = b_off if kind == "Multiply" else 1.0 / b_off
+        result.append((ax, a_scale * factor, a_off * factor))
+    return result
+
+
+def _uv_rect_from_graph(material, actor=None):
+    """
+    The crop feeding the albedo sampler, read off the graph itself: the same
+    ([u0, v0, w, h], flip_u, flip_v) as _decal_uv_rect, or None when the engine or
+    the graph's shape cannot answer and the older readers should try.
+    """
+    trace = ue2g_common.trace_material_graph(material)
+    sample = (trace or {"samples": {}})["samples"].get("albedo")
+    base = _base_material_of(material)
+    if sample is None or base is None:
+        return None
+    graph = ue2g_common.MaterialGraph(base)
+    coords = [child for name, child, _out in graph.inputs(sample["node"])
+              if name.lower() in ("uvs", "coordinates")]
+    uv = _uv_affine(graph, coords[0], material) if coords else [(0, 1.0, 0.0), (1, 1.0, 0.0)]
+    if uv is None or len(uv) != 2 or uv[0][0] != 0 or uv[1][0] != 1:
+        return None
+
+    rect, flips = [0.0, 0.0, 0.0, 0.0], [False, False]
+    for axis, (_axis, scale, offset) in enumerate(uv):
+        size = abs(scale)
+        start = (offset if scale > 0.0 else offset + scale) % 1.0
+        # A whole number of wraps lands on an edge, give or take float32 noise.
+        if start > 1.0 - 1e-4 or start < 1e-4:
+            start = 0.0
+        if size < _UV_EPS or size > 1.0 + 1e-4:
+            _log_actor_warning(
+                actor, "decal atlas crop skipped",
+                "'{}' tiles its texture {} times; a Godot Decal cannot repeat a "
+                "texture inside its box".format(ue2g_common.safe_get_name(base), scale))
+            return None, False, False
+        # start + size may pass 1.0: the importer wraps, as Unreal's sampler does.
+        rect[axis], rect[axis + 2] = start, min(size, 1.0)
+        flips[axis] = scale < 0.0
+    if rect[2] >= 1.0 - 1e-4 and rect[3] >= 1.0 - 1e-4 and not any(flips)             and not (rect[0] or rect[1]):
+        return None, False, False
+    return rect, flips[0], flips[1]
+
+
 def _decal_uv_rect(material, actor=None):
     """
     The atlas sub-rect a decal material samples, as ([u0, v0, w, h], flip_u,
@@ -978,6 +1051,10 @@ def _decal_uv_rect(material, actor=None):
     base = _base_material_of(material)
     if base is None:
         return None, False, False
+
+    found = _uv_rect_from_graph(material, actor)
+    if found is not None:
+        return found
 
     mel = getattr(unreal, "MaterialEditingLibrary", None)
     getter = getattr(mel, "get_material_expressions", None) if mel else None
@@ -1154,6 +1231,19 @@ def _decal_modulate(comp, params, material):
     return [max(0.0, c) for c in modulate]
 
 
+def _bake_decal_scale(size_m, godot_transform):
+    """
+    Moves a decal's scale into its size, leaving only the sign behind (a mirror).
+
+    Same box, but Godot's Forward+ clustering culls a scaled Decal as if it were
+    smaller, cutting it off along 32 px blocks: 20 of Downtown_Alley's 30 rendered
+    crops lost part of their picture on Godot 4.7.2 before this.
+    """
+    scale = godot_transform.get("scale") or [1.0, 1.0, 1.0]
+    godot_transform["scale"] = [-1.0 if s < 0.0 else 1.0 for s in scale]
+    return [abs(v * s) for v, s in zip(size_m, scale)]
+
+
 def _decal_distance_fade(comp, size_m, scale):
     """
     Converts UE's FadeScreenSize into Godot (distance_fade_begin,
@@ -1236,12 +1326,12 @@ def _build_decal_entry(actor, comp, name, collected_textures):
 
     decal_size = ue2g_common.safe_get_prop(comp, "decal_size", None)
     if decal_size is not None:
-        # UE decal_size is HALF-size cm as (X=projection depth, Y=width, Z=height).
-        # Godot Decal.size is FULL-size meters as (x=width, y=projection depth, z=height).
+        # UE decal_size is HALF-size cm as (X=projection depth, Y=image height, Z=image
+        # width). Godot Decal.size is FULL-size meters as (width, projection depth, height).
         size_m = [
-            _f(decal_size.y) * 2.0 * ue2g_common.CM_TO_M,
-            _f(decal_size.x) * 2.0 * ue2g_common.CM_TO_M,
             _f(decal_size.z) * 2.0 * ue2g_common.CM_TO_M,
+            _f(decal_size.x) * 2.0 * ue2g_common.CM_TO_M,
+            _f(decal_size.y) * 2.0 * ue2g_common.CM_TO_M,
         ]
     else:
         size_m = [1.0, 1.0, 1.0]
@@ -1311,6 +1401,7 @@ def _build_decal_entry(actor, comp, name, collected_textures):
     godot_transform = _decal_transform(_component_world_transform(actor, comp))
     fade_begin, fade_length = _decal_distance_fade(
         comp, size_m, godot_transform.get("scale") or [1.0, 1.0, 1.0])
+    size_m = _bake_decal_scale(size_m, godot_transform)
 
     # A decal component hidden in game is content the level explicitly turned
     # off; a Godot node that ignores that arrives visible.

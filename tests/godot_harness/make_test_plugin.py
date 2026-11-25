@@ -19,6 +19,7 @@ RUNNER = '''@tool
 extends EditorPlugin
 
 const Importer = preload("res://addons/unreal_importer/import_unreal_layout.gd")
+const EnvImporter = preload("res://addons/unreal_importer/import_environment.gd")
 
 var failures: Array[String] = []
 var results: Array[String] = []
@@ -243,14 +244,14 @@ func _run_tests() -> void:
 		var dw: Vector3 = db.x * 0.5 * d.size.x
 		var dd: Vector3 = db.y * 0.5 * d.size.y
 		var dh: Vector3 = db.z * 0.5 * d.size.z
-		check("Decal width half-extent == (0, 0, 5.12)", near(dw, Vector3(0, 0, 5.12)), str(dw))
-		check("Decal projection depth half-extent == (6.4, 0, 0)", near(dd, Vector3(6.4, 0, 0)), str(dd))
-		check("Decal height half-extent == (0, 7.68, 0)", near(dh, Vector3(0, 7.68, 0)), str(dh))
-		# Projection runs along local -Y and must land where UE local -X did.
-		check("Decal projects along the converted UE -X",
-			near((-db.y).normalized(), Vector3(-1, 0, 0)), str((-db.y).normalized()))
+		check("Decal width half-extent (UE +Z) == (0, 7.68, 0)", near(dw, Vector3(0, 7.68, 0)), str(dw))
+		check("Decal projection depth half-extent == (-6.4, 0, 0)", near(dd, Vector3(-6.4, 0, 0)), str(dd))
+		check("Decal height half-extent (UE +Y) == (0, 0, 5.12)", near(dh, Vector3(0, 0, 5.12)), str(dh))
+		# Projection runs along local -Y, towards UE local +X.
+		check("Decal projects along the converted UE +X",
+			near((-db.y).normalized(), Vector3(1, 0, 0)), str((-db.y).normalized()))
 		check("Decal depth NOT the pre-fix 2.56 m half-extent",
-			not near(dd, Vector3(2.56, 0, 0)), str(dd))
+			not near(dd.abs(), Vector3(2.56, 0, 0)), str(dd))
 		# Material tint / DecalColor / opacity all land in modulate, and UE's
 		# screen-size fade arrives as a distance fade. These used to be dropped.
 		check("Decal modulate carries the UE tint and opacity",
@@ -571,6 +572,21 @@ func _test_materials(root: Node) -> void:
 		bm.transparency == BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR, str(bm.transparency))
 	check("masked material preserves UE opacity_mask_clip_value",
 		absf(bm.alpha_scissor_threshold - 0.45) < 0.001, str(bm.alpha_scissor_threshold))
+	var cutout := bm.albedo_texture.get_image().get_pixel(0, 0) if bm.albedo_texture else Color.BLACK
+	check("opacity mask is read from its opacity_channel (blue)",
+		absf(cutout.a - 128.0 / 255.0) < 0.01, str(cutout))
+
+	# A decal crop running past the atlas edge wraps round, as Unreal's sampler does.
+	var sheet := Image.create_empty(4, 1, false, Image.FORMAT_RGBA8)
+	for x in 4:
+		sheet.set_pixel(x, 0, Color8(x * 10, 0, 0))
+	var wrapped: Texture2D = EnvImporter.new()._crop_decal_texture(
+		"sheet", ImageTexture.create_from_image(sheet), [0.75, 0.0, 0.5, 1.0], false, false)
+	var strip := wrapped.get_image()
+	check("a decal crop past the edge wraps to the other side",
+		strip.get_width() == 2 and strip.get_pixel(0, 0).r8 == 30
+		and strip.get_pixel(1, 0).r8 == 0 and strip.get_pixel(1, 0).a8 == 255,
+		"%s %s" % [strip.get_pixel(0, 0), strip.get_pixel(strip.get_width() - 1, 0)])
 	check("two-sided material disables backface culling",
 		bm.cull_mode == BaseMaterial3D.CULL_DISABLED, str(bm.cull_mode))
 	check("emissive material enables emission with multiply operator and energy",
@@ -707,6 +723,14 @@ func _test_phase3_scene_parity(root: Node) -> void:
 			"db=%s pitch=%s dist=%s auto=%s" % [aud.volume_db, aud.pitch_scale, aud.max_distance, aud.autoplay])
 
 
+func node_names(n: Node) -> Array:
+	var out := [str(n.name)]
+	for c in n.get_children():
+		out.append_array(node_names(c))
+	out.sort()
+	return out
+
+
 func _test_phase4_workflow(root: Node) -> void:
 	print("\\n--- Phase 4: incremental update, Blueprint prefabs, dry-run preview & dock config ---")
 	# 1. Pre-import JSON dry-run summary
@@ -753,6 +777,58 @@ func _test_phase4_workflow(root: Node) -> void:
 	check("incremental update with prune_removed removed deleted Crate_1",
 		find_node(inc_root, "Crate_1") == null)
 	inc_root.queue_free()
+
+	# 2b. Feature nodes (lights, decals, foliage, terrain...) must not duplicate on update.
+	var feat_root := Node3D.new()
+	feat_root.name = "FeatRoot"
+	get_tree().get_root().add_child(feat_root)
+	var feat_opts := {"apply_metadata": false, "update_existing": true, "terrain_mode": "mesh"}
+	await Importer.new().do_import("res://level_layout.json", "res://models/", "res://textures/", feat_root, feat_opts)
+	var feat_before := node_names(feat_root)
+	var lights_before := feat_root.get_node("UnrealLights")
+	var edited := lights_before.get_child(0)
+	var edited_child := Node3D.new()
+	edited_child.name = "UserChild"
+	edited.add_child(edited_child)
+	var user_light := OmniLight3D.new()
+	user_light.name = "UserLight"
+	lights_before.add_child(user_light)
+	await Importer.new().do_import("res://level_layout.json", "res://models/", "res://textures/", feat_root, feat_opts)
+	await get_tree().process_frame
+	check("incremental update keeps user nodes in feature containers",
+		is_instance_valid(user_light) and is_instance_valid(edited)
+		and edited.get_node_or_null("UserChild") != null)
+	if is_instance_valid(user_light):
+		user_light.free()
+	edited_child.free()
+	var feat_after := node_names(feat_root)
+	check("incremental update does not duplicate feature nodes",
+		feat_after == feat_before and feat_root.get_node("UnrealLights") == lights_before,
+		"before %s after %s" % [feat_before, feat_after])
+	var unowned := 0
+	for c in lights_before.get_children():
+		if c.owner != feat_root:
+			unowned += 1
+	check("re-imported feature nodes stay owned by the scene root", unowned == 0, str(unowned))
+	feat_root.queue_free()
+
+	# 2c. A missing-mesh placeholder is not duplicated, and gives way to its mesh.
+	var miss := FileAccess.open("res://level_layout_missing.json", FileAccess.WRITE)
+	miss.store_string(FileAccess.get_file_as_string("res://level_layout_v2.json").replace("SM_Crate", "SM_NotHere"))
+	miss.close()
+	var miss_root := Node3D.new()
+	get_tree().get_root().add_child(miss_root)
+	for _i in range(2):
+		await Importer.new().do_import("res://level_layout_missing.json", "res://models/", "res://textures/", miss_root, upd_opts)
+		await get_tree().process_frame
+	var markers := node_names(miss_root).filter(func(x): return "_MISSING_" in x)
+	check("incremental update keeps a single missing-mesh placeholder", markers.size() == 1, str(markers))
+	await Importer.new().do_import("res://level_layout_v2.json", "res://models/", "res://textures/", miss_root, upd_opts)
+	await get_tree().process_frame
+	markers = node_names(miss_root).filter(func(x): return "_MISSING_" in x)
+	check("placeholder is replaced once its mesh exists",
+		markers.is_empty() and find_node(miss_root, "Fresh_Actor") != null, str(markers))
+	miss_root.queue_free()
 
 	# 3. Blueprint prefab extraction (.tscn sub-scene)
 	var pref_root := Node3D.new()

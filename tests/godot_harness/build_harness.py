@@ -109,7 +109,7 @@ write_png(os.path.join(HARNESS, "textures", "TX_Test_NRM.png"), (128, 200, 255))
 write_png(os.path.join(HARNESS, "textures", "TX_Test_NRM_GL.png"), (128, 200, 255))
 write_png(os.path.join(HARNESS, "textures", "TX_Test_RMA.png"), (60, 200, 90))
 write_png(os.path.join(HARNESS, "textures", "TX_Test_EMI.png"), (255, 180, 40))
-write_png(os.path.join(HARNESS, "textures", "TX_Test_OPA.png"), (128, 128, 128))
+write_png(os.path.join(HARNESS, "textures", "TX_Test_OPA.png"), (10, 20, 128))
 
 # --- minimal valid glTF: one triangle with UVs, buffer as a data URI ----------
 positions = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]
@@ -317,6 +317,7 @@ layout = {
                     "two_sided": True,
                     "opacity_mask_clip_value": 0.45,
                     "opacity_texture": "TX_Test_OPA",
+                    "opacity_channel": 2,
                     "emissive_color": [0.5, 1.0, 0.25],
                     "emissive_texture": "TX_Test_EMI",
                     "emissive_energy": 2.5,
@@ -481,24 +482,23 @@ layout = {
     ],
     # One decal, written exactly as the exporter emits it for a UE DecalActor at
     # the origin with yaw +90 and scale (X=5, Y=2, Z=3), keeping UE's default
-    # decal_size half-extents (128, 256, 256) cm = (depth, width, height).
+    # decal_size half-extents (128, 256, 256) cm = (depth, image height, image width).
     #
-    #   size_m          = [Y*2, X*2, Z*2] * 0.01           = [5.12, 2.56, 5.12]
-    #   rotation_quat   = R_std . Rx(-90), R_std = Ry(-90) => (-.5, -.5, -.5, .5)
-    #   scale           = [usy, usx, usz]                  = [2, 5, 3]
-    #                     (Y/Z swapped vs the standard [usy, usz, usx] because the
-    #                      Rx(-90) fix-up re-labels the node's local Y and Z)
+    #   size_m          = [Z*2, X*2, Y*2] * 0.01           = [5.12, 2.56, 5.12]
+    #   rotation_quat   = R_std . fix-up, R_std = Ry(-90)  => (0, 0, .7071, .7071)
+    #   scale           = [usz, usx, usy]                  = [3, 5, 2]
+    #                     (the standard [usy, usz, usx] permuted by the fix-up)
     #
     # Rendered half-extents are 0.5 * size[j] * basis column j, so the Decal must
-    # come out width (0,0,5.12), projection depth (6.4,0,0), height (0,7.68,0) --
-    # which is the UE box (256*2, 128*5, 256*3 cm along its local Y/X/Z) taken
+    # come out width (0,7.68,0), projection depth (-6.4,0,0), height (0,0,5.12) --
+    # which is the UE box (256*3, -128*5, 256*2 cm along its local Z/X/Y) taken
     # through the layout conversion. See test_math.py section 11.
     "decals": [
         {
             "name": "Decal_Skewed",
             "godot_transform": {"translation": [0.0, 0.0, 0.0],
-                                "rotation_quat": [-0.5, -0.5, -0.5, 0.5],
-                                "scale": [2.0, 5.0, 3.0]},
+                                "rotation_quat": [0.0, 0.0, 0.7071067811865476, 0.7071067811865476],
+                                "scale": [3.0, 5.0, 2.0]},
             "size_m": [5.12, 2.56, 5.12],
             "sort_order": 0,
             "visible": True,

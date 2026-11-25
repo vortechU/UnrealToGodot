@@ -28,7 +28,7 @@ The repository contains two paired components that share a versioned JSON layout
 | Engine | Tested Version | Requirements & Notes |
 | --- | --- | --- |
 | **Unreal Engine** | **5.7 – 5.8** | Confirmed against the same landscape and material test suite (landscape APIs behave identically on both). Earlier 5.x versions are **untested**, though version-specific APIs are probed at runtime rather than assumed—if you test an older version, [let us know on Discord](https://discord.com/invite/HGwkYW2h6Y). Requires built-in **Python Editor Script Plugin**, **Editor Scripting Utilities**, and **glTF Exporter**. |
-| **Godot Engine** | **4.7.1** | The addon ships `.uid` resource sidecars (introduced in Godot 4.4), making **Godot 4.4+** the practical minimum. |
+| **Godot Engine** | **4.7.1 – 4.7.2** | The addon ships `.uid` resource sidecars (introduced in Godot 4.4), making **Godot 4.4+** the practical minimum. |
 
 Both plugins stamp and verify a schema `format_version`. A mismatched plugin/addon pair fails immediately with a message telling you which side to update, rather than breaking halfway through an import.
 
@@ -50,7 +50,7 @@ Both plugins stamp and verify a schema `format_version`. A mismatched plugin/add
 
 - **PBR Material & Texture Binding** — Maps Unreal material parameters (albedo, normal, roughness, metallic, ORM/RMA, tiling, emissive, blend mode/alpha cutout, opacity masks, and two-sided culling) and auto-exported textures onto Godot `StandardMaterial3D` / `ORMMaterial3D` resources with case-insensitive file matching, non-destructive DirectX → OpenGL normal-map Y-flipping, and optional reusable `.tres` material saving.
 - **Lighting & Post-Processing** — Converts every light component (including lights nested inside Blueprint props, not only standalone light actors) into `DirectionalLight3D`, `OmniLight3D`, or `SpotLight3D`. Carries unit-normalized intensity (lumens, candela, unitless, EV, nits), linear color, cone angles, source size, specular/volumetric scattering, shadow distance, distance fade, and visibility. Translates `PostProcessVolume`, height fog, and sky settings into a Godot `WorldEnvironment` (bloom, SSAO, exposure, fog, sky, and color temperature).
-- **Decals** — Exports every decal component (including those on Blueprint props) as Godot `Decal` nodes preserving bounds, projection axis, textures, tint/opacity, visibility, sorting priority, and distance fade.
+- **Decals** — Exports every decal component (including those on Blueprint props) as Godot `Decal` nodes preserving bounds, orientation, textures, atlas crops, tint/opacity, visibility, sorting priority, and distance fade.
 
 ### Environments, Foliage & Gameplay Data
 
@@ -79,6 +79,8 @@ Both plugins stamp and verify a schema `format_version`. A mismatched plugin/add
 │       ├── import_terrain.gd                 # Landscape rebuild (Terrain3D / mesh fallback)
 │       ├── import_foliage.gd                 # MultiMesh foliage rebuild
 │       ├── import_gameplay.gd                # Navigation regions + node metadata
+│       ├── import_skeletal_physics.gd        # Physics asset -> PhysicalBone3D ragdolls
+│       ├── import_spline_mesh.gd             # Spline mesh deformation
 │       ├── import_report.gd                  # Import audit report writer
 │       ├── texture_import_limit.gd           # Texture resolution cap & disk shrinking
 │       ├── importer_dock.gd                  # Editor dock GUI & feature toggles
@@ -190,19 +192,19 @@ This tool migrates **art**, not **behavior**. Typical environment, prop, and mod
 | --- | --- | --- |
 | **Static & skeletal meshes, collision shapes, level layout, Blueprint actor hierarchy** | Transfers well | Positions, rotations, non-uniform scales, and relative offsets come across cleanly. |
 | **Lights, sky/fog/post-process, decals, foliage (MultiMesh), navigation volumes, tags** | Transfers well | Mapped to native Godot 4 nodes and `get_meta()` metadata. |
-| **PBR materials, lighting calibration, Nanite meshes, landscape materials** | Approximate | Expect minor manual tuning—details below. |
-| **Blueprint graphs, gameplay systems, AnimBlueprints, particles, audio, cameras** | Out of scope | Not converted by design; rebuild behavior in GDScript. |
+| **PBR materials, lighting calibration, Nanite meshes, landscape materials, cameras, ambient audio (Sound Waves)** | Approximate | Expect minor manual tuning—details below. |
+| **Blueprint graphs, gameplay systems, AnimBlueprints, particles, Sound Cue logic** | Out of scope | Not converted by design; rebuild behavior in GDScript. |
 
 ### Transfers Approximately (Expect Some Manual Work)
 
-- **Materials (parameter-level, not shader-graph-level):** Albedo, normal, and ORM/RMA maps along with scalar, vector, and tiling parameters rebuild as Godot `StandardMaterial3D` / `ORMMaterial3D`. Custom shader graph logic—HLSL nodes, world-position offset, vertex-paint blending, or parallax—has no automatic equivalent and must be reauthored.
+- **Materials (parameter-level, not shader-graph-level):** Albedo, normal, and packed maps along with scalar, vector, and tiling parameters rebuild as Godot `StandardMaterial3D` / `ORMMaterial3D`. On UE 5.8 the exporter reads the material graph to see which texture channel drives which output; older engines go by parameter and texture names. Custom shader graph logic—HLSL nodes, hue shifts, blends of several textures, world-position offset, vertex-paint blending, or parallax—has no automatic equivalent and must be reauthored.
 - **Lighting (calibrated, not identical):** Unreal (lumens/candela/lux, Lumen) and Godot (energy, SDFGI/VoxelGI) use fundamentally different lighting and tonemapping pipelines. Intensities are normalized to candelas via Unreal's unit conversion and anchored so a default Unreal light imports as a default Godot light. Use **Light energy scale** for a quick global pass; raw Unreal intensities, units, and normalized candela values are also stored in the JSON if you want to build a custom mapping.
 - **Nanite meshes:** Godot has no Nanite equivalent. Nanite assets export as standard triangle meshes at their available LODs; packs authored assuming Nanite polygon budgets may need decimation.
 
 ### Out of Scope by Design
 
 - **Gameplay logic & systems:** Blueprint event graphs, gameplay frameworks, AnimBlueprints, and animation state machines do not convert and are not planned in the near term. Blueprint *actors* still transfer with their meshes, relative offsets, and (where exposed by Unreal's Python API) variables as node metadata so you have the scene structure ready to script against in GDScript.
-- **Other unexported types:** Niagara/Cascade particle systems, audio (sound cues, ambient actors, attenuation), and `CameraActor`s are not exported.
+- **Other unexported types:** Niagara/Cascade particle systems and Sound Cue graphs are not exported.
 - **Animations:** Raw animation *sequences* can be embedded in glTF via **Export Animation Sequences (Skeletal Meshes)**, though the logic driving them cannot.
 
 ### Landscapes: Install Terrain3D
@@ -216,7 +218,7 @@ Heightmaps and paint-layer weightmaps export as float EXRs, and the terrain surf
 ### Workflow Boundaries
 
 - **Only loaded levels are exported (with diagnostics):** The exporter reads actors from the currently loaded world and now inspects World Partition / streaming sublevels, warning in `ue2g_report.txt` and the dock preview whenever unloaded sublevels or World Partition cells are detected.
-- **Incremental re-import:** Enable **Update existing scene (incremental)** in the Godot importer dock to match actors by `unreal_actor_id` and update them in place (preserving custom Godot scripts and children), with optional pruning of removed actors. Leave it off for a clean one-shot import into a fresh scene.
+- **Incremental re-import:** Enable **Update existing scene (incremental)** in the Godot importer dock to match actors by `unreal_actor_id` and update them in place (preserving custom Godot scripts and children), with optional pruning of removed actors. Lights, decals, probes, cameras, audio, foliage, and navigation are rebuilt on each update, so edits to those generated nodes are lost unless the node has a script or children of its own (then it is kept as is); nodes you add to their containers stay. An existing WorldEnvironment or terrain is left alone, and on actors with several components only the actor itself is moved. Leave it off for a clean one-shot import into a fresh scene.
 
 ---
 

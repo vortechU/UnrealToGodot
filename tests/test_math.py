@@ -6,8 +6,8 @@ Numerically verifies the core coordinate math in ue2g_common.py by stubbing the
   3. godot_transform_basis (packed 12-float foliage layout) agrees with
      unreal_to_godot_transform (quat+scale) -- catches row/column packing bugs
   4. matrix_to_quat round-trip
-  5. the decal fix-up quaternion actually aligns Godot -Y with UE -X, and
-     carries the scale with it so the decal box keeps its UE dimensions
+  5. the decal fix-up quaternion puts UE's image axes (U=+Z, V=+Y) on Godot's, and
+     carries the scale with it so the decal box keeps its UE dimensions (section 11)
   6. build_export_name_map collision handling
   7. the schema's `scale` is a LOCAL scale: consumers must scale basis columns
 """
@@ -141,7 +141,7 @@ check("all 200 rotations satisfy C*R*C^T", bad == 0, "%d mismatches" % bad)
 print("\n=== 3. UE forward +X maps to Godot -Z ===")
 # For identity UE rotation, a UE local +X direction must land on Godot -Z.
 check("C * (1,0,0) == (0,0,-1)", matvec(CB, [1, 0, 0]) == [0.0, 0.0, -1.0])
-check("C * (-1,0,0) == (0,0,1)  (decal projection dir)",
+check("C * (-1,0,0) == (0,0,1)  (UE -X, a decal's Godot +Y)",
       matvec(CB, [-1, 0, 0]) == [0.0, 0.0, 1.0])
 
 print("\n=== 4. godot_transform_basis agrees with unreal_to_godot_transform ===")
@@ -191,36 +191,6 @@ edge = [
 for name, q in edge:
     M = quat_to_mat(q)
     check("edge rotation: %s" % name, mclose(M, quat_to_mat(C.matrix_to_quat(M)), 1e-5))
-
-print("\n=== 6. Decal fix-up quaternion ===")
-FIX = (-0.7071067811865476, 0.0, 0.0, 0.7071067811865476)
-
-
-def qmul(q1, q2):
-    x1, y1, z1, w1 = q1
-    x2, y2, z2, w2 = q2
-    return (w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2)
-
-
-check("R_fix * (0,1,0) == (0,0,-1)",
-      all(close(a, b, 1e-9) for a, b in zip(matvec(quat_to_mat(FIX), [0, 1, 0]), [0, 0, -1])))
-# The real requirement: R_final * (0,-1,0) == R_std * (0,0,1) for ANY actor rotation
-bad = 0
-for _ in range(200):
-    q = rand_quat(rng)
-    tr = Transform(Vector(0, 0, 0), Quat(*q), Vector(1, 1, 1))
-    std = C.unreal_to_godot_transform(tr)
-    q_std = tuple(std["rotation_quat"])
-    q_final = qmul(q_std, FIX)
-    lhs = matvec(quat_to_mat(q_final), [0, -1, 0])   # Godot Decal projects along -Y
-    rhs = matvec(quat_to_mat(q_std), [0, 0, 1])      # where UE -X actually landed
-    if not all(close(a, b, 1e-5) for a, b in zip(lhs, rhs)):
-        bad += 1
-check("Godot Decal -Y aligns with UE -X for 200 rotations", bad == 0,
-      "%d mismatches" % bad)
 
 print("\n=== 7. build_export_name_map collision handling ===")
 
@@ -364,16 +334,16 @@ check("row scaling (S * R) does NOT -- the mix-up is observable",
       worst_row > 0.1, "worst = %.3e" % worst_row)
 
 print("\n=== 11. Decal box: the fix-up rotation must carry the scale with it ===")
-# _decal_transform folds Rx(-90) into the rotation so Godot's -Y projection axis
-# lines up with UE's -X. That re-labels the node's local Y and Z, so the scale has
-# to be conjugated by the same rotation (its Y and Z swap). Forgetting that swaps
-# a decal's projection depth with its height. End-to-end check: reproduce the box
+# _decal_transform folds in a rotation that puts UE's image axes (U=+Z, V=+Y, per
+# DeferredDecal.usf) on Godot's (U=+X, V=+Z), so the scale has to be permuted by it
+# too. Forgetting that swaps a decal's projection depth with its size. End-to-end check: reproduce the box
 # Godot renders (0.5 * size[j] * basis column j) and compare it to the UE decal box.
 import export_environment as EE
 
-# UE default decal_size, half-extents cm: (X=projection depth, Y=width, Z=height)
-DS = (128.0, 256.0, 256.0)
-SIZE_M = [DS[1] * 2 * 0.01, DS[0] * 2 * 0.01, DS[2] * 2 * 0.01]   # what _build_decal_entry emits
+# decal_size half-extents cm: (X=projection depth, Y=image height, Z=image width).
+# Not square, so a swapped width and height cannot pass.
+DS = (128.0, 64.0, 256.0)
+SIZE_M = [DS[2] * 2 * 0.01, DS[0] * 2 * 0.01, DS[1] * 2 * 0.01]   # what _build_decal_entry emits
 
 worst = 0.0
 for _ in range(300):
@@ -391,11 +361,11 @@ for _ in range(300):
         "height": [basis[i][2] * 0.5 * SIZE_M[2] for i in range(3)],
     }
     # Truth: UE half-extent vectors DS[i]*scale[i] along the actor's local axes,
-    # converted with the layout map. UE local X=depth, Y=width, Z=height.
+    # converted with the layout map. Godot +Y is UE -X; U is UE +Z, V is UE +Y.
     Ru = quat_to_mat(q)
     want = {}
-    for name, axis in (("depth", 0), ("width", 1), ("height", 2)):
-        ue_vec = [Ru[i][axis] * DS[axis] * sc[axis] * 0.01 for i in range(3)]
+    for name, axis, sign in (("depth", 0, -1), ("width", 2, 1), ("height", 1, 1)):
+        ue_vec = [sign * Ru[i][axis] * DS[axis] * sc[axis] * 0.01 for i in range(3)]
         want[name] = matvec(CB, ue_vec)
     for name in want:
         worst = max(worst, max(abs(got[name][i] - want[name][i]) for i in range(3)))

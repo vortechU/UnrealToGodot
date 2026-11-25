@@ -333,9 +333,8 @@ def _decal_size_with_min_depth(size, transform, min_depth):
     size_m with its projection depth (index 1) floored at min_depth.
 
     The floor is on the EFFECTIVE depth -- size[1] times the node's Y scale --
-    because the exporter leaves size_m at Unreal's DecalSize and puts the rest in
-    the transform, so size[1] is routinely 0.02 against a scale of several
-    hundred. Flooring size[1] alone would do nothing.
+    because layouts from before v0.5 keep Unreal's scale in the transform, where
+    size[1] is routinely 0.02 against a scale of several hundred.
     """
     out = [max(abs(_num(size[i], 1.0)) if len(size) > i else 1.0, 0.01) for i in range(3)]
     try:

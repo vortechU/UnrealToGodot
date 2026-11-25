@@ -50,6 +50,10 @@ func apply(data: Dictionary, root: Node, scene_owner: Node, options: Dictionary)
 		if not (ls is Dictionary):
 			continue
 		var ls_name := Common.get_str(ls, "name", "Landscape")
+		if options.get("update_existing", false) and (root.has_node(ls_name)
+				or root.has_node(ls_name + "_Terrain3D")):
+			warnings.append("Landscape '%s' already exists in the scene; delete it to rebuild it." % ls_name)
+			continue
 		var img := _load_heightmap(ls, json_dir, warnings)
 		if img == null:
 			warnings.append("Landscape '%s': heightmap could not be loaded (%s)." % [ls_name, Common.get_str(ls, "heightmap_file", "?")])

@@ -995,6 +995,232 @@ check("an instance's OWN cell wins over the parent's default",
       _close(rect, [0.75, 0.5, 0.25, 0.25]), rect)
 
 
+print("\n=== 6d. Material graph tracing (UE 5.8 graph API) ===")
+# Shapes and values are Downtown_Alley's, dumped from UE 5.8: a "Surface" map no
+# name can classify, plain texture samples on a brick master, a dirt colour lerped
+# over the plaster, and decals cropped by a MaterialInstanceDynamic's scalars.
+
+
+class _Node:
+    _count = 0
+
+    def __init__(self, kind, inputs=(), **props):
+        # kind -> its own class, because the exporter reads the class name.
+        self.__class__ = type("MaterialExpression" + kind, (_Node,), {})
+        _Node._count += 1
+        self._name = "%s_%d" % (kind, _Node._count)
+        self._inputs = list(inputs)     # (input name, node, node's output name)
+        self._props = props
+
+    def get_name(self):
+        return self._name
+
+    def get_editor_property(self, key):
+        if key not in self._props:
+            raise Exception("no property %r" % key)
+        return self._props[key]
+
+
+class _GraphMat(_BaseMat):
+    _count = 0
+
+    def __init__(self, outputs, blend_mode="OPAQUE", scalars=(), vectors=(), textures=()):
+        _BaseMat.__init__(self, [])
+        _GraphMat._count += 1
+        self._path = "/Game/M_Graph%d" % _GraphMat._count
+        self._outputs = outputs
+        self._blend = blend_mode
+        self._scalarparams, self._vectorparams = dict(scalars), dict(vectors)
+        self._texparams = dict(textures)
+
+    def get_base_material(self):
+        return self
+
+    def get_path_name(self):
+        return self._path
+
+    def get_editor_property(self, key):
+        if key == "blend_mode":
+            return self._blend
+        raise Exception("no property %r" % key)
+
+
+class _GraphMI(_MI):
+    def get_base_material(self):
+        return self.get_editor_property("parent").get_base_material()
+
+
+def _graph_mi(parent, **params):
+    props = {"texture_parameter_values": [], "scalar_parameter_values": [],
+             "vector_parameter_values": [], "parent": parent}
+    props.update(params)
+    return _GraphMI(props)
+
+
+def _value_param(name, value):
+    return types.SimpleNamespace(parameter_info=types.SimpleNamespace(name=name),
+                                 parameter_value=value)
+
+
+class _RGBA:
+    def __init__(self, r, g, b, a):
+        self.r, self.g, self.b, self.a = r, g, b, a
+
+
+class _AnyProperty:
+    def __getattr__(self, name):
+        return name
+
+
+_GRAPH_API = {
+    "get_material_property_input_node":
+        lambda m, p: getattr(m, "_outputs", {}).get(p, (None, ""))[0],
+    "get_material_property_input_node_output_name": lambda m, p: m._outputs[p][1],
+    "get_inputs_for_material_expression": lambda m, n: [i[1] for i in n._inputs],
+    "get_material_expression_input_names": lambda n: [i[0] for i in n._inputs],
+    "get_input_node_output_name_for_material_expression":
+        lambda n, child: [i[2] for i in n._inputs if i[1] is child][0],
+}
+for _name, _fn in _GRAPH_API.items():
+    setattr(_FakeMEL, _name, staticmethod(_fn))
+u.MaterialProperty = _AnyProperty()
+
+
+def _sample(tex, param=None, uv=None):
+    kind = "TextureSampleParameter2D" if param else "TextureSample"
+    props = {"texture": tex}
+    if param:
+        props["parameter_name"] = param
+    return _Node(kind, [("UVs", uv, "")] if uv else [("UVs", None, "")], **props)
+
+
+def _bin(kind, a, b, **props):
+    return _Node(kind, [("A",) + a, ("B",) + b], **props)
+
+
+# --- packed "Surface" map, mask in its alpha ---
+_surface = _sample(_Tex("T_Default_s"), "Surface")
+_base_tex = _sample(_Tex("T_Default_d"), "Base Map")
+_props_master = _GraphMat({
+    "MP_BASE_COLOR": (_base_tex, "RGB"), "MP_ROUGHNESS": (_surface, "G"),
+    "MP_METALLIC": (_surface, "B"), "MP_AMBIENT_OCCLUSION": (_surface, "R"),
+    "MP_OPACITY_MASK": (_surface, "A")}, blend_mode="MASKED")
+_fence = EL.extract_material_parameters(_graph_mi(_props_master, texture_parameter_values=[
+    _TexParam("Surface", _Tex("T_Fence_s")), _TexParam("Base Map", _Tex("T_Fence_da"))]))
+check("a 'Surface' map binds by what the graph reads from it",
+      _fence["packed_texture"] == "T_Fence_s"
+      and _fence["packed_channels"] == {"roughness": 1, "metallic": 2, "ao": 0}, _fence)
+check("...and its scalars pass the map through",
+      _fence["roughness"] == 1.0 and _fence["metallic"] == 1.0, _fence)
+check("an opacity mask in the packed map's alpha is bound with its channel",
+      (_fence["opacity_texture"], _fence["opacity_channel"]) == ("T_Fence_s", 3), _fence)
+check("the traced albedo binds too", _fence["albedo_texture"] == "T_Fence_da", _fence)
+
+# --- plain samples on a parent master, roughness scaled by a scalar ---
+_brick_d, _brick_s = _sample(_Tex("T_Brick_d")), _sample(_Tex("T_Brick_s"))
+_tint = _Node("VectorParameter", parameter_name="Brick Tint")
+_dirt = _Node("VectorParameter", parameter_name="Dirt Color")
+_mask = _sample(_Tex("T_Dirt_Mask"), "Dirt Mask")
+_dirty = _Node("LinearInterpolate", [
+    ("A", _bin("Multiply", (_brick_d, "RGB"), (_tint, "")), ""), ("B", _dirt, ""),
+    ("Alpha", _mask, "R")])
+_rough_scale = _Node("ScalarParameter", parameter_name="Gloss Amount", default_value=0.7)
+_brick = _GraphMat({
+    "MP_BASE_COLOR": (_dirty, ""),
+    "MP_ROUGHNESS": (_bin("Multiply", (_brick_s, "G"), (_rough_scale, "")), ""),
+    "MP_METALLIC": (_Node("Constant", r=0.25), "")},
+    scalars={"Gloss Amount": 0.7, "Dirt Roughness Opacity": 0.1},
+    vectors={"Dirt Color": _RGBA(0.04, 0.03, 0.02, 1.0),
+             "Brick Tint Color": _RGBA(0.1, 0.1, 0.1, 1.0)},
+    textures={"Dirt Mask": _Tex("T_Dirt_Mask")})
+_p = EL.extract_material_parameters(_graph_mi(_brick))
+check("plain TextureSample nodes on a parent master are bound",
+      _p["albedo_texture"] == "T_Brick_d" and _p["packed_texture"] == "T_Brick_s"
+      and _p["packed_channels"] == {"roughness": 1}, _p)
+check("a colour blended over the texture is not its tint",
+      _p["albedo_color"] == [1.0, 1.0, 1.0, 1.0], _p["albedo_color"])
+check("the scalar that really scales roughness is used, not one named like it",
+      _p["roughness"] == 0.7, _p["roughness"])
+check("a constant wired into metallic is exported", _p["metallic"] == 0.25, _p["metallic"])
+
+# --- two textures mixed into one output: nothing can be bound faithfully ---
+_mixed = EL.extract_material_parameters(_GraphMat({
+    "MP_ROUGHNESS": (_bin("Multiply", (_sample(_Tex("T_X")), "R"),
+                          (_sample(_Tex("T_Y")), "G")), "")}))
+_weighted = EL.extract_material_parameters(_GraphMat({
+    "MP_ROUGHNESS": (_bin("Add", (_sample(_Tex("T_X")), "R"),
+                          (_bin("Multiply", (_sample(_Tex("T_Y")), "G"), (_Node(
+                              "ScalarParameter", parameter_name="Dirt Roughness"), "")), "")), "")},
+    scalars={"Dirt Roughness": 0.0}))
+check("a scalar weighting one of several textures is not the roughness",
+      _weighted["roughness"] == 0.5, _weighted["roughness"])
+check("a product of two textures binds neither",
+      _mixed["packed_texture"] is None and _mixed["roughness_texture"] is None, _mixed)
+_inverted = EL.extract_material_parameters(_GraphMat({
+    "MP_ROUGHNESS": (_Node("OneMinus", [("Input", _sample(_Tex("T_Gloss")), "R")]), "")}))
+check("an inverted (gloss) map is not bound as roughness",
+      _inverted["packed_texture"] is None and _inverted["roughness_texture"] is None, _inverted)
+
+
+# --- decal: MaterialInstanceDynamic, tint alpha unused, cropped by scalars ---
+def _decal_graph_mat():
+    def scalar(name, mask):
+        return (_Node("ComponentMask", [("None", _Node(
+            "ScalarParameter", parameter_name=name, default_value=1.0), "")], **mask), "")
+    xs, ys = {"r": True}, {"g": True}
+    uv = _bin("Multiply",
+              (_bin("Add", (_Node("TextureCoordinate", u_tiling=1.0, v_tiling=1.0), ""),
+                    (_bin("AppendVector", scalar("Offset X", xs), scalar("Offset Y", ys)), "")),
+               ""),
+              (_bin("AppendVector", scalar("Scale X", xs), scalar("Scale Y", ys)), ""))
+    tex = _sample(_Tex("T_Wall_Paint_da"), "Decal Texture", uv)
+    tint = _Node("VectorParameter", parameter_name="Color Tint")
+    return _GraphMat({"MP_BASE_COLOR": (_bin("Multiply", (tex, "RGB"), (tint, "")), ""),
+                      "MP_OPACITY": (tex, "A")}, blend_mode="TRANSLUCENT",
+                     scalars={"Scale X": 1.0, "Scale Y": 1.0, "Offset X": 0.0, "Offset Y": 0.0},
+                     vectors={"Color Tint": _RGBA(0.5, 1.0, 1.0, 0.0)},
+                     textures={"Decal Texture": _Tex("T_Wall_Paint_da")})
+
+
+def _decal_mid(ox, oy, sx, sy):
+    return _graph_mi(_decal_graph_mat(), scalar_parameter_values=[
+        _value_param(n, v) for n, v in zip(("Offset X", "Offset Y", "Scale X", "Scale Y"),
+                                           (ox, oy, sx, sy))])
+
+
+# The library getter refuses a dynamic instance, as the engine's does.
+def _mic_only(mi, name):
+    raise TypeError("not a MaterialInstanceConstant")
+
+
+_FakeMEL.get_material_instance_scalar_parameter_value = staticmethod(_mic_only)
+_mid = _decal_mid(6.4, 7.25, 0.2, 0.12)
+_p = EL.extract_material_parameters(_mid)
+check("a 'Decal Texture' parameter is the decal's albedo",
+      _p["albedo_texture"] == "T_Wall_Paint_da", _p)
+check("a tint's unused alpha does not make the decal invisible",
+      _p["albedo_color"] == [0.5, 1.0, 1.0, 1.0], _p["albedo_color"])
+check("alpha already inside the albedo needs no opacity texture",
+      _p["opacity_texture"] is None, _p)
+rect, fu, fv = EE._decal_uv_rect(_mid)
+check("a dynamic instance's offset/scale crop is read off the graph",
+      _close(rect, [0.28, 0.87, 0.2, 0.12], 1e-6) and not fu and not fv, (rect, fu, fv))
+rect, _, _ = EE._decal_uv_rect(_decal_mid(3.5, 0.0, 0.25, 0.5))
+check("a crop running past the edge keeps its full size", _close(rect, [0.875, 0.0, 0.25, 0.5]), rect)
+check("an uncropped decal records none",
+      EE._decal_uv_rect(_decal_mid(0.0, 0.0, 1.0, 1.0)) == (None, False, False))
+check("a tiled decal is refused", EE._decal_uv_rect(_decal_mid(0.0, 0.0, 3.0, 1.0))[0] is None)
+
+for _name in _GRAPH_API:
+    delattr(_FakeMEL, _name)
+del u.MaterialProperty
+
+_tr = {"scale": [3.0, -5.0, 2.0]}
+check("a decal's scale moves into its size, keeping only a mirror",
+      EE._bake_decal_scale([1.0, 2.0, 0.5], _tr) == [3.0, 10.0, 1.0]
+      and _tr["scale"] == [1.0, -1.0, 1.0], _tr)
+
+
 print("\n=== 7. Decal modulate, visibility and distance fade ===")
 
 
@@ -2014,13 +2240,25 @@ check("audio collected with dB conversion, attenuation radius, and SoundWave que
       and _fake_sw in p3_sounds, p3_env["audio"])
 
 print("\n=== 15. Phase 4: actor_id, blueprint_asset & world_streaming ===")
+
+
+class _FakeGuid:
+    """unreal.Guid as probed on UE 5.8: only to_string() yields the value."""
+
+    def to_string(self):
+        return "1564D3824FD7C91333AC658C0594F567"
+
+    def __str__(self):
+        return "<Struct 'Guid' (0x%016X) {}>" % id(self)
+
+
 guid_actor = types.SimpleNamespace(
-    get_editor_property=lambda k: "A1B2C3D4-1111-2222-3333-444455556666" if k == "actor_guid" else None,
+    get_editor_property=lambda k: _FakeGuid() if k == "actor_guid" else None,
     get_path_name=lambda: "/Game/Maps/Demo.Demo:PersistentLevel.Crate_1",
     get_class=lambda: types.SimpleNamespace(get_name=lambda: "BP_Lamp_C", get_path_name=lambda: "/Game/BP/BP_Lamp.BP_Lamp_C"),
 )
 check("extract_actor_id prefers non-zero actor_guid",
-      EL.extract_actor_id(guid_actor) == "A1B2C3D4-1111-2222-3333-444455556666")
+      EL.extract_actor_id(guid_actor) == "1564D3824FD7C91333AC658C0594F567")
 path_only_actor = types.SimpleNamespace(
     get_editor_property=lambda k: None,
     get_path_name=lambda: "/Game/Maps/Demo.Demo:PersistentLevel.Crate_2",
@@ -2148,6 +2386,26 @@ check("CineCameraComponent reads current_horizontal_fov and uses clean 0.05..400
       len(ue58_cams) == 1 and abs(ue58_cams[0]["fov_deg"] - 52.6708) < 1e-3
       and abs(ue58_cams[0]["near_clip_m"] - 0.05) < 1e-4
       and abs(ue58_cams[0]["far_clip_m"] - 4000.0) < 1e-3, ue58_cams)
+
+# Camera proxy meshes (SM_CineCam, MatineeCam_SM) are editor-only; a level holding
+# nothing else has no meshes to export, so this returns before touching the exporter.
+_eo_comp = types.SimpleNamespace(
+    get_editor_property=lambda k: {"is_editor_only": True, "static_mesh": object()}.get(k))
+_eo_actor = types.SimpleNamespace(get_components_by_class=lambda cls: [_eo_comp])
+_eo_prev = dict(vars(u))
+u.GLTFExporter = u.EditorActorSubsystem = u.StaticMeshComponent = object
+u.get_editor_subsystem = lambda cls: types.SimpleNamespace(get_all_level_actors=lambda: [_eo_actor])
+_eo_warned = []
+u.log_warning = _eo_warned.append
+try:
+    _eo_result = EX.export_all_level_meshes(export_dir=tempfile.mkdtemp(), show_dialogs=False)
+except Exception as e:
+    _eo_result = repr(e)
+finally:
+    vars(u).clear()
+    vars(u).update(_eo_prev)
+check("export_all_level_meshes skips editor-only components",
+      _eo_result == (0, 0) and "No static or skeletal" in "".join(_eo_warned), _eo_result)
 
 print("\n" + "=" * 60)
 if FAIL:

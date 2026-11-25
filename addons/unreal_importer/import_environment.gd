@@ -82,9 +82,8 @@ var _decal_crop_cache: Dictionary = {}
 # import Unreal's depths untouched.
 #
 # The floor applies to the EFFECTIVE depth (size.y * the node's Y scale), not to
-# size.y alone: the exporter leaves size_m at UE's DecalSize and puts the rest in
-# the transform, so on this content size.y is 0.02 and the scale carries a factor
-# of several hundred. Flooring size.y by itself would do nothing at all.
+# size.y alone: layouts from before v0.5 keep Unreal's scale in the transform, where
+# size.y is 0.02 and the scale carries a factor of several hundred.
 const DEFAULT_DECAL_MIN_DEPTH_M := 0.10
 
 
@@ -455,12 +454,15 @@ func _crop_decal_texture(
 	# UV v and Image row both count from the top, so v maps straight onto y.
 	var region := Rect2i(
 		int(roundf(float(rect[0]) * w)), int(roundf(float(rect[1]) * h)),
-		int(roundf(float(rect[2]) * w)), int(roundf(float(rect[3]) * h))
-	).intersection(Rect2i(0, 0, w, h))
+		mini(int(roundf(float(rect[2]) * w)), w), mini(int(roundf(float(rect[3]) * h)), h))
 	if region.size.x <= 0 or region.size.y <= 0:
 		return null
 
-	var out := img.get_region(region)
+	# Crops dragged by hand often run a little past the sheet, where Unreal's wrap
+	# addressing carries on from the opposite edge. blit_rect clips each copy.
+	var out := Image.create_empty(region.size.x, region.size.y, false, img.get_format())
+	for wrap in [Vector2i.ZERO, Vector2i(w, 0), Vector2i(0, h), Vector2i(w, h)]:
+		out.blit_rect(img, Rect2i(region.position - wrap, region.size), Vector2i.ZERO)
 	# A negative Unreal tiling walks the axis backwards, which is a mirror.
 	if flip_u:
 		out.flip_x()

@@ -106,7 +106,8 @@ for v1 files).
     "two_sided": false,
     "opacity": 1.0,                    // scalar 0..1 multiplied into translucent/additive alpha
     "opacity_mask_clip_value": 0.3333, // UE OpacityMaskClipValue -> alpha_scissor_threshold
-    "opacity_texture": null,           // separate grayscale mask packed into albedo_texture.a
+    "opacity_texture": null,           // separate mask packed into albedo_texture.a
+    "opacity_channel": 0,              // channel of opacity_texture holding it (0=R..3=A)
     "emissive_color": [r, g, b] | null,
     "emissive_texture": null,
     "emissive_energy": 1.0,
@@ -140,8 +141,17 @@ channels, and the channel order is a naming convention, not a standard:
 | `ORM`, `ARM` | ao | roughness | metallic |
 | `MRA`, `MRAO` | metallic | roughness | ao |
 
-The exporter resolves the layout from the parameter name and emits explicit
-channel indices in `packed_channels`, matching Godot's
+On UE 5.8 the exporter does not guess: it walks the material graph and reads which
+texture, and which of its channels, reaches each output (Base Color, Normal, Roughness,
+Metallic, Ambient Occlusion, Opacity), so a map called `Surface` or a plain texture
+sample with no parameter binds correctly. A lerp is read by its A side and a product of
+two different textures binds neither. A colour counts as the albedo tint only if it
+multiplies the albedo texture, its alpha only if the graph uses it, and a scalar as
+roughness/metallic only if it scales that map. Instance overrides of static switches are
+not followed. Where the graph cannot be read (older engines) or an output is ambiguous,
+the parameter name decides.
+
+Either way it emits explicit channel indices in `packed_channels`, matching Godot's
 `BaseMaterial3D.TextureChannel` (`0=RED, 1=GREEN, 2=BLUE, 3=ALPHA`). Importers
 assign the same texture to `roughness_texture`/`metallic_texture`/`ao_texture` and
 set each `*_texture_channel` from those indices — **never assume one layout**, or
@@ -417,13 +427,20 @@ field the importer binds the whole sheet, and a decal that reads "Exit" in Unrea
 in Godot showing all four signs at once (measured on `SpaceshipInterior`'s
 `M_Scifi_Signs_Decal_01..04`, four `TextureCoordinate` nodes over one 1024×1024 sheet).
 
-`uv_rect` is `[u0, v0, w, h]`, normalised 0..1, with **v measured from the top** of the
+`uv_rect` is `[u0, v0, w, h]`, normalised to the image (`u0 + w` may pass 1: the crop
+then continues from the opposite edge, as wrap addressing does), with **v measured from the top** of the
 image — the origin Unreal's UVs and Godot's `Image` row 0 already share, so no flip is
 needed to move between them. It applies to every slot of that decal, and is **omitted
 entirely** when the material samples the texture whole, so an ordinary
 one-texture-per-decal entry is unchanged by this field's existence.
 
-The exporter reads the plain `TextureCoordinate` form, `UV = uv * (U, V)`. With Unreal's
+On UE 5.8 the exporter evaluates the UV input of the albedo sampler itself, so any
+`UV = uv * scale + offset` built from `TextureCoordinate`, constants, scalar parameters
+(including those on a `MaterialInstanceDynamic`) and Add/Subtract/Multiply/Divide/
+AppendVector/ComponentMask is read exactly. The two forms below are the fallback for
+engines, or graphs, it cannot read.
+
+The first is the plain `TextureCoordinate` form, `UV = uv * (U, V)`. With Unreal's
 default wrap addressing and `|tiling| <= 1` that is a sub-rect, and the **sign** picks
 which end of the axis, plus a mirror:
 
@@ -434,18 +451,17 @@ which end of the axis, plus a mirror:
 
 `\|t\| > 1` is genuine repetition, which a Godot `Decal` cannot express at all; the
 exporter refuses it and logs which material it skipped rather than approximating a wrong
-crop. Same for a graph with more than one `TextureCoordinate` node — Python cannot see
-expression *inputs*, so which node feeds the albedo sampler would be a guess.
+crop. Same for a graph with more than one `TextureCoordinate` node — without the wiring,
+which node feeds the albedo sampler would be a guess.
 
 The second form is the **parameter-driven** one: the base material holds
 `TextureCoordinate(1,1) → Divide → Add → sampler` and each *instance* picks its cell with
 scalar parameters (`ModularSciFiStation`'s `M_decal`: `UV Divide`, `U Tile`, `V Tile`),
 giving `uv_rect = [U Tile, V Tile, 1/UV Divide, 1/UV Divide]` and no flips.
 
-Expression **inputs** cannot be read from Python — every pin on `Divide`/`Add`/
-`AppendVector`, and `Coordinates` on the sampler, raises *"is protected and cannot be
-read"* on UE 5.8 — so the wiring is genuinely unwalkable and this formula was inferred
-from the values: across all 16 `MI_*` instances `UV Divide` is `4.0` and `U`/`V Tile` take
+Expression **inputs** cannot be read as properties — every pin raises *"is protected and
+cannot be read"* — so before 5.8's `MaterialEditingLibrary` graph calls this formula was
+inferred from the values: across all 16 `MI_*` instances `UV Divide` is `4.0` and `U`/`V Tile` take
 only `{0, 0.25, 0.5, 0.75}`, i.e. fractions rather than integer cell indices, which fits
 `uv/divide + (u,v)` and not `(uv + (u,v))/divide`. Rendering the 4×4 grid over
 `T_numbers_01_basecolor` confirmed it cell by cell: `MI_numbers_01_red` lands on "1",
@@ -494,9 +510,8 @@ have clipped away, which on a cluttered prop can project a decal onto its neighb
 is an option rather than a constant. Set it to `0` to import Unreal's depths exactly.
 
 The floor applies to the **effective** depth (`size_m[1]` × the node's Y scale), not to
-`size_m[1]` alone: the exporter leaves `size_m` at Unreal's `DecalSize` and puts the rest in
-the transform, so `size_m[1]` is routinely `0.02` against a scale of several hundred, and
-flooring it directly would do nothing at all.
+`size_m[1]` alone: layouts from before v0.5 keep Unreal's scale in the transform, where
+`size_m[1]` is routinely `0.02` against a scale of several hundred.
 
 **`orm` is only ever set when the source map is genuinely ORM-ordered**
 (R=AO, G=roughness, B=metallic — the `ORM`/`ARM` row of the packed-map table
@@ -506,14 +521,17 @@ cannot be bound at all: the latter would read back as AO=roughness (backwards) a
 metallic=roughness, rendering a rough concrete decal as chrome. Anything else is
 left `null` and the exporter logs which decal it skipped.
 
-UE `decal_size` is half-size cm in (X=projection depth, Y=width, Z=height); UE decals
-project along **-X** (local). The exporter must fold whatever axis fix-up is needed into
-`godot_transform` so the Godot `Decal` (projects along **-Y**) matches, and set
-`size_m = [Y*2, X*2, Z*2] * 0.01`. Texture names refer to files in `textures/`.
+UE draws a decal's texture with U along local **+Z** and V along local **+Y**
+(`DeferredDecal.usf`: `SwizzlePos = DecalVector.zyx`), so `decal_size`, half-size cm, is
+(X=projection depth, Y=image height, Z=image width). The exporter folds the axis fix-up
+into `godot_transform` so the Godot `Decal` (U along +X, V along +Z, projecting along
+**-Y**) matches, and sets `size_m = [Z*2, X*2, Y*2] * 0.01`. Texture names refer to files
+in `textures/`.
 
-Because that fix-up re-labels the node's local Y and Z axes, `godot_transform.scale` for a
-decal is **conjugated by it too**: its Y and Z components are swapped relative to the
-standard `[usy, usz, usx]`, giving `[usy, usx, usz]`. The rotation and the scale must stay
+Because that fix-up re-labels the node's local axes, `godot_transform.scale` for a decal
+is **permuted by it too**: the standard `[usy, usz, usx]` becomes `[usz, usx, usy]`. The
+exporter then multiplies it into `size_m`, leaving only its signs in the transform: Godot's
+Forward+ renderer cuts off parts of a scaled `Decal`. The rotation and the scale must stay
 in the same frame — Godot renders the half-extent along local axis `j` as
 `0.5 * size_m[j] * basis_column[j]`, so a scale left in the un-fixed frame trades the
 decal's projection depth for its height. Guarded by `test_math.py` section 11 and the

@@ -30,6 +30,11 @@ const SUPPORTED_FORMAT_VERSION: int = 2
 # the same layout produce the same tree.
 const STATIC_MESH_CONTAINER: String = "UnrealStaticMeshes"
 
+# Containers the feature modules build from scratch on every import.
+const FEATURE_CONTAINERS: Array[String] = ["UnrealLights", "UnrealDecals",
+	"UnrealReflectionProbes", "UnrealCameras", "UnrealAudio", "UnrealFoliage",
+	"UnrealNavigation"]
+
 # Per-feature import toggles (see docs/SCHEMA_V2.md). The dock passes a matching
 # dictionary; anything omitted falls back to these defaults.
 const DEFAULT_IMPORT_OPTIONS := {
@@ -256,7 +261,11 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 		# Incremental re-import: update existing actor node in place, preserving user scripts & children.
 		if update_existing and actor_id != "" and existing_by_id.has(actor_id):
 			var existing_node: Node = existing_by_id[actor_id]
-			if is_instance_valid(existing_node):
+			if existing_node is Marker3D and String(existing_node.name).contains("_MISSING_"):
+				# A placeholder: import again, its mesh may have arrived since.
+				existing_by_id.erase(actor_id)
+				existing_node.free()
+			elif is_instance_valid(existing_node):
 				seen_actor_ids[actor_id] = true
 				_update_existing_actor_node(existing_node, actor_parent, actor_transform, actor_data, components, gameplay_helper)
 				updated_count += 1
@@ -281,7 +290,9 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 			var gltf_path := find_model_for(models_folder, mesh_key, mesh_name)
 			if gltf_path == "":
 				missing_meshes[mesh_key] = true
-				create_placeholder(actor_parent, actor_name, comp_transform, mesh_key)
+				var marker := create_placeholder(actor_parent, actor_name, comp_transform, mesh_key)
+				if actor_id != "":
+					marker.set_meta("unreal_actor_id", actor_id)
 				continue
 
 			# Collision shapes are defined in mesh-local space, so the physics body
@@ -471,6 +482,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 		"import_foliage.gd": "Foliage",
 		"import_gameplay.gd": "Navigation",
 	}
+	var previous := _set_aside_feature_containers() if update_existing else {}
 	for file_name in feature_files:
 		var module = _load_feature(file_name)
 		if module == null:
@@ -487,6 +499,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 				feature_summary.append("%s: %d node(s)" % [feature_files[file_name], created])
 			for w in res.get("warnings", []):
 				feature_warnings.append(str(w))
+	_merge_feature_containers(previous)
 
 	# Summary reporting
 	print("\n=================== IMPORT SUMMARY ===================")
@@ -652,7 +665,7 @@ func instance_gltf(gltf_path: String) -> Node3D:
 	
 	return null
 
-func create_placeholder(parent: Node, name_str: String, local_transform: Transform3D, mesh_name: String) -> void:
+func create_placeholder(parent: Node, name_str: String, local_transform: Transform3D, mesh_name: String) -> Marker3D:
 	"""Creates a Marker3D node in the editor to serve as a placement reminder."""
 	var marker := Marker3D.new()
 	marker.name = name_str + "_MISSING_" + mesh_name
@@ -661,6 +674,7 @@ func create_placeholder(parent: Node, name_str: String, local_transform: Transfo
 	marker.transform = local_transform
 	# Print to console
 	print("Created placeholder for missing mesh: ", mesh_name, " at local position: ", local_transform.origin)
+	return marker
 
 func _set_owner_recursive(node: Node, owner: Node) -> void:
 	"""Recursively sets the owner on all descendants so they persist in the saved scene."""
@@ -1008,9 +1022,12 @@ func _resolve_folder_parent(root_container: Node, folder_path: String, cache: Di
 		if cache.has(key):
 			parent = cache[key]
 		else:
-			var folder_node := Node3D.new()
-			folder_node.name = seg_clean
-			Common.add_owned_child(parent, folder_node, active_scene_root)
+			# An incremental update finds last import's folder already here.
+			var folder_node := parent.get_node_or_null(NodePath(seg_clean.validate_node_name()))
+			if folder_node == null or folder_node.has_meta("unreal_actor_id"):
+				folder_node = Node3D.new()
+				folder_node.name = seg_clean
+				Common.add_owned_child(parent, folder_node, active_scene_root)
 			cache[key] = folder_node
 			parent = folder_node
 	return parent
@@ -1045,6 +1062,48 @@ func _index_existing_actors(node: Node, out: Dictionary) -> void:
 			out[aid] = node
 	for child in node.get_children():
 		_index_existing_actors(child, out)
+
+
+func _set_aside_feature_containers() -> Dictionary:
+	"""Renames existing feature containers so the modules can build fresh ones."""
+	var previous := {}
+	for container_name in FEATURE_CONTAINERS:
+		var old := active_scene_root.get_node_or_null(container_name)
+		if old != null:
+			old.name = container_name + "_previous"
+			previous[container_name] = old
+	return previous
+
+
+func _merge_feature_containers(previous: Dictionary) -> void:
+	"""Stamps what the modules built; on update, swaps it into the old container.
+
+	Only stamped nodes are replaced. Nodes the user added to a container stay, and
+	so does a generated node that has gained a script or children of its own."""
+	for container_name in FEATURE_CONTAINERS:
+		var fresh := active_scene_root.get_node_or_null(container_name)
+		if fresh != null and fresh.is_queued_for_deletion():
+			fresh = null
+		if fresh != null:
+			for child in fresh.get_children():
+				child.set_meta("unreal_generated", true)
+		if not previous.has(container_name):
+			continue
+		var old: Node = previous[container_name]
+		if fresh != null:
+			for child in old.get_children():
+				if not child.has_meta("unreal_generated"):
+					continue
+				if child.get_script() != null or child.get_child_count() > 0:
+					var twin := fresh.get_node_or_null(NodePath(child.name))
+					if twin != null:
+						twin.free()
+					continue
+				child.free()
+			for child in fresh.get_children():
+				child.reparent(old, false)
+			fresh.free()
+		old.name = container_name
 
 
 func _update_existing_actor_node(existing_node: Node, desired_parent: Node,
@@ -1490,11 +1549,12 @@ func _load_normal_texture(tex_path: String, tex_stem: String) -> Texture2D:
 	return load_texture(tex_path)
 
 
-func _combine_albedo_and_opacity(albedo_path: String, opacity_path: String) -> Texture2D:
-	"""Packs a standalone grayscale Unreal opacity texture into the alpha channel
-	of albedo_texture (or white RGB if no albedo texture is set), since Godot's
+func _combine_albedo_and_opacity(albedo_path: String, opacity_path: String,
+		channel: int = 0) -> Texture2D:
+	"""Packs one channel of an Unreal opacity texture into the alpha channel of
+	albedo_texture (or white RGB if no albedo texture is set), since Godot's
 	StandardMaterial3D reads alpha exclusively from albedo_texture.a."""
-	var cache_key := "%s|%s" % [albedo_path, opacity_path]
+	var cache_key := "%s|%s|%d" % [albedo_path, opacity_path, channel]
 	if _alpha_merged_cache.has(cache_key):
 		return _alpha_merged_cache[cache_key]
 	var op_img := Common.load_image_file(opacity_path)
@@ -1512,7 +1572,7 @@ func _combine_albedo_and_opacity(albedo_path: String, opacity_path: String) -> T
 	for y in h:
 		for x in w:
 			var rgb := alb_img.get_pixel(x, y) if alb_img != null else Color.WHITE
-			var a := op_img.get_pixel(x, y).r
+			var a: float = op_img.get_pixel(x, y)[channel]
 			out.set_pixel(x, y, Color(rgb.r, rgb.g, rgb.b, a))
 	var merged := ImageTexture.create_from_image(out)
 	_alpha_merged_cache[cache_key] = merged
@@ -1601,7 +1661,8 @@ func create_godot_material(params: Dictionary, existing_mat: Material = null) ->
 	if opacity_tex != "" and (blend_mode == "masked" or blend_mode == "translucent" or blend_mode == "additive"):
 		var opacity_path := find_texture_path(active_textures_folder, opacity_tex)
 		if opacity_path != "":
-			var merged := _combine_albedo_and_opacity(albedo_path, opacity_path)
+			var merged := _combine_albedo_and_opacity(albedo_path, opacity_path,
+				clampi(int(Common.get_num(params, "opacity_channel", 0.0)), 0, 3))
 			if merged != null:
 				mat.albedo_texture = merged
 		else:

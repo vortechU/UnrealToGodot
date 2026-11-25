@@ -302,6 +302,268 @@ def safe_get_prop(obj, prop_name, default=None):
         return default
 
 
+# ---------------------------------------------------------------------------
+# Material graph tracing
+#
+# Names are a guess: a parameter called "Surface" says nothing, and "Dirt Color"
+# is not the base colour. UE 5.8's MaterialEditingLibrary answers the real
+# question -- which texture, and which of its channels, reaches each material
+# output (verified against /Game/Downtown_Alley). Engines without these calls get
+# None here and callers fall back to classifying by name.
+# ---------------------------------------------------------------------------
+
+_TRACED_OUTPUTS = (
+    ("albedo", "MP_BASE_COLOR"), ("normal", "MP_NORMAL"),
+    ("roughness", "MP_ROUGHNESS"), ("metallic", "MP_METALLIC"),
+    ("ao", "MP_AMBIENT_OCCLUSION"),
+    ("opacity", "MP_OPACITY"), ("opacity_mask", "MP_OPACITY_MASK"),
+)
+
+# Inputs that shape or place a value instead of carrying it.
+_NON_VALUE_INPUTS = frozenset((
+    "uvs", "coordinates", "coordinate", "alpha", "exp", "exponent", "fraction",
+    "height",
+))
+
+# Material graphs are 10-20 deep; this only bounds a malformed one.
+_MAX_TRACE_DEPTH = 64
+
+_trace_cache = {}
+
+
+def clear_material_trace_cache():
+    """Call once per export: a material may have been edited since the last one."""
+    _trace_cache.clear()
+
+
+def node_kind(node):
+    """'Multiply' for a MaterialExpressionMultiply."""
+    return type(node).__name__.replace("MaterialExpression", "")
+
+
+def graph_inputs(base, node):
+    """[(input_name, child_or_None, child_output_name_or_None)] of one expression."""
+    mel = unreal.MaterialEditingLibrary
+    children = list(mel.get_inputs_for_material_expression(base, node))
+    names = [str(n) for n in mel.get_material_expression_input_names(node)]
+    result = []
+    for i, child in enumerate(children):
+        out = None
+        # The output is looked up by node, so a child wired in twice is ambiguous.
+        if child is not None and sum(c == child for c in children) == 1:
+            out = str(mel.get_input_node_output_name_for_material_expression(node, child))
+        result.append((names[i] if i < len(names) else "", child, out))
+    return result
+
+
+def _param_name(node):
+    return str(safe_get_prop(node, "parameter_name", "") or "")
+
+
+def _is_sample(node):
+    return node_kind(node).startswith("TextureSample")
+
+
+def _mask_output(node, out):
+    """The output pin a ComponentMask narrows a sample's RGB(A) output to."""
+    if out not in ("", "RGB", "RGBA"):
+        return out
+    kept = [c for c in "RGBA" if safe_get_prop(node, c.lower(), False)]
+    if len(kept) == 1:
+        return kept[0]
+    return out if kept == ["R", "G", "B"] else None
+
+
+class MaterialGraph:
+    def __init__(self, base):
+        self.base = base
+        self._samples = {}
+        self._inputs = {}
+
+    def inputs(self, node):
+        key = safe_get_name(node)
+        if key not in self._inputs:
+            self._inputs[key] = [i for i in graph_inputs(self.base, node)
+                                 if i[1] is not None]
+        return self._inputs[key]
+
+    def value_inputs(self, node):
+        """The inputs a node's value comes from; a lerp's base layer is A."""
+        kind = node_kind(node)
+        inputs = self.inputs(node)
+        if kind == "LinearInterpolate":
+            for wanted in ("A", "B", "Alpha"):
+                picked = [i for i in inputs if i[0] == wanted]
+                if picked and self.samples(picked[0][1], picked[0][2]):
+                    return picked
+            return []
+        if kind.startswith("StaticSwitch"):
+            # shortcut: follows the base default; read the instance's
+            # static_parameter_values if a pack turns out to override switches.
+            wanted = str(bool(safe_get_prop(node, "default_value", True)))
+            return [i for i in inputs if i[0] == wanted]
+        return [i for i in inputs if i[0].lower() not in _NON_VALUE_INPUTS]
+
+    def samples(self, node, out, depth=0):
+        """Texture samples feeding a value, as [(node, output_name or None)].
+        None means the value is altered beyond what an importer can rebind."""
+        if node is None or depth > _MAX_TRACE_DEPTH:
+            return []
+        if _is_sample(node):
+            return [(node, out)]
+        key = safe_get_name(node)
+        if key not in self._samples:
+            self._samples[key] = []
+            kind = node_kind(node)
+            found = []
+            for _name, child, child_out in self.value_inputs(node):
+                for sample, pin in self.samples(child, child_out, depth + 1):
+                    if kind == "OneMinus":
+                        pin = None
+                    elif kind == "ComponentMask":
+                        pin = _mask_output(node, pin)
+                    if (sample, pin) not in found:
+                        found.append((sample, pin))
+            self._samples[key] = found
+        return self._samples[key]
+
+    def names_under(self, node, kind):
+        """Parameter names of every node of one kind at or below a node."""
+        found, seen, pending = set(), set(), [node]
+        while pending:
+            current = pending.pop()
+            key = safe_get_name(current)
+            if key in seen:
+                continue
+            seen.add(key)
+            if node_kind(current) == kind:
+                found.add(_param_name(current))
+            # Past a sample lies only where it is sampled, not its value.
+            if not _is_sample(current):
+                pending.extend(i[1] for i in self.inputs(current))
+        return found
+
+    def multipliers(self, node, kind, secondary, seen=None):
+        """Parameters applied to the traced texture. `secondary` collects those
+        that only act on a lerp's blended-in (B) side."""
+        seen = set() if seen is None else seen
+        key = safe_get_name(node)
+        if key in seen or _is_sample(node):
+            return set()
+        seen.add(key)
+        if node_kind(node) == kind:
+            return {_param_name(node)}
+        found = set()
+        inputs = self.inputs(node)
+        if node_kind(node) == "LinearInterpolate":
+            for wanted, bucket in (("A", found), ("B", secondary)):
+                for name, child, out in inputs:
+                    if name == wanted and self.samples(child, out):
+                        bucket |= self.multipliers(child, kind, secondary, seen)
+            return found
+        textured = any(self.samples(c, o) for _n, c, o in inputs)
+        for name, child, out in inputs:
+            if name.lower() in _NON_VALUE_INPUTS:
+                continue
+            if self.samples(child, out):
+                found |= self.multipliers(child, kind, secondary, seen)
+            elif textured:
+                found |= self.names_under(child, kind)
+        return found
+
+
+def trace_material_graph(material):
+    """
+    What the base material's graph really wires to each output, or None when the
+    engine cannot say. Keys:
+        "samples":   {role: {"node", "param", "texture", "output"}}, only for roles
+                     fed by exactly one texture (a blend of several is left alone)
+        "tints":     vector parameters multiplying the albedo texture, or None
+        "not_tints": vector parameters used some other way in the base colour
+        "hidden":    True when a material function may hide further tints
+        "scalars":   {"roughness"/"metallic": its multiplier parameter names}
+        "constants": {"roughness"/"metallic": value wired in as a constant}
+        "alpha":     vector parameters that reach opacity, or None
+    """
+    mel = getattr(unreal, "MaterialEditingLibrary", None)
+    props = getattr(unreal, "MaterialProperty", None)
+    getter = getattr(material, "get_base_material", None)
+    if (getter is None or props is None
+            or not hasattr(mel, "get_material_property_input_node")
+            or not hasattr(mel, "get_inputs_for_material_expression")):
+        return None
+    try:
+        base = getter()
+        key = base.get_path_name()
+        if key not in _trace_cache:
+            _trace_cache[key] = _trace_base(base, mel, props)
+        return _trace_cache[key]
+    except Exception as e:
+        unreal.log_warning("Could not trace the graph of material %s: %s"
+                           % (safe_get_name(material), str(e)))
+        return None
+
+
+def _sample_source(graph, sample):
+    """(parameter name or "", texture) one sample node reads."""
+    for _name, child, _out in graph.inputs(sample):
+        if node_kind(child).startswith("TextureObject"):
+            sample = child
+            break
+    return _param_name(sample), safe_get_prop(sample, "texture", None)
+
+
+def _trace_base(base, mel, props):
+    graph = MaterialGraph(base)
+    result = {"samples": {}, "tints": None, "not_tints": set(), "hidden": False,
+              "scalars": {}, "constants": {}, "alpha": None}
+    alpha = set()
+    has_base_color = False
+    for role, prop_name in _TRACED_OUTPUTS:
+        prop = getattr(props, prop_name)
+        node = mel.get_material_property_input_node(base, prop)
+        if node is None:
+            continue
+        out = str(mel.get_material_property_input_node_output_name(base, prop))
+        found = graph.samples(node, out)
+        # One parameter is often sampled by several nodes; that is one source.
+        sources = {}
+        for sample, pin in found:
+            param, texture = _sample_source(graph, sample)
+            sources[(param or safe_get_name(texture), pin)] = {
+                "node": sample, "param": param, "texture": texture, "output": pin}
+        if len(sources) == 1:
+            source = next(iter(sources.values()))
+            if source["texture"] is not None and source["output"] is not None:
+                result["samples"][role] = source
+
+        kind = node_kind(node)
+        if role == "albedo":
+            has_base_color = True
+            if found:
+                secondary = set()
+                primary = graph.multipliers(node, "VectorParameter", secondary)
+                result["tints"] = primary or secondary
+                result["not_tints"] = (graph.names_under(node, "VectorParameter")
+                                       - result["tints"])
+                result["hidden"] = bool(graph.names_under(node, "MaterialFunctionCall"))
+        elif role in ("roughness", "metallic"):
+            if kind == "Constant":
+                result["constants"][role] = float(safe_get_prop(node, "r", 0.0))
+            elif (found or kind == "ScalarParameter") and not graph.names_under(
+                    node, "MaterialFunctionCall"):
+                # With several textures mixed none is bound, and a scalar that only
+                # weights one of them is not a roughness of its own.
+                single = not found or role in result["samples"]
+                result["scalars"][role] = graph.multipliers(
+                    node, "ScalarParameter", set()) if single else set()
+        elif role in ("opacity", "opacity_mask"):
+            alpha |= graph.names_under(node, "VectorParameter")
+    if has_base_color:
+        result["alpha"] = alpha
+    return result
+
+
 def iter_base_material_textures(material, include_dependencies=True):
     """Yields (parameter_name, texture) for every texture a *base* Material references.
 
@@ -324,10 +586,9 @@ def iter_base_material_textures(material, include_dependencies=True):
     and hands back clean parameter names to classify by. Verified on UE 5.7.4
     against /Game/ContainersHouseCH/Materials/M_Containers_Master.
 
-    Textures wired through non-parameter TextureSample nodes are still picked up by
-    the legacy expression walk on engines that allow it (pre-5.7); on 5.7 that read
-    raises and is skipped. Master materials in asset packs expose their maps as
-    parameters, which is the case that matters here.
+    Textures wired through non-parameter TextureSample nodes are picked up by
+    trace_material_graph (5.8), or by the legacy expression walk on engines that
+    allow it (pre-5.7).
     """
     if not material:
         return
@@ -386,6 +647,15 @@ def iter_base_material_textures(material, include_dependencies=True):
                     name = ""
             yield name, tex
 
+    # Plain TextureSample nodes that the graph trace ties to an output. "" because
+    # they have no parameter name; the trace is what classifies them.
+    crawl = include_dependencies and not seen
+    for sample in (trace_material_graph(material) or {"samples": {}})["samples"].values():
+        tex = sample["texture"]
+        if not sample["param"] and isinstance(tex, unreal.Texture) and tex not in seen:
+            seen.add(tex)
+            yield "", tex
+
     # Last resort: the material's package dependencies from the AssetRegistry.
     #
     # Both passes above find NOTHING for a base material that wires its maps
@@ -406,7 +676,7 @@ def iter_base_material_textures(material, include_dependencies=True):
     #
     # Only runs when the material yielded nothing at all, so it can never displace a
     # properly named parameter -- it fills a slot that was otherwise empty.
-    if seen or not include_dependencies:
+    if not crawl:
         return
     for tex in iter_material_dependency_textures(material):
         if tex not in seen:

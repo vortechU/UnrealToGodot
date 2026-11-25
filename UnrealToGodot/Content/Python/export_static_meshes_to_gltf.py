@@ -1034,6 +1034,7 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
         return 0, 0
 
     # 2. Scan level for all unique meshes
+    ue2g_common.clear_material_trace_cache()
     try:
         actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
         all_actors = actor_subsystem.get_all_level_actors()
@@ -1049,6 +1050,9 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
             # Static Meshes
             static_comps = actor.get_components_by_class(unreal.StaticMeshComponent)
             for comp in static_comps:
+                # Same filter as the layout pre-scan: the name maps must see the same meshes.
+                if ue2g_common.safe_get_prop(comp, "is_editor_only", False):
+                    continue
                 mesh = ue2g_common.safe_get_prop(comp, "static_mesh")
                 if mesh:
                     unique_meshes.add(mesh)
@@ -1058,6 +1062,8 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
             if hasattr(unreal, "SkeletalMeshComponent"):
                 skeletal_comps = actor.get_components_by_class(unreal.SkeletalMeshComponent)
             for comp in skeletal_comps:
+                if ue2g_common.safe_get_prop(comp, "is_editor_only", False):
+                    continue
                 mesh = ue2g_common.safe_get_prop(comp, "skeletal_mesh")
                 if mesh:
                     unique_meshes.add(mesh)

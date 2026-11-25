@@ -316,6 +316,10 @@ _PACKED_LAYOUTS = {
 }
 
 
+# Texture sample output pin -> the same channel indices; "RGB" and "" read red.
+_OUTPUT_CHANNELS = {"R": 0, "G": 1, "B": 2, "A": 3}
+
+
 def classify_packed_texture(param_name):
     """Returns the channel layout for a packed PBR map parameter, else None.
 
@@ -679,6 +683,7 @@ def extract_material_parameters(material, collected_textures=None):
         "opacity": 1.0,
         "opacity_mask_clip_value": 0.3333,
         "opacity_texture": None,
+        "opacity_channel": 0,
         "emissive_color": None,
         "emissive_texture": None,
         "emissive_energy": 1.0,
@@ -686,16 +691,67 @@ def extract_material_parameters(material, collected_textures=None):
     }
 
     visited = set()
+    opacity_sources = {}
     # Tracks scalar/vector/surface params that have been explicitly set, so the
     # first (child-most) material that provides one wins — even if its value
     # happens to equal a default (e.g. roughness exactly 0.5). Texture params
     # already use a None sentinel below and need no tracking here.
     assigned = set()
 
+    # What the graph really wires up beats what names suggest (None: cannot tell).
+    trace = ue2g_common.trace_material_graph(material)
+    traced = trace["samples"] if trace else {}
+
+    def _traced_roles(param_name, tex):
+        """{role: output pin} the graph gives this texture, e.g. {"roughness": "G"}."""
+        roles = {}
+        for role, sample in traced.items():
+            same = (sample["param"] == param_name if param_name
+                    else not sample["param"] and _path_of(sample["texture"]) == _path_of(tex))
+            if same:
+                roles[role] = sample["output"]
+        return roles
+
+    def _set_slot(slot, tex):
+        parameters[slot] = tex.get_name()
+        parameters["texture_paths"][slot] = _path_of(tex)
+
+    def _assign_traced(tex, roles):
+        for role in ("albedo", "normal"):
+            if role in roles and parameters[role + "_texture"] is None:
+                _set_slot(role + "_texture", tex)
+        channels = {r: _OUTPUT_CHANNELS.get(roles[r], 0)
+                    for r in ("roughness", "metallic", "ao") if r in roles}
+        if len(channels) == 1 and "ao" not in channels and 0 in channels.values():
+            # One grayscale map, which is what the standalone slots hold.
+            slot = next(iter(channels)) + "_texture"
+            if parameters[slot] is None:
+                _set_slot(slot, tex)
+        elif channels and parameters["packed_texture"] is None:
+            parameters["packed_channels"] = channels
+            _set_slot("packed_texture", tex)
+
     def _assign_texture(param_name, tex):
         """Classifies one sampled texture and records its slot plus its asset path."""
         tex_name = tex.get_name()
+        roles = _traced_roles(str(param_name or ""), tex)
+        for role in ("opacity", "opacity_mask"):
+            output = roles.pop(role, None)
+            if output is not None:
+                opacity_sources.setdefault(role, (tex, output))
+        if roles:
+            _assign_traced(tex, roles)
+            return
         role, packed = resolve_texture_role(str(param_name).lower(), tex_name)
+        # A name never overrules an output the graph already settled.
+        if packed:
+            packed = {k: v for k, v in packed.items() if k not in traced}
+            if not packed:
+                return
+        elif role and role.replace("_texture", "") in ("albedo", "normal", "roughness",
+                                                       "metallic") \
+                and role.replace("_texture", "") in traced:
+            return
         if role == "packed":
             if parameters["packed_texture"] is None:
                 parameters["packed_texture"] = tex_name
@@ -714,8 +770,26 @@ def extract_material_parameters(material, collected_textures=None):
             parameters[key] = value
         assigned.add(key)
 
-    def _assign_vector(key, value):
+    def _scalar_key(name):
+        """classify_scalar_parameter, corrected by what the graph says."""
+        key = classify_scalar_parameter(name)
+        if not trace:
+            return key
+        for role, names in trace["scalars"].items():
+            if str(name) in names:
+                return role
+        # "Dirt Roughness Opacity" has the word but does not scale the roughness.
+        if key in trace["scalars"] or key in trace["constants"]:
+            return None
+        return key
+
+    def _assign_vector(name, value):
+        key = classify_vector_parameter(name)
         if key is None or key in assigned:
+            return
+        if key == "albedo_color" and trace and trace["tints"] is not None \
+                and str(name) not in trace["tints"] \
+                and (str(name) in trace["not_tints"] or not trace["hidden"]):
             return
         try:
             if key == "tiling":
@@ -725,6 +799,9 @@ def extract_material_parameters(material, collected_textures=None):
             else:
                 parameters["albedo_color"] = [float(value.r), float(value.g),
                                               float(value.b), float(value.a)]
+                # A tint's alpha means nothing unless the graph uses it.
+                if trace and trace["alpha"] is not None and str(name) not in trace["alpha"]:
+                    parameters["albedo_color"][3] = 1.0
             assigned.add(key)
         except Exception:
             pass
@@ -803,11 +880,11 @@ def extract_material_parameters(material, collected_textures=None):
             # whatever the material said.
             for pname, value in ue2g_common.iter_base_material_scalars(mat):
                 try:
-                    _assign_scalar(classify_scalar_parameter(pname), float(value))
+                    _assign_scalar(_scalar_key(pname), float(value))
                 except Exception:
                     continue
             for pname, value in ue2g_common.iter_base_material_vectors(mat):
-                _assign_vector(classify_vector_parameter(pname), value)
+                _assign_vector(pname, value)
             return
 
         # Material Instance: Parse overridden parameters
@@ -817,8 +894,7 @@ def extract_material_parameters(material, collected_textures=None):
             if scalars:
                 for s in scalars:
                     # Child instances are visited before parents; first explicit value wins.
-                    _assign_scalar(classify_scalar_parameter(s.parameter_info.name),
-                                   s.parameter_value)
+                    _assign_scalar(_scalar_key(s.parameter_info.name), s.parameter_value)
         except Exception:
             pass
 
@@ -827,8 +903,7 @@ def extract_material_parameters(material, collected_textures=None):
             vectors = mat.get_editor_property("vector_parameter_values")
             if vectors:
                 for v in vectors:
-                    _assign_vector(classify_vector_parameter(v.parameter_info.name),
-                                   v.parameter_value)
+                    _assign_vector(v.parameter_info.name, v.parameter_value)
         except Exception:
             pass
 
@@ -860,6 +935,25 @@ def extract_material_parameters(material, collected_textures=None):
             pass
 
     _extract_recursive(material)
+
+    if trace:
+        for key, value in trace["constants"].items():
+            _assign_scalar(key, value)
+
+        # Masked and translucent read different outputs. Alpha already inside the
+        # albedo texture needs no separate mask.
+        source = opacity_sources.get(
+            {"masked": "opacity_mask", "translucent": "opacity", "additive": "opacity"}
+            .get(parameters["blend_mode"]))
+        if source:
+            tex, output = source
+            if (output == "A"
+                    and _path_of(tex) == parameters["texture_paths"].get("albedo_texture")):
+                parameters["opacity_texture"] = None
+                parameters["texture_paths"].pop("opacity_texture", None)
+            else:
+                _set_slot("opacity_texture", tex)
+                parameters["opacity_channel"] = _OUTPUT_CHANNELS.get(output, 0)
 
     # Godot computes roughness/metallic as scalar * texture[channel]. Unreal drives
     # them straight from a packed or standalone map unless the material exposes an
@@ -1152,10 +1246,13 @@ def extract_actor_id(actor):
     if actor is None:
         return ""
     guid = ue2g_common.safe_get_prop(actor, "actor_guid", None)
-    if guid is not None:
-        gstr = str(guid).strip()
-        if gstr and gstr.lower() != "none" and not all(c in "0-" for c in gstr):
+    try:
+        # str(unreal.Guid) is the wrapper's memory address, different on every export.
+        gstr = str(guid.to_string()).strip()
+        if gstr and not all(c in "0-" for c in gstr):
             return gstr
+    except Exception:
+        pass
     if hasattr(actor, "get_path_name"):
         try:
             p = str(actor.get_path_name() or "").strip()
@@ -1436,6 +1533,7 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
         return False
 
     # 4. Extract transforms and static mesh details
+    ue2g_common.clear_material_trace_cache()
     all_actors = actor_subsystem.get_all_level_actors()
     exported_actors = []
     total_components_count = 0
@@ -1448,11 +1546,15 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
     for actor in all_actors:
         try:
             for comp in actor.get_components_by_class(unreal.StaticMeshComponent):
+                if ue2g_common.safe_get_prop(comp, "is_editor_only", False):
+                    continue
                 m = ue2g_common.safe_get_prop(comp, "static_mesh")
                 if m:
                     unique_meshes.add(m)
             if hasattr(unreal, "SkeletalMeshComponent"):
                 for comp in actor.get_components_by_class(unreal.SkeletalMeshComponent):
+                    if ue2g_common.safe_get_prop(comp, "is_editor_only", False):
+                        continue
                     m = ue2g_common.safe_get_prop(comp, "skeletal_mesh")
                     if m:
                         unique_meshes.add(m)

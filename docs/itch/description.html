@@ -1,0 +1,61 @@
+<p><strong>Move 3D asset packs and levels from Unreal Engine to Godot 4, with meshes, materials, collision, lighting and layout.</strong> Free and open source (MIT).</p>
+<p>It comes in two parts: an Unreal plugin that exports your level, and a Godot addon that rebuilds it. Click <em>Export Everything</em> in Unreal, then <em>Import Unreal Level Layout</em> in Godot.</p>
+<p><em>This is early access (v0.5). Expect rough edges, and read "What doesn't transfer" below before you start.</em></p>
+
+<h2>What transfers</h2>
+<ul>
+<li><strong>Level layout:</strong> positions, rotations, non-uniform scale and Blueprint actor hierarchies, converted to Godot's axes and metres. Outliner folders can be kept, and repeated Blueprints can be saved as shared <code>.tscn</code> prefabs.</li>
+<li><strong>Meshes:</strong> batch export of static and skeletal meshes to glTF. Animation sequences and LOD chains are optional.</li>
+<li><strong>Spline meshes:</strong> roads, pipes and fences arrive bent along their spline.</li>
+<li><strong>Collision:</strong> boxes, spheres, capsules and convex hulls become <code>CollisionShape3D</code> nodes, with non-uniform scale baked in so Jolt doesn't complain. Skeletal physics assets can become ragdoll bodies.</li>
+<li><strong>Materials:</strong> PBR and emissive parameters, textures, blend modes, alpha cutout and two-sided settings are bound to Godot materials. DirectX normal maps are flipped for Godot, and materials can be saved as reusable <code>.tres</code> files.</li>
+<li><strong>Lights and atmosphere:</strong> directional, point, spot and rect lights, plus post-process, fog and sky as a <code>WorldEnvironment</code>. Reflection captures become <code>ReflectionProbe</code> nodes.</li>
+<li><strong>Foliage:</strong> painted foliage and instanced meshes become <code>MultiMeshInstance3D</code>, with cull distances.</li>
+<li><strong>Landscapes:</strong> heightmaps and paint layers are rebuilt through Terrain3D, or as a simple preview mesh without it.</li>
+<li><strong>Decals, navigation volumes, and actor and component tags.</strong></li>
+<li><strong>Cameras and ambient audio:</strong> camera actors, and ambient sounds that use a Sound Wave.</li>
+</ul>
+<p>Re-importing can update an existing scene in place, keeping your own scripts and child nodes. You can also write a Godot <code>.tscn</code> scene directly from Unreal, cap texture sizes on import, and switch each feature on or off. Both sides write a report telling you what went wrong and where.</p>
+
+<h2>What doesn't transfer</h2>
+<ul>
+<li><strong>Not converted:</strong> Blueprint graphs, gameplay logic, AnimBlueprints, particles and Sound Cue logic. This tool moves art, not behavior.</li>
+<li><strong>Materials are approximate:</strong> custom shader graph logic, such as world-position offset, vertex-paint blending or parallax, has to be rebuilt by hand.</li>
+<li><strong>Lighting won't match exactly:</strong> the engines render differently, so expect to adjust brightness.</li>
+<li><strong>Nanite:</strong> there is no Godot equivalent. Meshes arrive as regular triangle meshes.</li>
+<li><strong>Landscapes:</strong> terrain is the least mature part. Paint layers need their ground textures reassigned in Godot.</li>
+<li><strong>Loaded levels only:</strong> load World Partition cells and streaming sublevels before exporting. The report warns you about unloaded ones.</li>
+</ul>
+
+<h2>Requirements</h2>
+<ul>
+<li><strong>Unreal Engine 5.7 or 5.8.</strong> Earlier 5.x versions are untested. Uses the built-in Python Editor Script, Editor Scripting Utilities and glTF Exporter plugins.</li>
+<li><strong>Godot 4.4 or later.</strong> Tested on 4.7.1 and 4.7.2.</li>
+<li><strong>Terrain3D</strong> (optional), recommended for landscapes.</li>
+</ul>
+
+<h2>Install</h2>
+<ol>
+<li>Copy <code>UnrealToGodot</code> into your Unreal project's <code>Plugins</code> folder. In Edit &gt; Plugins, enable Unreal to Godot Exporter and the three built-in plugins above, then restart.</li>
+<li>Copy <code>addons/unreal_importer</code> into your Godot project's <code>addons</code> folder. In Project Settings &gt; Plugins, enable Unreal Engine Layout Importer.</li>
+</ol>
+
+<h2>Use it</h2>
+<ol>
+<li>In Unreal, open your level, then Window &gt; Unreal to Godot Exporter.</li>
+<li>Choose your output paths and click <strong>Export Everything (Meshes + Layout)</strong>.</li>
+<li>In Godot, open a 3D scene and the <strong>Unreal Importer</strong> dock. Point it at the layout JSON, models and textures.</li>
+<li>Click <strong>Import Unreal Level Layout</strong>.</li>
+</ol>
+<p><strong>Large levels:</strong> keep the texture size limit on (1024 by default). Full 4K texture sets can crash Godot's importer. <em>Also shrink texture files on disk</em> permanently overwrites the exported copies.</p>
+
+<h2>Help and source</h2>
+<ul>
+<li><a href="https://github.com/vortechU/UnrealToGodot/tree/v0.5#readme">Full documentation and source</a></li>
+<li><a href="https://discord.com/invite/HGwkYW2h6Y">Discord</a> for help and questions</li>
+<li><a href="https://github.com/vortechU/UnrealToGodot/issues">Report a bug</a>. Please attach both report files: <code>ue2g_report.txt</code> and <code>ue2g_import_report.txt</code>.</li>
+</ul>
+
+<h2>License</h2>
+<p>The tool is MIT licensed. Your assets keep their own licenses, and some Unreal content is licensed for Unreal only, so check that a pack may be used in another engine before you move it.</p>
+<p><em>Built by Vordev. Not affiliated with Epic Games or the Godot Foundation.</em></p>
