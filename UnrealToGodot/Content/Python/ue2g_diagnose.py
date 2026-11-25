@@ -544,8 +544,11 @@ def audit_textures(rep, tex_dir, layout=None, models_dir=None):
         rep.ok("texture set is within a size Godot imports reliably")
 
 
-def audit_sidecars(rep, root, models_dir, layout):
-    """Checks on-disk existence of v2 sidecar assets (terrain, audio, LODs, physics)."""
+def audit_sidecars(rep, root, models_dir, layout, lods=True):
+    """Checks on-disk existence of v2 sidecar assets (terrain, audio, LODs, physics).
+
+    lods=False skips the LOD models: the layout lists them even when they were not
+    asked for."""
     if not isinstance(layout, dict):
         return
     missing = []
@@ -583,7 +586,7 @@ def audit_sidecars(rep, root, models_dir, layout):
         pf = mesh_entry.get("physics_file")
         if isinstance(pf, str) and pf and os.path.basename(pf).lower() not in model_entries:
             missing.append("models/" + os.path.basename(pf))
-        for lod in (mesh_entry.get("lods") or []):
+        for lod in (mesh_entry.get("lods") or []) if lods else []:
             if not isinstance(lod, dict):
                 continue
             if int(lod.get("lod_index") or 0) > 0:
@@ -740,7 +743,7 @@ def _listdir(path):
 
 
 def diagnose(export_dir, godot_project=None, strict=True, out_path=None,
-             layout_path=None, models_dir=None):
+             layout_path=None, models_dir=None, lods=True):
     """Audits an export and writes the report. Returns (report_text, Report).
 
     This is the entry point the exporter calls, so it must never raise: a
@@ -761,7 +764,7 @@ def diagnose(export_dir, godot_project=None, strict=True, out_path=None,
         layout = audit_layout(rep, layout_file, strict=strict)
         audit_models(rep, models, layout, strict=strict)
         audit_textures(rep, textures, layout, models_dir=models)
-        audit_sidecars(rep, root, models, layout)
+        audit_sidecars(rep, root, models, layout, lods=lods)
         if godot_project:
             audit_godot_project(rep, godot_project)
     except Exception as exc:

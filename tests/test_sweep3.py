@@ -155,6 +155,18 @@ for layout, want in (({"actors": [], "foliage": [{}], "landscapes": [{}]}, 0), (
     errors = [e for e in D.diagnose(d, layout_path=path, strict=False)[1].errors if "zero actors" in e]
     check("zero actors is an error only when nothing else is there (%s)" % sorted(layout), len(errors) == want, errors)
 
+path = os.path.join(d, "lods_layout.json")
+with open(path, "w") as f:
+    json.dump({"actors": [], "lights": [], "meshes": {"SM_A": {
+        "physics_file": "SM_A_physics.json",
+        "lods": [{"lod_index": 0, "export_name": "SM_A"}, {"lod_index": 1, "export_name": "SM_A_LOD1"}]}}}, f)
+for lods, want in ((True, "2 referenced"), (False, "1 referenced")):
+    warned = [w for w in D.diagnose(d, layout_path=path, strict=False, lods=lods)[1].warnings if "sidecar" in w]
+    check("missing LOD models are reported only when asked for (%s)" % lods,
+          len(warned) == 1 and warned[0].startswith(want) and ("LOD1" in warned[0]) == lods, warned)
+check("every export passes the LOD checkbox on", gui.count("lods=export_lods)") == gui.count("rep = _run_diagnostic("),
+      gui.count("lods=export_lods)"))
+
 print("=== 18. LOD name clash ===")
 
 

@@ -42,7 +42,7 @@ def _positive_int(value, default):
 
 
 def _run_diagnostic(export_dir, godot_project=None, strict=False,
-                    layout_path=None, models_dir=None):
+                    layout_path=None, models_dir=None, lods=True):
     """Audits an export and leaves a report beside it.
 
     Runs after every export so a problem is described in writing at the moment
@@ -56,7 +56,7 @@ def _run_diagnostic(export_dir, godot_project=None, strict=False,
     try:
         _text, rep = ue2g_diagnose.diagnose(
             export_dir, godot_project=godot_project, strict=strict,
-            layout_path=layout_path, models_dir=models_dir,
+            layout_path=layout_path, models_dir=models_dir, lods=lods,
         )
     except Exception as e:
         unreal.log_warning("Unreal to Godot Exporter: diagnostic failed: %s" % str(e))
@@ -1082,7 +1082,8 @@ class UnrealToGodotApp:
         self.save_settings()
         self.show_status("Export command sent to Unreal...")
         # Queue the export layout command to run on main thread
-        _command_queue.put(("export_layout", [save_path, godot_project, feature_options]))
+        _command_queue.put(("export_layout", [save_path, godot_project, feature_options,
+                                              self.export_lods_var.get()]))
 
     def close(self):
         """Pushes close signal to main thread and shuts down GUI."""
@@ -1182,7 +1183,7 @@ def check_editor_queues(delta_time):
                     exported, failed = export_static_meshes_to_gltf.export_all_level_meshes(
                         export_dir=export_dir, export_animations=export_anims, export_lods=export_lods, separate_textures=separate_tex, show_dialogs=False, godot_project_dir=godot_project
                     )
-                    rep = _run_diagnostic(export_dir, godot_project)
+                    rep = _run_diagnostic(export_dir, godot_project, lods=export_lods)
                     verdict = _diagnostic_status(rep)
                     if failed > 0:
                         _state_queue.put({"status": (f"Batch export completed: {exported} exported, {failed} failed.", "warning")})
@@ -1244,7 +1245,8 @@ def check_editor_queues(delta_time):
 
                 diag_godot = godot_project or (feature_options or {}).get("tscn_godot_project_dir")
                 rep = _run_diagnostic(os.path.dirname(save_path), diag_godot, strict=True,
-                                      layout_path=save_path, models_dir=export_dir)
+                                      layout_path=save_path, models_dir=export_dir,
+                                      lods=export_lods)
                 verdict = _diagnostic_status(rep)
                 if failed > 0:
                     _state_queue.put({"status": (f"Full export: {exported} meshes exported, {failed} failed.", "warning")})
@@ -1261,6 +1263,7 @@ def check_editor_queues(delta_time):
                 save_path = args[0]
                 godot_project = args[1] if len(args) > 1 else None
                 feature_options = args[2] if len(args) > 2 else None
+                export_lods = args[3] if len(args) > 3 else True
                 unreal.log("Unreal to Godot Exporter: Starting level layout export on main thread...")
                 try:
                     success = export_level_to_json.export_level_to_json(
@@ -1272,7 +1275,7 @@ def check_editor_queues(delta_time):
                         # can be cross-checked against each other.
                         diag_godot = godot_project or (feature_options or {}).get("tscn_godot_project_dir")
                         rep = _run_diagnostic(os.path.dirname(save_path), diag_godot,
-                                              layout_path=save_path)
+                                              layout_path=save_path, lods=export_lods)
                         verdict = _diagnostic_status(rep)
                         _state_queue.put({"status": verdict or ("Successfully exported level layout JSON!", "success")})
                     else:
