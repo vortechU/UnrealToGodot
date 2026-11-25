@@ -559,7 +559,7 @@ have clipped away, which on a cluttered prop can project a decal onto its neighb
 is an option rather than a constant. Set it to `0` to import Unreal's depths exactly.
 
 The floor applies to the **effective** depth (`size_m[1]` × the node's Y scale), not to
-`size_m[1]` alone: layouts from before v0.5 keep Unreal's scale in the transform, where
+`size_m[1]` alone: layouts from before v1.0 keep Unreal's scale in the transform, where
 `size_m[1]` is routinely `0.02` against a scale of several hundred.
 
 **`orm` is only ever set when the source map is genuinely ORM-ordered**

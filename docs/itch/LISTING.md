@@ -1,4 +1,4 @@
-# itch.io listing (v0.5, waiting for the build)
+# itch.io listing (v1.0.0)
 
 Create the page at https://itch.io/game/new and leave it as Draft until you have previewed it.
 
@@ -9,9 +9,9 @@ Create the page at https://itch.io/game/new and leave it as Draft until you have
 | Short description | Free, open-source exporter that moves Unreal levels and 3D asset packs into Godot 4. |
 | Classification | Tool |
 | Kind of project | Downloadable |
-| Release status | In development |
+| Release status | Released |
 | Pricing | No payments (fully free). "$0 or donate" keeps it free and adds a tip prompt. |
-| Upload | `UnrealToGodot-v0.5.zip`; display name "Unreal plugin + Godot addon v0.5"; platform: Windows |
+| Upload | `UnrealToGodot-v1.0.0.zip`; display name "Unreal plugin + Godot addon v1.0.0"; platform: Windows |
 | Description | Paste `description.html` into the editor's HTML (`<>`) view |
 | Tags | `godot`, `unreal-engine`, `exporter`, `importer`, `level-design`, `3d`, `gltf`, `game-development`, `open-source`, `addon` |
 | Code license | MIT |
@@ -29,12 +29,10 @@ Create the page at https://itch.io/game/new and leave it as Draft until you have
 
 ## Before publishing
 
-The text covers roadmap phases 1-4, as committed on `main`.
-
-- [ ] Run the tests with `--godot` and a real Unreal export.
-- [ ] Set 0.5 in `UnrealToGodot.uplugin` and `addons/unreal_importer/plugin.cfg`.
-- [ ] Update the `README.md` scope table (cameras and audio are still listed as not exported).
-- [ ] Build `UnrealToGodot-v0.5.zip` with LICENSE inside; tag and push `v0.5` (the docs link needs the tag).
+- [x] Run the tests with `--godot` and a real Unreal export.
+- [x] Set 1.0.0 in `UnrealToGodot.uplugin` and `addons/unreal_importer/plugin.cfg`.
+- [x] Tag and push `v1.0.0` (the docs link needs the tag). Build the zip from it:
+      `git archive --format=zip -o UnrealToGodot-v1.0.0.zip v1.0.0 UnrealToGodot addons LICENSE`
 - [ ] Retake the Godot and dock screenshots, and rebuild the cover from the new Godot shot.
 
 ## Page theme

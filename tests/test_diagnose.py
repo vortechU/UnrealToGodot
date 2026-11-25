@@ -143,6 +143,21 @@ check("unloaded sublevels trigger an export warning",
 check("World Partition triggers a partial-cell warning",
       any("World Partition" in w for w in wp_rep.warnings), wp_rep.warnings)
 
+print("\n=== 5. textures beside the models are not called leftovers ===")
+side = tempfile.mkdtemp()
+with open(os.path.join(side, "M.gltf"), "w", encoding="utf-8") as f:
+    json.dump({"images": [{"uri": "./T_A.png"}]}, f)
+for png in ("T_A.png", "T_Mask.png", "T_Old.png"):
+    open(os.path.join(side, png), "w").close()
+side_layout = {"meshes": {"M": {"materials": [{"parameters": {"opacity_texture": "T_Mask"}}]}}, "actors": []}
+side_rep = D.Report()
+D.audit_models(side_rep, side, side_layout)
+check("only the one nothing uses is", any(w.startswith("1 unreferenced") and "T_Old" in w for w in side_rep.warnings),
+      side_rep.warnings)
+side_rep = D.Report()
+D.audit_models(side_rep, side, None, strict=False)
+check("without a layout there is no telling", not any("unreferenced" in w for w in side_rep.warnings), side_rep.warnings)
+
 print("\n" + "=" * 60)
 if FAIL:
     print("FAILURES (%d): %s" % (len(FAIL), FAIL))

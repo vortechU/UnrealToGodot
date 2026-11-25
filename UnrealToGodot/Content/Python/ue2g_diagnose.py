@@ -312,6 +312,8 @@ def audit_models(rep, models_dir, layout, strict=True):
             uri = img.get("uri")
             if not uri or uri.startswith("data:"):
                 continue
+            if uri.startswith("./"):
+                uri = uri[2:]  # How a texture beside the model is written.
             uri_count += 1
             if any(uri.endswith(sfx) for sfx in BAKED_SUFFIXES) and "/" not in uri:
                 baked_hits.append((name, uri))
@@ -324,12 +326,16 @@ def audit_models(rep, models_dir, layout, strict=True):
 
     # Only flag PNGs inside models/ as stale leftovers when they carry baked
     # suffixes or are NOT intentionally referenced by sibling bare-URI glTFs
-    # (which is the normal layout when separate_textures=False).
+    # (which is the normal layout when separate_textures=False) or by the layout,
+    # which also uses maps glTF has no slot for. With no layout only baked ones count.
+    has_layout = isinstance(layout, dict)
+    if has_layout:
+        referenced_sibling_pngs.update(n.lower() + ".png" for n in layout_texture_names(layout))
     stray_png = [
         f for f in all_entries
         if f.lower().endswith(".png")
         and (any(f.endswith(sfx) for sfx in BAKED_SUFFIXES)
-             or f.lower() not in referenced_sibling_pngs)
+             or (has_layout and f.lower() not in referenced_sibling_pngs))
     ]
     if stray_png:
         rep.warn("%d unreferenced/baked PNG(s) sit inside models/ (e.g. %s). "

@@ -1,6 +1,6 @@
 <p><strong>Move 3D asset packs and levels from Unreal Engine to Godot 4, with meshes, materials, collision, lighting and layout.</strong> Free and open source (MIT).</p>
 <p>It comes in two parts: an Unreal plugin that exports your level, and a Godot addon that rebuilds it. Click <em>Export Everything</em> in Unreal, then <em>Import Unreal Level Layout</em> in Godot.</p>
-<p><em>This is early access (v0.5). Expect rough edges, and read "What doesn't transfer" below before you start.</em></p>
+<p><em>Version 1.0.0. Read "What doesn't transfer" below before you start.</em></p>
 
 <h2>What transfers</h2>
 <ul>
@@ -20,7 +20,7 @@
 <h2>What doesn't transfer</h2>
 <ul>
 <li><strong>Not converted:</strong> Blueprint graphs, gameplay logic, AnimBlueprints, particles and Sound Cue logic. This tool moves art, not behavior.</li>
-<li><strong>Materials are approximate:</strong> custom shader graph logic, such as world-position offset, vertex-paint blending or parallax, has to be rebuilt by hand.</li>
+<li><strong>Materials are approximate:</strong> custom shader graph logic, such as world-position offset, blends of several textures or parallax, has to be rebuilt by hand. The exception is vertex-painted layers (puddles, moss): on Unreal 5.8 with the Geometry Script plugin enabled, most become a Godot shader with the paint intact.</li>
 <li><strong>Lighting won't match exactly:</strong> the engines render differently, so expect to adjust brightness.</li>
 <li><strong>Nanite:</strong> there is no Godot equivalent. Meshes arrive as regular triangle meshes.</li>
 <li><strong>Landscapes:</strong> terrain is the least mature part. Paint layers need their ground textures reassigned in Godot.</li>
@@ -51,7 +51,7 @@
 
 <h2>Help and source</h2>
 <ul>
-<li><a href="https://github.com/vortechU/UnrealToGodot/tree/v0.5#readme">Full documentation and source</a></li>
+<li><a href="https://github.com/vortechU/UnrealToGodot/tree/v1.0.0#readme">Full documentation and source</a></li>
 <li><a href="https://discord.com/invite/HGwkYW2h6Y">Discord</a> for help and questions</li>
 <li><a href="https://github.com/vortechU/UnrealToGodot/issues">Report a bug</a>. Please attach both report files: <code>ue2g_report.txt</code> and <code>ue2g_import_report.txt</code>.</li>
 </ul>

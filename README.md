@@ -18,7 +18,7 @@ A toolchain for migrating 3D asset packs and level layouts—static and skeletal
 
 The repository contains two paired components that share a versioned JSON layout schema:
 
-1. **Unreal to Godot Exporter (Unreal Plugin)** — A Python plugin running inside Unreal Engine with a thread-safe Tkinter GUI to batch-export meshes to glTF, textures to PNG, landscapes to EXR, and level layouts to JSON (or directly to `.tscn`).
+1. **Unreal to Godot Exporter (Unreal Plugin)** — A Python plugin running inside Unreal Engine with a thread-safe Tkinter GUI to batch-export meshes to glTF, textures to PNG (float art to EXR), landscapes to EXR, and level layouts to JSON (or directly to `.tscn`).
 2. **Unreal Layout Importer (Godot Addon)** — A GDScript editor dock that parses the layout JSON, instances exported glTF assets at remapped transforms, generates physics collisions, binds PBR materials, and rebuilds lighting, terrain, foliage, decals, and navigation.
 
 ---
@@ -28,7 +28,7 @@ The repository contains two paired components that share a versioned JSON layout
 | Engine | Tested Version | Requirements & Notes |
 | --- | --- | --- |
 | **Unreal Engine** | **5.7 – 5.8** | Confirmed against the same landscape and material test suite (landscape APIs behave identically on both). Earlier 5.x versions are **untested**, though version-specific APIs are probed at runtime rather than assumed—if you test an older version, [let us know on Discord](https://discord.com/invite/HGwkYW2h6Y). Requires built-in **Python Editor Script Plugin**, **Editor Scripting Utilities**, and **glTF Exporter**. |
-| **Godot Engine** | **4.7.1 – 4.7.2** | The addon ships `.uid` resource sidecars (introduced in Godot 4.4), making **Godot 4.4+** the practical minimum. |
+| **Godot Engine** | **4.7.1 – 4.7.2** | **Godot 4.4+** is expected to work, but only the versions listed here are tested. |
 
 Both plugins stamp and verify a schema `format_version`. A mismatched plugin/addon pair fails immediately with a message telling you which side to update, rather than breaking halfway through an import.
 
@@ -146,7 +146,7 @@ Both plugins stamp and verify a schema `format_version`. A mismatched plugin/add
    - **Layout JSON path**
    *(Heightmaps/weightmaps write to a sibling `terrain/` folder; textures write to `textures/`.)*
 4. Toggle your desired **Level Export Features** (persisted across sessions):
-   - **Lights & Post-Process**, **Decals**, **Landscape / Terrain**, **Foliage & Instances**, **Navigation Volumes**, and **Tags & Metadata**.
+   - **Lights & Post-Process**, **Decals**, **Landscape / Terrain**, **Foliage & Instances**, **Navigation Volumes**, **Tags & Metadata**, **Reflection Probes**, **Cameras**, and **Ambient Audio**.
    - **Foliage & Instances note:** Unticking this does *not* drop instanced geometry. Instead, each ISM/HISM instance exports as an individual mesh placement so architectural details (railings, window frames) still arrive—just unbatched. Keep it enabled for dense painted foliage so it batches cleanly into a `MultiMeshInstance3D`.
    - **Generate Godot `.tscn` scene directly** *(optional)*: Writes a ready-to-open scene file directly into your Godot project (requires setting **Godot Project Path** under *Godot Engine Integration*).
 5. Click **Export Everything (Meshes + Layout)**.
@@ -183,6 +183,8 @@ If you enabled **Generate Godot `.tscn` scene directly** during export, open the
 
 - **Foliage:** Click **Bind Foliage Meshes (`.tscn` scenes)** once in the Unreal Importer dock. Because `.tscn` files cannot directly reference meshes nested inside glTF scenes, this binds each foliage MultiMesh in place using its `source_model` metadata.
 - **Landscapes:** Landscapes appear as placeholder `Node3D` nodes storing the heightmap/weightmap metadata (a text scene cannot decode float EXRs into geometry). Run a dock import with only **Terrain** enabled to build them, or import the `terrain/*.exr` files directly through your terrain plugin.
+
+The direct scene uses the materials inside the glTF files, so it does not carry per-placement material overrides, packed roughness/metallic maps, texture tiling, decal atlas crops, vertex paint, LOD chains, spline bending, or per-mesh shadow and draw-distance settings. For those, import the layout JSON through the dock instead.
 
 ---
 

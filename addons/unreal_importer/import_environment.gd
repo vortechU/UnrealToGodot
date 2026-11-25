@@ -112,7 +112,7 @@ var _decal_crop_cache: Dictionary = {}
 # import Unreal's depths untouched.
 #
 # The floor applies to the EFFECTIVE depth (size.y * the node's Y scale), not to
-# size.y alone: layouts from before v0.5 keep Unreal's scale in the transform, where
+# size.y alone: layouts from before v1.0 keep Unreal's scale in the transform, where
 # size.y is 0.02 and the scale carries a factor of several hundred.
 const DEFAULT_DECAL_MIN_DEPTH_M := 0.10
 
