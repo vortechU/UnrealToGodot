@@ -19,9 +19,10 @@ u = types.ModuleType("unreal")
 
 
 class _Texture(object):
-    def __init__(self, name, writable=True):
+    def __init__(self, name, writable=True, ext=".png"):
         self._name = name
         self.writable = writable
+        self.ext = ext
 
     def get_name(self):
         return self._name
@@ -59,7 +60,7 @@ class _Exporter(object):
         ok = True
         for task in tasks:
             _Exporter.forced_exporters.append(task.exporter)
-            if getattr(task.object, "writable", False):
+            if getattr(task.object, "writable", False) and task.filename.endswith(task.object.ext):
                 with open(task.filename, "wb") as f:
                     f.write(b"\x89PNG")
             else:
@@ -194,6 +195,18 @@ unmapped = _Texture2D("T_Un mapped!")
 res = C.export_textures_to_png([unmapped], name_tmp, name_map={})
 check("a texture missing from the map falls back to its sanitized asset name",
       res["exported"] == ["T_Un_mapped"], res)
+
+print("\n=== 6c. Float art is written as .exr ===")
+exr_tmp = tempfile.mkdtemp(prefix="ue2g_texexr_")
+textures = [_Texture2D("T_Car_N", ext=".exr"), _Texture2D("T_Car_D"), _Texture2D("T_None", writable=False)]
+res = C.export_textures_to_png(textures, exr_tmp)
+check("float art exports", sorted(res["exported"]) == ["T_Car_D", "T_Car_N"], res)
+check("as .exr, and only it", sorted(os.listdir(exr_tmp)) == ["T_Car_D.png", "T_Car_N.exr"], os.listdir(exr_tmp))
+check("art with neither form is still reported", res["unsupported"] == ["T_None"], res)
+_Exporter.forced_exporters = []
+res = C.export_textures_to_png(textures[:2], exr_tmp, skip_existing=True)
+check("an .exr already written is reused", sorted(res["reused"]) == ["T_Car_D", "T_Car_N"]
+      and _Exporter.forced_exporters == [], res)
 
 print("\n=== 7. Empty input is a no-op ===")
 res = C.export_textures_to_png([], tmp)

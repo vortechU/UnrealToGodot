@@ -144,7 +144,7 @@ DirectX normal maps, without ever double-flipping or mutating source PNGs.
 
 **Texture names are exported FILENAMES, not asset names.** Two different texture
 assets can share a name (two packs both shipping a `T_Concrete_D`); such names are
-exported as `<name>_<8-char-path-hash>.png`, exactly like colliding mesh names, so
+exported as `<name>_<8-char-path-hash>.png` (`.exr` for float art), exactly like colliding mesh names, so
 each material still binds its own art. Importers must treat the string as a
 filename stem and nothing more. `texture_paths` records the Unreal asset path each
 slot came from — the exporter needs it because the final filename is only known

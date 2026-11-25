@@ -1984,12 +1984,13 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                             if not tex or not isinstance(tex, unreal.Texture):
                                 continue
                             tex_name = texture_names.get(tex) or ue2g_common.sanitize_name(tex.get_name())
-                            src_tex = os.path.join(local_textures_dir, f"{tex_name}.png")
-                            if os.path.exists(src_tex):
-                                dest_tex = os.path.join(godot_textures_dir, f"{tex_name}.png")
-                                if not _same_path(src_tex, dest_tex):
-                                    shutil.copy2(src_tex, dest_tex)
-                                    unreal.log(f"Transferred texture: {tex_name}.png -> {godot_textures_dir}")
+                            for ext in ue2g_common.TEXTURE_EXPORT_EXTS:
+                                src_tex = os.path.join(local_textures_dir, tex_name + ext)
+                                if os.path.exists(src_tex):
+                                    dest_tex = os.path.join(godot_textures_dir, tex_name + ext)
+                                    if not _same_path(src_tex, dest_tex):
+                                        shutil.copy2(src_tex, dest_tex)
+                                        unreal.log(f"Transferred texture: {tex_name}{ext} -> {godot_textures_dir}")
                 except Exception as copy_err:
                     unreal.log_warning(f"Failed to auto-transfer level textures to Godot: {str(copy_err)}")
 

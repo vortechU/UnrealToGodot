@@ -657,7 +657,7 @@ def audit_godot_project(rep, project_dir):
             name, uri = broken_rel[0]
             rep.error("%d image URI(s) in the project's models/ point to missing "
                       "texture files (e.g. '%s' referenced by %s). The texture "
-                      "was not transferred or could not be exported as PNG."
+                      "was not transferred or could not be exported."
                       % (len(broken_rel), uri, name))
         if not broken_bare and not broken_rel and (gltfs or glbs):
             rep.ok("every glTF in the project resolves its textures")

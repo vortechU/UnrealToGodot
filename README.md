@@ -256,8 +256,8 @@ The diagnostic script requires only standard Python (no Unreal or Godot installa
   The mesh name in the layout JSON did not match any `.gltf` file in your models folder. Confirm your **glTF Models Folder** path. If a pack contains multiple meshes with the same name, the exporter appends a deterministic `_<hash>` suffix—re-export meshes and layout together so filenames stay synchronized.
 - **Textures aren't loading**
   Material and decal textures auto-export into a sibling `textures/` folder. Matching is case-insensitive and supports `.png`, `.tga`, `.jpg`, `.jpeg`, `.dds`, `.exr`, and `.webp`.
-- **A few textures skipped with `"could not be written as PNG"`**
-  Unreal's PNG exporter only handles 8/16-bit source art. Floating-point textures (`.exr`, `.hdr`), cubemaps, and sky panoramas cannot be exported as PNG and are safely skipped (the rest of the export succeeds and the report logs the skipped references). To include one, re-import it in Unreal from an 8/16-bit source image.
+- **A few textures skipped with `"could not be written as PNG or EXR"`**
+  Floating-point textures (imported from `.exr` or `.hdr`) export as `.exr`; everything else exports as `.png`. Cubemaps and sky panoramas have no single-image form and are safely skipped (the rest of the export succeeds and the report logs the skipped references). To include a skipped 2D texture, re-import it in Unreal from a `.png`, `.tga`, or `.exr`.
 - **Imported scene is too dark or too bright**
   Adjust **Light energy scale** in the Godot importer dock or tweak individual light nodes. Original Unreal intensities and units are preserved in the layout JSON.
 - **Terrain looks flat or missing**

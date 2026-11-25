@@ -247,9 +247,9 @@ static func shrink_source_files(folder: String, size_limit: int, names = null) -
 	## folders searched also hold the project's other art.
 	##
 	## This is destructive and cannot be undone from inside Godot -- the source
-	## art only exists back in Unreal. It is deliberately limited to .png, the
-	## only thing the exporter writes: anything else in the folder was put there
-	## by hand, and quietly rewriting someone's own art would be a nasty way to
+	## art only exists back in Unreal. It is deliberately limited to .png, what
+	## the exporter writes (bar a few .exr): anything else in the folder may have
+	## been put there by hand, and quietly rewriting someone's own art would be a nasty way to
 	## learn what this option does.
 	##
 	## Returns {"total", "shrunk", "skipped", "failed", "bytes_before",

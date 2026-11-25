@@ -787,8 +787,13 @@ def iter_base_material_vectors(material):
         material, "get_vector_parameter_names", "get_material_default_vector_parameter_value")
 
 
+# What export_textures_to_png writes, in the order it tries them.
+TEXTURE_EXPORT_EXTS = (".png", ".exr")
+
+
 def export_textures_to_png(textures, textures_dir, skip_existing=False, name_map=None):
-    """Writes each texture's SOURCE art to <textures_dir>/<export name>.png.
+    """Writes each texture's SOURCE art to <textures_dir>/<export name>.png, or .exr
+    for float art (imported from .exr/.hdr), which Unreal has no PNG form of.
 
     name_map is the {texture: export_name} dict from build_export_name_map. Pass
     it whenever the filenames end up referenced from somewhere else (a layout
@@ -814,15 +819,16 @@ def export_textures_to_png(textures, textures_dir, skip_existing=False, name_map
     Leaving the exporter unset makes the engine pick one via SupportsObject().
     For a supported texture that is TextureExporterPNG and the bytes are
     identical (verified byte-for-byte on UE 5.7.4); for an unsupported one it
-    logs a warning and moves on to the next task instead of asserting.
+    logs a warning and moves on to the next task instead of asserting. Those are
+    retried as .exr, which the engine writes for float art only (UE 5.8).
     """
     result = {"exported": [], "reused": [], "unsupported": []}
-    tasks = []
+    pending = []
 
     for tex in textures:
         if tex is None:
             continue
-        # Only 2D textures have PNG-writable source art. Cubemaps, render
+        # Only 2D textures have writable source art. Cubemaps, render
         # targets, arrays and volume textures have no single-image form, so
         # drop them here rather than let the engine warn once per task.
         if not isinstance(tex, unreal.Texture2D):
@@ -834,34 +840,40 @@ def export_textures_to_png(textures, textures_dir, skip_existing=False, name_map
             name = name_map.get(tex)
         if not name:
             name = sanitize_name(safe_get_name(tex))
-        filename = os.path.join(textures_dir, "%s.png" % name)
 
         should_skip = (
             (name in skip_existing) if isinstance(skip_existing, (set, frozenset, list, tuple))
             else bool(skip_existing)
         )
-        if should_skip and os.path.exists(filename):
+        if should_skip and any(os.path.exists(os.path.join(textures_dir, name + ext))
+                               for ext in TEXTURE_EXPORT_EXTS):
             result["reused"].append(name)
             continue
+        pending.append((name, tex))
 
-        task = unreal.AssetExportTask()
-        task.object = tex
-        task.filename = filename
-        task.automated = True
-        task.prompt = False
-        task.replace_identical = True
-        # task.exporter is deliberately left unset -- see the docstring.
-        tasks.append((name, filename, task))
-
-    if tasks:
-        unreal.Exporter.run_asset_export_tasks([t[2] for t in tasks])
+    for ext in TEXTURE_EXPORT_EXTS:
+        tasks = []
+        for name, tex in pending:
+            task = unreal.AssetExportTask()
+            task.object = tex
+            task.filename = os.path.join(textures_dir, name + ext)
+            task.automated = True
+            task.prompt = False
+            task.replace_identical = True
+            # task.exporter is deliberately left unset -- see the docstring.
+            tasks.append(task)
+        if tasks:
+            unreal.Exporter.run_asset_export_tasks(tasks)
         # The batch keeps going past a failure, so the file on disk is the only
         # reliable per-texture verdict.
-        for name, filename, _task in tasks:
-            if os.path.isfile(filename):
+        missing = []
+        for (name, tex), task in zip(pending, tasks):
+            if os.path.isfile(task.filename):
                 result["exported"].append(name)
             else:
-                result["unsupported"].append(name)
+                missing.append((name, tex))
+        pending = missing
+    result["unsupported"].extend(name for name, _tex in pending)
 
     return result
 
@@ -875,11 +887,10 @@ def log_texture_export_result(result, textures_dir):
         unreal.log("Exported %d texture(s) to: %s" % (len(result["exported"]), textures_dir))
     if result["unsupported"]:
         unreal.log_warning(
-            "%d texture(s) could not be written as PNG and were skipped: %s. "
-            "Unreal's PNG exporter only handles 8/16-bit source art, so textures "
-            "imported from .exr/.hdr (and cubemaps) have no PNG form. Materials "
-            "using them import into Godot without that map -- re-import the "
-            "texture in Unreal from an 8/16-bit source to include it."
+            "%d texture(s) could not be written as PNG or EXR and were skipped: %s. "
+            "Cubemaps have no single-image form, and some source formats have no "
+            "exporter. Materials using them import into Godot without that map -- "
+            "re-import the texture in Unreal from a .png, .tga or .exr to include it."
             % (len(result["unsupported"]), ", ".join(sorted(result["unsupported"])))
         )
 

@@ -309,6 +309,20 @@ uris = [i["uri"] for i in doc.get("images", [])]
 check("albedo uri spells the real relative path",
       "../textures/TX_Old_Bouys_NN_02a_ALB.png" in uris, uris)
 check("normal uri present", "../textures/TX_Old_Bouys_NN_02a_NRM.png" in uris, uris)
+exr_root = tempfile.mkdtemp()
+for sub in ("models", "textures"):
+    os.makedirs(os.path.join(exr_root, sub))
+for fn in ("TX_Old_Bouys_NN_02a_NRM.exr", "TX_Old_Bouys_NN_02a_ALB.exr", "TX_Old_Bouys_NN_02a_ALB.png"):
+    open(os.path.join(exr_root, "textures", fn), "w").close()
+exr_gltf = os.path.join(exr_root, "models", "SM_Buoy.gltf")
+with open(exr_gltf, "w", encoding="utf-8") as f:
+    json.dump(base_doc, f)
+EX.inject_texture_references(exr_gltf, params, "../textures")
+with open(exr_gltf, encoding="utf-8") as f:
+    exr_images = {i["uri"]: i.get("mimeType") for i in json.load(f)["images"]}
+check("a texture written as .exr is referenced as .exr, a .png one as .png",
+      exr_images == {"../textures/TX_Old_Bouys_NN_02a_NRM.exr": None,
+                     "../textures/TX_Old_Bouys_NN_02a_ALB.png": "image/png"}, exr_images)
 check("packed RMA map NOT injected (glTF channel order differs)",
       not any("RMA" in u for u in uris), uris)
 

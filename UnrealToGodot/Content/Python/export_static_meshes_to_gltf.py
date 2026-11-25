@@ -136,10 +136,18 @@ def inject_texture_references(gltf_path, params_by_material, textures_rel="../te
 
     def texture_index(tex_name):
         """Adds (or reuses) an image+texture pair for tex_name, returning its index."""
-        uri = "%s/%s.png" % (textures_rel, tex_name)
+        stem = "%s/%s" % (textures_rel, tex_name)
+        folder = os.path.dirname(gltf_path)
+        # Float art is written as .exr (see ue2g_common.export_textures_to_png).
+        is_exr = (os.path.isfile(os.path.join(folder, stem + ".exr"))
+                  and not os.path.isfile(os.path.join(folder, stem + ".png")))
+        uri = stem + (".exr" if is_exr else ".png")
         if uri in uri_to_texture:
             return uri_to_texture[uri]
-        images.append({"uri": uri, "mimeType": "image/png", "name": tex_name})
+        image = {"uri": uri, "name": tex_name}
+        if not is_exr:
+            image["mimeType"] = "image/png"
+        images.append(image)
         textures.append({"source": len(images) - 1})
         uri_to_texture[uri] = len(textures) - 1
         return len(textures) - 1
@@ -1059,8 +1067,6 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
             if mesh_has_exported:
                 exported_count += 1
                 exported_meshes.append(mesh)
-                inject_textures_for_exported_mesh(mesh, export_dir, mesh_name,
-                                                  separate_textures, texture_names_by_path)
 
     # Automatically export referenced textures
     if exported_count > 0:
@@ -1069,6 +1075,11 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
                                        name_map=texture_names)
         except Exception as tex_err:
             unreal.log_warning(f"Failed to export textures for meshes: {str(tex_err)}")
+
+        # After the textures: the .gltf names the file each one was written to.
+        for mesh in exported_meshes:
+            inject_textures_for_exported_mesh(mesh, export_dir, export_names.get(mesh, mesh.get_name()),
+                                              separate_textures, texture_names_by_path)
 
         if separate_textures:
             # Post-export safety net: with baking disabled the glTF folder should
@@ -1296,8 +1307,6 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
             if mesh_has_exported:
                 exported_count += 1
                 exported_meshes.append(mesh)
-                inject_textures_for_exported_mesh(mesh, export_dir, mesh_name,
-                                                  separate_textures, texture_names_by_path)
 
     # Automatically export referenced textures
     if exported_count > 0:
@@ -1309,6 +1318,11 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
                 exported_textures_out.update(tex_res.get("reused") or ())
         except Exception as tex_err:
             unreal.log_warning(f"Failed to export textures for meshes: {str(tex_err)}")
+
+        # After the textures: the .gltf names the file each one was written to.
+        for mesh in exported_meshes:
+            inject_textures_for_exported_mesh(mesh, export_dir, export_names.get(mesh, mesh.get_name()),
+                                              separate_textures, texture_names_by_path)
 
         if separate_textures:
             # Post-export safety net: with baking disabled the glTF folder should
