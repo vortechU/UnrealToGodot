@@ -4,7 +4,7 @@ as a FILE-PATH positional (the pythonscript commandlet cannot load a level):
 
     set UE2G_OUT_DIR=<dir>
     UnrealEditor-Cmd.exe <project>.uproject <map>.umap ^
-      -ExecutePythonScript="tests/real_landscape_export.py" -unattended -nopause -nosplash
+      -ExecutePythonScript="<repo>/tests/real_landscape_export.py" -unattended -nopause -nosplash
 
 Findings are logged one line per field under `LogPython` in
 <project>/Saved/Logs/<project>.log, prefixed REALLS| -- unreal.log only tags the

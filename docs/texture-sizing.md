@@ -103,7 +103,7 @@ hands back a null canvas). Add `-AllowCommandletRendering`:
 
 ```bash
 UnrealEditor-Cmd.exe <project>.uproject -run=pythonscript \
-  -script="tests/probe_texture_export_routes.py" -unattended -nopause -nosplash \
+  -script="<repo>/tests/probe_texture_export_routes.py" -unattended -nopause -nosplash \
   -AllowCommandletRendering
 
 python tests/compare_texture_exports.py C:/scratch/texquality

@@ -2,7 +2,7 @@
 production functions the GUI calls, for use as fast-iteration test data.
 
     UnrealEditor-Cmd.exe <project>.uproject -run=pythonscript \
-      -script="tests/real_export.py" -unattended -nopause -nosplash \
+      -script="<repo>/tests/real_export.py" -unattended -nopause -nosplash -AllowCommandletRendering \
       -MapPath="/Game/Docks/VOL2_Powell/Maps/Demonstration" \
       -OutDir="C:/path/to/scratch/real_export_out"
 
@@ -12,16 +12,19 @@ full map's Nanite build can take minutes); run it once per Unreal-side change
 and reuse the output for many Godot-side iterations via run_real_check.py.
 """
 import os
+import re
 import sys
 import unreal
 
-MAP_PATH = None
-OUT_DIR = None
-for arg in sys.argv:
-    if arg.startswith("-MapPath="):
-        MAP_PATH = arg.split("=", 1)[1].strip('"')
-    elif arg.startswith("-OutDir="):
-        OUT_DIR = arg.split("=", 1)[1].strip('"')
+
+def arg(name):
+    """The value of -name=, or None. The pythonscript commandlet leaves sys.argv without it."""
+    m = re.search(r'-%s=(?:"([^"]*)"|(\S+))' % name, unreal.SystemLibrary.get_command_line())
+    return m and (m.group(1) or m.group(2))
+
+
+MAP_PATH = arg("MapPath")
+OUT_DIR = arg("OutDir")
 
 if not MAP_PATH or not OUT_DIR:
     unreal.log_error("real_export.py requires -MapPath=... and -OutDir=...")

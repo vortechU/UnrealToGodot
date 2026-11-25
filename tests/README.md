@@ -22,7 +22,7 @@ export once from Unreal and then re-run the Godot half as often as you like:
 ```bash
 # SLOW (minutes) -- run once per Unreal-side change
 UnrealEditor-Cmd.exe <project>.uproject -run=pythonscript \
-  -script="tests/real_export.py" -unattended -nopause -nosplash \
+  -script="<repo>/tests/real_export.py" -unattended -nopause -nosplash -AllowCommandletRendering \
   -MapPath="/Game/.../Maps/Demonstration" -OutDir="C:/scratch/real_export_out"
 
 # FAST (~1s import) -- run after every Godot-side change
@@ -102,7 +102,7 @@ latter boots the full editor and crashes in Slate under `-NullRHI`:
 
 ```bash
 UnrealEditor-Cmd.exe <project>.uproject -run=pythonscript \
-  -script="tests/probe_unreal_api.py" -unattended -nopause -nosplash
+  -script="<repo>/tests/probe_unreal_api.py" -unattended -nopause -nosplash
 ```
 
 Python output lands in `<project>/Saved/Logs/<project>.log` under `LogPython`,
