@@ -343,9 +343,11 @@ def classify_packed_texture(param_name):
 # parameter literally "Diff" (the ContainersHouse pack does), and "diffuse"
 # contains "diff" anyway. "colour" covers UK-spelled packs that "color" misses.
 _ROLE_SUBSTRINGS = (
+    # Check emissive before albedo so "EmissiveColor" / "EmissiveColorMap" does
+    # not match "color" and get misclassified as albedo_texture.
+    ("emissive_texture", ("emissive", "emission", "glow")),
     ("albedo_texture", ("albedo", "basecolor", "diff", "colour", "color", "maintex")),
     ("normal_texture", ("normal", "bump")),
-    ("emissive_texture", ("emissive", "emission", "glow")),
     ("opacity_texture", ("opacity", "alpha", "translucen", "transparen")),
     ("roughness_texture", ("rough",)),
     ("metallic_texture", ("metal",)),
@@ -729,20 +731,28 @@ def extract_material_parameters(material, collected_textures=None):
             slot = next(iter(channels)) + "_texture"
             if parameters[slot] is None:
                 _set_slot(slot, tex)
-        elif channels and parameters["packed_texture"] is None:
-            parameters["packed_channels"] = channels
-            _set_slot("packed_texture", tex)
+        elif channels:
+            # Don't let an AO-only texture lock out a richer roughness/metallic
+            # packed map that arrives later on the same material.
+            existing_ch = parameters.get("packed_channels") or {}
+            if parameters["packed_texture"] is None or (
+                    set(existing_ch.keys()) == {"ao"} and set(channels.keys()) != {"ao"}):
+                parameters["packed_channels"] = channels
+                _set_slot("packed_texture", tex)
 
     def _assign_texture(param_name, tex):
         """Classifies one sampled texture and records its slot plus its asset path."""
         tex_name = tex.get_name()
         roles = _traced_roles(str(param_name or ""), tex)
+        had_traced = bool(roles)
         for role in ("opacity", "opacity_mask"):
             output = roles.pop(role, None)
             if output is not None:
                 opacity_sources.setdefault(role, (tex, output))
         if roles:
             _assign_traced(tex, roles)
+            return
+        if had_traced:
             return
         role, packed = resolve_texture_role(str(param_name).lower(), tex_name)
         # A name never overrules an output the graph already settled.
@@ -794,6 +804,8 @@ def extract_material_parameters(material, collected_textures=None):
 
     def _assign_vector(name, value):
         key = classify_vector_parameter(name)
+        if key is None and trace and trace["tints"] is not None and str(name) in trace["tints"]:
+            key = "albedo_color"
         if key is None or key in assigned:
             return
         # A Blueprint often sets one on every slot, used by the material or not.
@@ -1078,7 +1090,8 @@ _INSTANCE_EXPANSION_WARN_THRESHOLD = 1000
 
 
 def _expand_instanced_component(foliage_mod, comp, comp_name, mesh_key, mesh_name,
-                                mesh_path, material_overrides, actor_label):
+                                mesh_path, material_overrides, actor_label,
+                                render_flags=None):
     """
     One schema component entry per instance of an instanced (ISM/HISM/foliage)
     component, for the path where foliage export is switched off.
@@ -1091,6 +1104,9 @@ def _expand_instanced_component(foliage_mod, comp, comp_name, mesh_key, mesh_nam
     """
     if foliage_mod is None or not hasattr(foliage_mod, "iter_instance_transforms"):
         return []
+
+    if render_flags is None:
+        render_flags = extract_component_render_flags(comp)
 
     placements = []
     try:
@@ -1106,6 +1122,10 @@ def _expand_instanced_component(foliage_mod, comp, comp_name, mesh_key, mesh_nam
                 "godot_relative_transform": unreal_to_godot_transform(local_transform),
                 "unreal_world_transform": unreal_transform_to_dict(world_transform),
                 "godot_world_transform": unreal_to_godot_transform(world_transform),
+                "visible": render_flags["visible"],
+                "cast_shadow": render_flags["cast_shadow"],
+                "collision_enabled": render_flags["collision_enabled"],
+                "max_draw_distance_m": render_flags["max_draw_distance_m"],
                 "material_overrides": material_overrides,
             })
     except Exception as e:
@@ -1234,14 +1254,24 @@ def extract_spline_mesh_params(comp):
     else:
         up_dir = [0.0, 1.0, 0.0]
 
+    def _vec2_m(v, default=(0.0, 0.0)):
+        if v is None:
+            return list(default)
+        try:
+            return [float(v.x) * ue2g_common.CM_TO_M, float(v.y) * ue2g_common.CM_TO_M]
+        except Exception:
+            return list(default)
+
     return {
         "start_pos": _gltf_vec_m(ue2g_common.safe_get_prop(params, "start_pos", None)),
         "start_tangent": _gltf_vec_m(ue2g_common.safe_get_prop(params, "start_tangent", None), (1.0, 0.0, 0.0)),
         "start_scale": _vec2(ue2g_common.safe_get_prop(params, "start_scale", None)),
+        "start_offset": _vec2_m(ue2g_common.safe_get_prop(params, "start_offset", None)),
         "start_roll_rad": _num_p(params, "start_roll", 0.0),
         "end_pos": _gltf_vec_m(ue2g_common.safe_get_prop(params, "end_pos", None), (1.0, 0.0, 0.0)),
         "end_tangent": _gltf_vec_m(ue2g_common.safe_get_prop(params, "end_tangent", None), (1.0, 0.0, 0.0)),
         "end_scale": _vec2(ue2g_common.safe_get_prop(params, "end_scale", None)),
+        "end_offset": _vec2_m(ue2g_common.safe_get_prop(params, "end_offset", None)),
         "end_roll_rad": _num_p(params, "end_roll", 0.0),
         "forward_axis": forward_axis,
         "up_dir": up_dir,
@@ -1373,6 +1403,28 @@ def inspect_world_streaming(world):
         "loaded_sublevels": sorted(set(loaded)),
         "unloaded_sublevels": sorted(set(unloaded)),
     }
+
+
+def _get_skeletal_mesh(comp):
+    """Reads a SkeletalMeshComponent's SkeletalMesh across UE 4.x and UE 5.1+ APIs."""
+    skel_cls = getattr(unreal, "SkeletalMesh", None)
+    if hasattr(comp, "get_skeletal_mesh_asset"):
+        try:
+            m = comp.get_skeletal_mesh_asset()
+            if m is not None:
+                return m
+        except Exception:
+            pass
+    for prop in ("skeletal_mesh_asset", "skinned_asset", "skeletal_mesh"):
+        m = ue2g_common.safe_get_prop(comp, prop, None)
+        if m is not None and (skel_cls is None or isinstance(m, skel_cls)):
+            return m
+    if hasattr(comp, "skeletal_mesh"):
+        try:
+            return comp.skeletal_mesh
+        except Exception:
+            pass
+    return None
 
 
 def extract_component_material_overrides(comp, collected_textures=None):
@@ -1577,7 +1629,7 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                 for comp in actor.get_components_by_class(unreal.SkeletalMeshComponent):
                     if ue2g_common.safe_get_prop(comp, "is_editor_only", False):
                         continue
-                    m = ue2g_common.safe_get_prop(comp, "skeletal_mesh")
+                    m = _get_skeletal_mesh(comp)
                     if m:
                         unique_meshes.add(m)
         except Exception:
@@ -1609,12 +1661,14 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
             mesh_library[mesh_key] = entry
         return mesh_key
 
+    cancelled = False
     with unreal.ScopedSlowTask(len(all_actors), "Scanning level actors for Static Meshes...") as slow_task:
         slow_task.make_dialog(can_cancel=True)
         
         for actor in all_actors:
             if slow_task.should_cancel():
                 unreal.log_warning("Export cancelled by user.")
+                cancelled = True
                 break
             if actor is None:
                 continue
@@ -1646,7 +1700,7 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                 for comp in skeletal_comps:
                     if ue2g_common.safe_get_prop(comp, "is_editor_only", False):
                         continue
-                    mesh = comp.skeletal_mesh if hasattr(comp, "skeletal_mesh") else comp.get_editor_property("skeletal_mesh")
+                    mesh = _get_skeletal_mesh(comp)
                     if mesh:
                         valid_components.append((comp, mesh))
                         
@@ -1697,10 +1751,11 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                     # than one per component, which would put a whole painted field
                     # on a single mesh at the component origin.
                     if expand_instanced and isinstance(comp, instanced_classes):
+                        render_flags = extract_component_render_flags(comp, actor)
                         placements = _expand_instanced_component(
                             foliage_mod, comp, comp_name, mesh_key, mesh_name, mesh_path,
                             extract_component_material_overrides(comp, collected_textures),
-                            actor_label)
+                            actor_label, render_flags=render_flags)
                         if comp_tags:
                             for p in placements:
                                 p["tags"] = list(comp_tags)
@@ -1752,7 +1807,11 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                     exported_actors.append(actor_data)
             except Exception as actor_err:
                 unreal.log_warning(f"Failed to export actor '{ue2g_common.safe_get_name(actor)}': {str(actor_err)}")
- 
+
+    if cancelled:
+        unreal.log_warning("Level layout export aborted before writing file.")
+        return False
+
     # 5. Collect feature data (lights, post-process, decals, probes, cameras, audio, terrain, foliage, navigation)
     environment_data = {}
     collected_sounds = set()
@@ -1899,21 +1958,26 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                 unreal.log_warning(f"Failed to export level audio: {str(aud_err)}")
 
         if godot_project_dir and os.path.isdir(godot_project_dir):
+            import shutil
+            unreal.log(f"Unreal to Godot: Automatically transferring layout and textures to Godot project: {godot_project_dir}")
+
+            def _same_path(a, b):
+                return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+            # Copy JSON file
             try:
-                import shutil
-                unreal.log(f"Unreal to Godot: Automatically transferring layout and textures to Godot project: {godot_project_dir}")
-                
-                # Copy JSON file
                 dest_json = os.path.join(godot_project_dir, os.path.basename(save_path))
-                if os.path.abspath(save_path) != os.path.abspath(dest_json):
+                if not _same_path(save_path, dest_json):
                     shutil.copy2(save_path, dest_json)
                     unreal.log(f"Transferred layout JSON: {os.path.basename(save_path)} -> {godot_project_dir}")
-                
-                # Copy textures
-                if collected_textures:
+            except Exception as copy_err:
+                unreal.log_warning(f"Failed to auto-transfer layout JSON to Godot: {str(copy_err)}")
+
+            # Copy textures
+            if collected_textures:
+                try:
                     godot_textures_dir = os.path.join(godot_project_dir, "textures")
                     os.makedirs(godot_textures_dir, exist_ok=True)
-                    
                     local_textures_dir = os.path.join(os.path.dirname(save_path), "textures")
                     if os.path.exists(local_textures_dir):
                         for tex in collected_textures:
@@ -1923,11 +1987,14 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                             src_tex = os.path.join(local_textures_dir, f"{tex_name}.png")
                             if os.path.exists(src_tex):
                                 dest_tex = os.path.join(godot_textures_dir, f"{tex_name}.png")
-                                if os.path.abspath(src_tex) != os.path.abspath(dest_tex):
+                                if not _same_path(src_tex, dest_tex):
                                     shutil.copy2(src_tex, dest_tex)
                                     unreal.log(f"Transferred texture: {tex_name}.png -> {godot_textures_dir}")
+                except Exception as copy_err:
+                    unreal.log_warning(f"Failed to auto-transfer level textures to Godot: {str(copy_err)}")
 
-                # Copy terrain data (heightmaps / weightmaps written by the landscape exporter)
+            # Copy terrain data (heightmaps / weightmaps written by the landscape exporter)
+            try:
                 local_terrain_dir = os.path.join(os.path.dirname(save_path), "terrain")
                 if os.path.isdir(local_terrain_dir):
                     godot_terrain_dir = os.path.join(godot_project_dir, "terrain")
@@ -1935,11 +2002,14 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                     for terrain_file in os.listdir(local_terrain_dir):
                         src_t = os.path.join(local_terrain_dir, terrain_file)
                         dest_t = os.path.join(godot_terrain_dir, terrain_file)
-                        if os.path.isfile(src_t) and os.path.abspath(src_t) != os.path.abspath(dest_t):
+                        if os.path.isfile(src_t) and not _same_path(src_t, dest_t):
                             shutil.copy2(src_t, dest_t)
                     unreal.log(f"Transferred terrain data -> {godot_terrain_dir}")
+            except Exception as copy_err:
+                unreal.log_warning(f"Failed to auto-transfer terrain data to Godot: {str(copy_err)}")
 
-                # Copy exported audio (.wav) files
+            # Copy exported audio (.wav) files
+            try:
                 local_audio_dir = os.path.join(os.path.dirname(save_path), "audio")
                 if os.path.isdir(local_audio_dir):
                     godot_audio_dir = os.path.join(godot_project_dir, "audio")
@@ -1947,20 +2017,21 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                     for audio_file in os.listdir(local_audio_dir):
                         src_a = os.path.join(local_audio_dir, audio_file)
                         dest_a = os.path.join(godot_audio_dir, audio_file)
-                        if os.path.isfile(src_a) and os.path.abspath(src_a) != os.path.abspath(dest_a):
+                        if os.path.isfile(src_a) and not _same_path(src_a, dest_a):
                             shutil.copy2(src_a, dest_a)
                     unreal.log(f"Transferred audio data -> {godot_audio_dir}")
             except Exception as copy_err:
-                unreal.log_warning(f"Failed to auto-transfer level layout to Godot: {str(copy_err)}")
+                unreal.log_warning(f"Failed to auto-transfer audio data to Godot: {str(copy_err)}")
         
         # Optionally generate a Godot .tscn scene directly inside the Godot project
         tscn_path = None
-        if opts.get("write_tscn") and godot_project_dir and os.path.isdir(godot_project_dir):
+        tscn_project_dir = godot_project_dir or opts.get("tscn_godot_project_dir")
+        if opts.get("write_tscn") and tscn_project_dir and os.path.isdir(tscn_project_dir):
             tscn_mod = _try_import("tscn_writer")
             if tscn_mod:
                 try:
                     scene_name = ue2g_common.sanitize_name(opts.get("tscn_scene_name") or f"{world_name}_imported")
-                    tscn_path = os.path.join(godot_project_dir, f"{scene_name}.tscn")
+                    tscn_path = os.path.join(tscn_project_dir, f"{scene_name}.tscn")
                     res_paths = {
                         "models": "res://models/",
                         "textures": "res://textures/",
@@ -1969,7 +2040,7 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                     }
                     tscn_options = {
                         "scene_name": scene_name,
-                        "godot_project_dir": godot_project_dir,
+                        "godot_project_dir": tscn_project_dir,
                         "light_energy_scale": 1.0,
                         "lights": bool(opts.get("lights")),
                         "decals": bool(opts.get("decals")),

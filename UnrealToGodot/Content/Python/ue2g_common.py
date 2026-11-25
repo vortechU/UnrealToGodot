@@ -21,6 +21,7 @@ the conversion, so every transform in the layout JSON stays consistent.
 
 import hashlib
 import os
+import re
 
 import unreal
 
@@ -656,11 +657,9 @@ def iter_base_material_textures(material, include_dependencies=True):
                     name = str(expr.get_editor_property("parameter_name"))
                 except Exception:
                     name = ""
-            if not name:
-                try:
-                    name = str(expr.get_name())
-                except Exception:
-                    name = ""
+            # Plain MaterialExpressionTextureSample nodes have no parameter name;
+            # keep "" so trace_material_graph (which records param="") matches them
+            # instead of failing to match a synthesized expression object name.
             yield name, tex
 
     # Plain TextureSample nodes that the graph trace ties to an output. "" because
@@ -837,7 +836,11 @@ def export_textures_to_png(textures, textures_dir, skip_existing=False, name_map
             name = sanitize_name(safe_get_name(tex))
         filename = os.path.join(textures_dir, "%s.png" % name)
 
-        if skip_existing and os.path.exists(filename):
+        should_skip = (
+            (name in skip_existing) if isinstance(skip_existing, (set, frozenset, list, tuple))
+            else bool(skip_existing)
+        )
+        if should_skip and os.path.exists(filename):
             result["reused"].append(name)
             continue
 
@@ -910,30 +913,37 @@ def build_export_name_map(assets, kind="asset"):
     Unique names are kept as-is; when several different assets share a name
     (common in large asset packs), EVERY colliding asset gets a deterministic
     "<name>_<8-char-path-hash>" suffix so exported files never overwrite each
-    other, regardless of iteration order.
+    other, regardless of iteration order. So does a mesh called "<X>_LOD<n>" when
+    <X> is in the batch: that is the file name of <X>'s own LOD n.
 
-    kind only names the assets in the collision warning. That warning matters:
+    kind otherwise only names the assets in the collision warning. That warning matters:
     a silent collision is invisible downstream -- every reference still resolves,
     just to the wrong art -- so the log is the only place it ever surfaces.
     """
     groups = {}
+    seen_assets = set()
     for asset in assets:
-        if not asset:
+        if not asset or asset in seen_assets:
             continue
+        seen_assets.add(asset)
         try:
             name = sanitize_name(asset.get_name())
         except Exception:
             continue
-        groups.setdefault(name, []).append(asset)
+        # Group case-insensitively so Windows/macOS filesystems and Godot's
+        # case-insensitive texture/mesh lookups never collide on case-only diffs.
+        groups.setdefault(name.lower(), []).append((name, asset))
 
     result = {}
     collisions = []
-    for name, group in groups.items():
-        if len(group) == 1:
-            result[group[0]] = name
+    for _key, group in groups.items():
+        lod_of = re.match(r"(.+)_lod\d+$", _key) if kind == "mesh" else None
+        if len(group) == 1 and not (lod_of and lod_of.group(1) in groups):
+            name, asset = group[0]
+            result[asset] = name
         else:
-            collisions.append(name)
-            for asset in group:
+            collisions.append(group[0][0])
+            for name, asset in group:
                 try:
                     result[asset] = "%s_%s" % (name, short_path_hash(asset.get_path_name()))
                 except Exception:

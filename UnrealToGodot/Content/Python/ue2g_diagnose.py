@@ -121,6 +121,11 @@ def human_bytes(n):
         n /= 1024.0
 
 
+FEATURE_SECTIONS = ("lights", "decals", "reflection_probes", "cameras", "audio",
+                    "landscapes", "foliage", "navigation",
+                    "post_process", "height_fog", "sky_light")
+
+
 def audit_layout(rep, path, strict=True):
     """Reads level_layout.json: actor/mesh counts, material scalars, transforms.
 
@@ -145,13 +150,17 @@ def audit_layout(rep, path, strict=True):
         rep.error("level_layout.json is not valid JSON (%s)" % e)
         return None
 
-    actors = data.get("actors", [])
-    meshes = data.get("meshes", {})
+    if not isinstance(data, dict):
+        rep.error("level_layout.json root must be a JSON object (got %s)" % type(data).__name__)
+        return None
+
+    actors = data.get("actors") if isinstance(data.get("actors"), list) else []
+    meshes = data.get("meshes") if isinstance(data.get("meshes"), dict) else {}
     rep.fact("format_version", data.get("format_version", "(absent)"))
     rep.fact("level_name", data.get("level_name", "(absent)"))
     rep.fact("actors", len(actors))
     rep.fact("mesh entries", len(meshes))
-    if not actors:
+    if not actors and not any(data.get(key) for key in FEATURE_SECTIONS):
         rep.error("layout contains zero actors -- nothing will be imported.")
 
     # Which v2 feature sections this export actually carries. A section that is
@@ -163,9 +172,7 @@ def audit_layout(rep, path, strict=True):
         return "present" if value else "none"
 
     rep.line("  feature sections:")
-    for key in ("lights", "decals", "reflection_probes", "cameras", "audio",
-                "landscapes", "foliage", "navigation",
-                "post_process", "height_fog", "sky_light"):
+    for key in FEATURE_SECTIONS:
         if key in data:
             rep.line("    %-22s %s" % (key, _count(data.get(key))))
 
@@ -183,8 +190,10 @@ def audit_layout(rep, path, strict=True):
     # The importer must never compose actor * relative; it relies on this key.
     missing_world = 0
     for actor in actors:
-        for comp in actor.get("components", []):
-            if not comp.get("godot_world_transform"):
+        if not isinstance(actor, dict):
+            continue
+        for comp in (actor.get("components") or []):
+            if isinstance(comp, dict) and not comp.get("godot_world_transform"):
                 missing_world += 1
     if missing_world:
         rep.error("%d component(s) lack godot_world_transform -- the importer "
@@ -198,19 +207,45 @@ def audit_layout(rep, path, strict=True):
     bad_scalars = Counter()
     bad_examples = {}
     tinted = 0
+
+    def _check_mat_params(params, label):
+        nonlocal tinted
+        if not isinstance(params, dict):
+            return
+        for pname in UNIT_RANGE_PARAMS:
+            val = params.get(pname)
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                if val < 0.0 or val > 1.0:
+                    bad_scalars[pname] += 1
+                    bad_examples.setdefault(pname, (label, val))
+        albedo = params.get("albedo_color")
+        if isinstance(albedo, list) and any(
+                isinstance(c, (int, float)) and c > 1.0 for c in albedo[:3]):
+            tinted += 1
+
     for key, mesh in meshes.items():
-        for mat in mesh.get("materials", []):
-            params = mat.get("parameters", {}) or {}
-            for pname in UNIT_RANGE_PARAMS:
-                val = params.get(pname)
-                if isinstance(val, (int, float)) and not isinstance(val, bool):
-                    if val < 0.0 or val > 1.0:
-                        bad_scalars[pname] += 1
-                        bad_examples.setdefault(pname, (key, val))
-            albedo = params.get("albedo_color")
-            if isinstance(albedo, list) and any(
-                    isinstance(c, (int, float)) and c > 1.0 for c in albedo[:3]):
-                tinted += 1
+        if not isinstance(mesh, dict):
+            continue
+        for mat in (mesh.get("materials") or []):
+            if isinstance(mat, dict):
+                _check_mat_params(mat.get("parameters"), key)
+    for actor in actors:
+        if not isinstance(actor, dict):
+            continue
+        aname = actor.get("name") or "Actor"
+        for comp in (actor.get("components") or []):
+            if not isinstance(comp, dict):
+                continue
+            for ov in (comp.get("material_overrides") or []):
+                if isinstance(ov, dict):
+                    _check_mat_params(ov.get("parameters"), aname)
+    for fol in (data.get("foliage") or []):
+        if not isinstance(fol, dict):
+            continue
+        fname = fol.get("name") or fol.get("mesh_key") or "Foliage"
+        for ov in (fol.get("material_overrides") or []):
+            if isinstance(ov, dict):
+                _check_mat_params(ov.get("parameters"), fname)
 
     if bad_scalars:
         for pname, count in bad_scalars.most_common():
@@ -235,8 +270,8 @@ def audit_layout(rep, path, strict=True):
 
 
 def audit_models(rep, models_dir, layout, strict=True):
-    """Reads every .gltf: image URIs, baked-texture leftovers, missing targets."""
-    rep.section("Models (*.gltf)")
+    """Reads every .gltf/.glb: image URIs, baked-texture leftovers, missing targets."""
+    rep.section("Models (*.gltf / *.glb)")
     if not os.path.isdir(models_dir):
         msg = ("no models folder at %s -- the mesh export is a SEPARATE action "
                "from the layout export; running one does not run the other."
@@ -246,20 +281,17 @@ def audit_models(rep, models_dir, layout, strict=True):
         else:
             rep.warn(msg)
         return
-    gltfs = sorted(f for f in os.listdir(models_dir) if f.lower().endswith(".gltf"))
-    rep.fact("glTF files", len(gltfs))
-    if not gltfs:
-        rep.error("models/ contains no .gltf files.")
+    all_entries = _listdir(models_dir)
+    gltfs = sorted(f for f in all_entries if f.lower().endswith(".gltf"))
+    glbs = sorted(f for f in all_entries if f.lower().endswith(".glb"))
+    model_files = gltfs + glbs
+    rep.fact("glTF/GLB files", len(model_files))
+    if not model_files:
+        rep.error("models/ contains no .gltf or .glb files.")
         return
 
-    stray_png = [f for f in os.listdir(models_dir) if f.lower().endswith(".png")]
-    if stray_png:
-        rep.warn("%d PNG(s) sit inside models/ (e.g. %s). With baking disabled "
-                 "there should be none; these are leftovers from an older "
-                 "export and mean this folder was not cleared."
-                 % (len(stray_png), stray_png[0]))
-
     baked_hits, bare_uri, missing_target, no_texture = [], [], [], []
+    referenced_sibling_pngs = set()
     uri_count = 0
     for name in gltfs:
         full = os.path.join(models_dir, name)
@@ -269,10 +301,14 @@ def audit_models(rep, models_dir, layout, strict=True):
         except Exception as e:
             rep.error("%s is not readable as glTF JSON (%s)" % (name, e))
             continue
-        images = doc.get("images", [])
+        if not isinstance(doc, dict):
+            continue
+        images = doc.get("images") or []
         if not images:
             no_texture.append(name)
         for img in images:
+            if not isinstance(img, dict):
+                continue
             uri = img.get("uri")
             if not uri or uri.startswith("data:"):
                 continue
@@ -281,9 +317,24 @@ def audit_models(rep, models_dir, layout, strict=True):
                 baked_hits.append((name, uri))
             elif "/" not in uri:
                 bare_uri.append((name, uri))
+                referenced_sibling_pngs.add(uri.lower())
             target = os.path.normpath(os.path.join(models_dir, uri))
             if not os.path.isfile(target):
                 missing_target.append((name, uri))
+
+    # Only flag PNGs inside models/ as stale leftovers when they carry baked
+    # suffixes or are NOT intentionally referenced by sibling bare-URI glTFs
+    # (which is the normal layout when separate_textures=False).
+    stray_png = [
+        f for f in all_entries
+        if f.lower().endswith(".png")
+        and (any(f.endswith(sfx) for sfx in BAKED_SUFFIXES)
+             or f.lower() not in referenced_sibling_pngs)
+    ]
+    if stray_png:
+        rep.warn("%d unreferenced/baked PNG(s) sit inside models/ (e.g. %s). "
+                 "These look like leftovers from an older export."
+                 % (len(stray_png), stray_png[0]))
 
     rep.fact("image URIs referenced", uri_count)
 
@@ -297,7 +348,7 @@ def audit_models(rep, models_dir, layout, strict=True):
     else:
         rep.ok("no baked texture references (material baking is correctly off)")
 
-    if bare_uri:
+    if bare_uri and missing_target:
         name, uri = bare_uri[0]
         rep.warn("%d image URI(s) are bare filenames (e.g. '%s' in %s). glTF "
                  "resolves URIs relative to the .gltf's own folder, so these "
@@ -316,28 +367,38 @@ def audit_models(rep, models_dir, layout, strict=True):
         rep.line("  note    %d glTF(s) reference no textures at all: %s"
                  % (len(no_texture), ", ".join(no_texture[:5])))
 
-    # Cross-check the layout against what was actually exported.
-    if layout:
-        available = {os.path.splitext(f)[0] for f in gltfs}
-        wanted = set()
-        for actor in layout.get("actors", []):
-            for comp in actor.get("components", []):
+    # Cross-check the layout against what was actually exported (case-insensitive,
+    # covering both .gltf and .glb and matching mesh_key or mesh_name fallback).
+    if isinstance(layout, dict):
+        available = {os.path.splitext(f)[0].lower() for f in model_files}
+        wanted = {}
+        for actor in (layout.get("actors") or []):
+            if not isinstance(actor, dict):
+                continue
+            for comp in (actor.get("components") or []):
+                if not isinstance(comp, dict):
+                    continue
                 key = comp.get("mesh_key") or comp.get("mesh_name")
+                alt = comp.get("mesh_name")
                 if key:
-                    wanted.add(key)
-        for foliage in layout.get("foliage") or []:
+                    wanted.setdefault(str(key).lower(), (str(key), str(alt or "")))
+        for foliage in (layout.get("foliage") or []):
             if isinstance(foliage, dict):
                 key = foliage.get("mesh_key") or foliage.get("mesh_name")
+                alt = foliage.get("mesh_name")
                 if key:
-                    wanted.add(key)
-        absent = sorted(wanted - available)
+                    wanted.setdefault(str(key).lower(), (str(key), str(alt or "")))
+        absent = sorted(
+            orig for low, (orig, alt) in wanted.items()
+            if low not in available and (not alt or alt.lower() not in available)
+        )
         if absent:
-            rep.error("%d mesh(es) referenced by the layout have no .gltf "
+            rep.error("%d mesh(es) referenced by the layout have no .gltf/.glb "
                       "(e.g. %s). These import as MISSING_ placeholders -- the "
                       "two exports are out of sync; re-run the mesh export."
                       % (len(absent), ", ".join(absent[:5])))
         else:
-            rep.ok("every mesh referenced by the layout has a .gltf")
+            rep.ok("every mesh referenced by the layout has a .gltf/.glb")
 
 
 IMAGE_EXTENSIONS = (".png", ".tga", ".jpg", ".jpeg", ".dds", ".exr", ".webp")
@@ -354,27 +415,45 @@ def layout_texture_names(layout):
             value = params.get(key)
             if isinstance(value, str) and value:
                 names.add(value)
+        shader = params.get("shader")
+        if isinstance(shader, dict):
+            tpaths = shader.get("texture_paths")
+            if isinstance(tpaths, dict):
+                for slot in tpaths:
+                    value = shader.get(slot)
+                    if isinstance(value, str) and value:
+                        names.add(value)
 
     slots = ("albedo_texture", "normal_texture", "roughness_texture",
              "metallic_texture", "packed_texture", "emissive_texture",
              "opacity_texture")
     for mesh in (layout.get("meshes") or {}).values():
-        for mat in mesh.get("materials", []) or []:
-            _add(mat.get("parameters"), slots)
-    for actor in layout.get("actors") or []:
-        for comp in actor.get("components", []) or []:
-            for override in comp.get("material_overrides", []) or []:
-                _add(override.get("parameters"), slots)
-    for foliage in layout.get("foliage") or []:
+        if not isinstance(mesh, dict):
+            continue
+        for mat in (mesh.get("materials") or []):
+            if isinstance(mat, dict):
+                _add(mat.get("parameters"), slots)
+    for actor in (layout.get("actors") or []):
+        if not isinstance(actor, dict):
+            continue
+        for comp in (actor.get("components") or []):
+            if not isinstance(comp, dict):
+                continue
+            for override in (comp.get("material_overrides") or []):
+                if isinstance(override, dict):
+                    _add(override.get("parameters"), slots)
+    for foliage in (layout.get("foliage") or []):
         if isinstance(foliage, dict):
-            for override in foliage.get("material_overrides", []) or []:
-                _add(override.get("parameters"), slots)
-    for decal in layout.get("decals") or []:
-        _add(decal.get("textures"), ("albedo", "normal", "orm", "emission"))
-    for landscape in layout.get("landscapes") or []:
+            for override in (foliage.get("material_overrides") or []):
+                if isinstance(override, dict):
+                    _add(override.get("parameters"), slots)
+    for decal in (layout.get("decals") or []):
+        if isinstance(decal, dict):
+            _add(decal.get("textures"), ("albedo", "normal", "orm", "emission"))
+    for landscape in (layout.get("landscapes") or []):
         mat = landscape.get("material") if isinstance(landscape, dict) else None
         if isinstance(mat, dict):
-            for tex in mat.get("textures", []) or []:
+            for tex in (mat.get("textures") or []):
                 if isinstance(tex, dict):
                     value = tex.get("texture")
                     if isinstance(value, str) and value:
@@ -382,7 +461,7 @@ def layout_texture_names(layout):
     return names
 
 
-def audit_texture_references(rep, tex_dir, layout):
+def audit_texture_references(rep, tex_dir, layout, extra_dirs=None):
     """Checks that every texture the layout names actually exists on disk.
 
     Texture filenames are disambiguated per export run (a name shared by two
@@ -390,17 +469,19 @@ def audit_texture_references(rep, tex_dir, layout):
     that saw a different set of textures can name a file that was never written.
     The material then imports without that map and nothing else notices.
     """
-    if not layout:
+    if not isinstance(layout, dict):
         return
     wanted = layout_texture_names(layout)
     if not wanted:
         return
+    search_dirs = [tex_dir] + [d for d in (extra_dirs or []) if d]
     present = set()
-    if os.path.isdir(tex_dir):
-        for f in os.listdir(tex_dir):
-            stem, ext = os.path.splitext(f)
-            if ext.lower() in IMAGE_EXTENSIONS:
-                present.add(stem.lower())
+    for folder in search_dirs:
+        if os.path.isdir(folder):
+            for f in _listdir(folder):
+                stem, ext = os.path.splitext(f)
+                if ext.lower() in IMAGE_EXTENSIONS:
+                    present.add(stem.lower())
     missing = sorted(n for n in wanted if n.lower() not in present)
     if missing:
         rep.warn("%d texture(s) named by the layout are not in %s (e.g. %s). "
@@ -411,23 +492,37 @@ def audit_texture_references(rep, tex_dir, layout):
         rep.ok("every texture the layout names is present (%d)" % len(wanted))
 
 
-def audit_textures(rep, tex_dir, layout=None):
+def audit_textures(rep, tex_dir, layout=None, models_dir=None):
     """Sizes and dimensions -- predicts the Godot import segfault before it happens."""
     rep.section("Textures")
-    audit_texture_references(rep, tex_dir, layout)
-    if not os.path.isdir(tex_dir):
+    audit_texture_references(rep, tex_dir, layout, extra_dirs=[models_dir] if models_dir else None)
+    # Collect texture files from tex_dir, or fall back to models_dir when
+    # separate_textures=False placed them beside the .gltf models.
+    scan_dirs = []
+    if os.path.isdir(tex_dir):
+        scan_dirs.append(tex_dir)
+    if models_dir and os.path.isdir(models_dir) and os.path.normcase(os.path.abspath(models_dir)) != os.path.normcase(os.path.abspath(tex_dir)):
+        model_imgs = [f for f in _listdir(models_dir) if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS]
+        if model_imgs:
+            scan_dirs.append(models_dir)
+    if not scan_dirs:
         rep.warn("no textures folder at %s -- models will import untextured." % tex_dir)
         return
-    files = [f for f in os.listdir(tex_dir) if os.path.isfile(os.path.join(tex_dir, f))]
-    total = sum(os.path.getsize(os.path.join(tex_dir, f)) for f in files)
-    rep.fact("texture files", len(files))
+    file_paths = []
+    for folder in scan_dirs:
+        for f in _listdir(folder):
+            full = os.path.join(folder, f)
+            if os.path.isfile(full) and (folder == tex_dir or os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS):
+                file_paths.append((f, full))
+    total = sum(os.path.getsize(full) for _f, full in file_paths)
+    rep.fact("texture files", len(file_paths))
     rep.fact("total size", human_bytes(total))
 
     oversized = []
-    for f in files:
+    for f, full in file_paths:
         if not f.lower().endswith(".png"):
             continue
-        dims = png_size(os.path.join(tex_dir, f))
+        dims = png_size(full)
         if dims and max(dims) >= TEXTURE_DIM_WARN:
             oversized.append((f, dims))
     if oversized:
@@ -449,6 +544,59 @@ def audit_textures(rep, tex_dir, layout=None):
         rep.ok("texture set is within a size Godot imports reliably")
 
 
+def audit_sidecars(rep, root, models_dir, layout):
+    """Checks on-disk existence of v2 sidecar assets (terrain, audio, LODs, physics)."""
+    if not isinstance(layout, dict):
+        return
+    missing = []
+
+    terrain_dir = os.path.join(root, "terrain")
+    terrain_files = {f.lower() for f in _listdir(terrain_dir)}
+    for ls in (layout.get("landscapes") or []):
+        if not isinstance(ls, dict):
+            continue
+        hf = ls.get("heightmap_file")
+        if isinstance(hf, str) and hf and os.path.basename(hf).lower() not in terrain_files:
+            missing.append("terrain/" + os.path.basename(hf))
+        for layer in (ls.get("layers") or []):
+            if not isinstance(layer, dict):
+                continue
+            wf = layer.get("weightmap_file")
+            if isinstance(wf, str) and wf and os.path.basename(wf).lower() not in terrain_files:
+                missing.append("terrain/" + os.path.basename(wf))
+
+    audio_dir = os.path.join(root, "audio")
+    audio_files = {f.lower() for f in _listdir(audio_dir)}
+    for aud in (layout.get("audio") or []):
+        if not isinstance(aud, dict):
+            continue
+        sf = aud.get("sound_file")
+        if isinstance(sf, str) and sf and os.path.basename(sf).lower() not in audio_files:
+            missing.append("audio/" + os.path.basename(sf))
+
+    model_entries = {f.lower() for f in _listdir(models_dir)}
+    model_stems = {os.path.splitext(f)[0].lower() for f in model_entries
+                   if f.endswith(".gltf") or f.endswith(".glb")}
+    for mesh_entry in (layout.get("meshes") or {}).values():
+        if not isinstance(mesh_entry, dict):
+            continue
+        pf = mesh_entry.get("physics_file")
+        if isinstance(pf, str) and pf and os.path.basename(pf).lower() not in model_entries:
+            missing.append("models/" + os.path.basename(pf))
+        for lod in (mesh_entry.get("lods") or []):
+            if not isinstance(lod, dict):
+                continue
+            if int(lod.get("lod_index") or 0) > 0:
+                exp = lod.get("export_name")
+                if isinstance(exp, str) and exp and exp.lower() not in model_stems:
+                    missing.append("models/" + exp + ".gltf")
+
+    if missing:
+        rep.section("Sidecar Assets")
+        rep.warn("%d referenced sidecar asset(s) are missing on disk (e.g. %s)."
+                 % (len(missing), ", ".join(missing[:5])))
+
+
 def audit_godot_project(rep, project_dir):
     """Catches the stale-cache and stale-model cases on the Godot side."""
     rep.section("Godot project")
@@ -461,43 +609,57 @@ def audit_godot_project(rep, project_dir):
 
     models_dir = os.path.join(project_dir, "models")
     if os.path.isdir(models_dir):
-        baked = [f for f in os.listdir(models_dir)
+        entries = _listdir(models_dir)
+        baked = [f for f in entries
                  if any(f.endswith(sfx) for sfx in BAKED_SUFFIXES)]
         if baked:
             rep.error("%d baked texture PNG(s) still sit in the project's models/ "
                       "folder (e.g. %s). These are from an older export; delete "
                       "them or Godot keeps importing them."
                       % (len(baked), baked[0]))
-        gltfs = [f for f in os.listdir(models_dir) if f.lower().endswith(".gltf")]
-        rep.fact("glTFs in project", len(gltfs))
+        gltfs = [f for f in entries if f.lower().endswith(".gltf")]
+        glbs = [f for f in entries if f.lower().endswith(".glb")]
+        rep.fact("glTF/GLB files in project", len(gltfs) + len(glbs))
 
         # The check that matters: a .gltf's uri is resolved against its OWN
-        # folder, and the transfer splits models/ from textures/. An export
-        # whose uris describe the export folder's layout instead of the
-        # project's breaks here and nowhere else.
-        broken = []
+        # folder, and the transfer splits models/ from textures/.
+        broken_bare = []
+        broken_rel = []
         for name in gltfs:
             try:
                 with open(os.path.join(models_dir, name), encoding="utf-8") as f:
                     doc = json.load(f)
             except Exception:
                 continue
-            for img in doc.get("images", []):
+            if not isinstance(doc, dict):
+                continue
+            for img in (doc.get("images") or []):
+                if not isinstance(img, dict):
+                    continue
                 uri = img.get("uri")
                 if not uri or uri.startswith("data:"):
                     continue
                 if not os.path.isfile(os.path.normpath(os.path.join(models_dir, uri))):
-                    broken.append((name, uri))
-        if broken:
-            name, uri = broken[0]
+                    if "/" not in uri and "\\" not in uri:
+                        broken_bare.append((name, uri))
+                    else:
+                        broken_rel.append((name, uri))
+        if broken_bare:
+            name, uri = broken_bare[0]
             rep.error("%d image URI(s) in the project's models/ do not resolve "
                       "(e.g. '%s' in %s -- Godot looks for it at res://models/%s "
                       "and reports \"Can't open file from path\"). The .gltf "
                       "references textures beside itself, but the transfer puts "
                       "them in res://textures/. Re-export: the transfer now "
                       "rewrites these to ../textures/."
-                      % (len(broken), uri, name, os.path.basename(uri)))
-        elif gltfs:
+                      % (len(broken_bare), uri, name, os.path.basename(uri)))
+        if broken_rel:
+            name, uri = broken_rel[0]
+            rep.error("%d image URI(s) in the project's models/ point to missing "
+                      "texture files (e.g. '%s' referenced by %s). The texture "
+                      "was not transferred or could not be exported as PNG."
+                      % (len(broken_rel), uri, name))
+        if not broken_bare and not broken_rel and (gltfs or glbs):
             rep.ok("every glTF in the project resolves its textures")
 
     cache = os.path.join(project_dir, ".godot")
@@ -508,7 +670,7 @@ def audit_godot_project(rep, project_dir):
 
 
 def _has_gltf(path):
-    return any(f.lower().endswith(".gltf") for f in _listdir(path))
+    return any(f.lower().endswith((".gltf", ".glb")) for f in _listdir(path))
 
 
 def find_models_dir(root):
@@ -577,25 +739,33 @@ def _listdir(path):
         return []
 
 
-def diagnose(export_dir, godot_project=None, strict=True, out_path=None):
+def diagnose(export_dir, godot_project=None, strict=True, out_path=None,
+             layout_path=None, models_dir=None):
     """Audits an export and writes the report. Returns (report_text, Report).
 
     This is the entry point the exporter calls, so it must never raise: a
     diagnostic that breaks the thing it diagnoses is worse than none.
     """
-    root, models, textures, layout_path = resolve_paths(export_dir)
-
     rep = Report()
-    rep.section("Environment")
-    rep.fact("generated", datetime.datetime.now().isoformat(timespec="seconds"))
-    rep.fact("export folder", root)
-    rep.fact("python", sys.version.split()[0])
+    root = os.path.abspath(export_dir)
+    try:
+        root, resolved_models, textures, resolved_layout = resolve_paths(export_dir)
+        models = os.path.abspath(models_dir) if models_dir else resolved_models
+        layout_file = os.path.abspath(layout_path) if layout_path else resolved_layout
 
-    layout = audit_layout(rep, layout_path, strict=strict)
-    audit_models(rep, models, layout, strict=strict)
-    audit_textures(rep, textures, layout)
-    if godot_project:
-        audit_godot_project(rep, godot_project)
+        rep.section("Environment")
+        rep.fact("generated", datetime.datetime.now().isoformat(timespec="seconds"))
+        rep.fact("export folder", root)
+        rep.fact("python", sys.version.split()[0])
+
+        layout = audit_layout(rep, layout_file, strict=strict)
+        audit_models(rep, models, layout, strict=strict)
+        audit_textures(rep, textures, layout, models_dir=models)
+        audit_sidecars(rep, root, models, layout)
+        if godot_project:
+            audit_godot_project(rep, godot_project)
+    except Exception as exc:
+        rep.error("diagnostic encountered an unexpected error (%s)" % exc)
 
     text = rep.render()
     target = out_path or os.path.join(root, "ue2g_report.txt")

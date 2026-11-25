@@ -348,8 +348,18 @@ def retarget_gltf_textures(gltf_path, textures_rel="../textures"):
     return changed
 
 
-def relocate_baked_textures(export_dir, textures_dir):
+def _png_names(folder):
+    """Lowercase names of the PNGs directly inside folder."""
+    if not os.path.isdir(folder):
+        return set()
+    return {f.lower() for f in os.listdir(folder) if f.lower().endswith(".png")}
+
+
+def relocate_baked_textures(export_dir, textures_dir, keep=()):
     """Moves stray PNGs emitted beside the .gltf files into textures_dir.
+
+    keep holds the (lowercase) PNG names that were in export_dir before the
+    export: those are the user's, and the folder may well be a project's own.
 
     Skips any PNG a .gltf actually references: those are resolved as URIs
     relative to the .gltf, so moving them would leave the model pointing at a
@@ -380,7 +390,7 @@ def relocate_baked_textures(export_dir, textures_dir):
 
     os.makedirs(textures_dir, exist_ok=True)
     for filename in os.listdir(export_dir):
-        if not filename.lower().endswith(".png"):
+        if not filename.lower().endswith(".png") or filename.lower() in keep:
             continue
         if filename.lower() in referenced:
             unreal.log(f"Keeping glTF-referenced texture beside model: {filename}")
@@ -434,6 +444,15 @@ def collect_textures_from_material(material, collected_textures):
                 collected_textures.add(tex)
                 
     _collect_recursive(material)
+    # Also harvest vertex-paint shader blend textures (plain TextureSample nodes
+    # on blended layers that parameter enumeration and single-path tracing miss).
+    try:
+        _shader, shader_textures = material_shader.build_shader(material, "opaque", False, 0.3333)
+        for tex in (shader_textures or ()):
+            if tex and isinstance(tex, unreal.Texture):
+                collected_textures.add(tex)
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Coordinate conversion math lives in ue2g_common (single source of truth).
@@ -472,8 +491,16 @@ def extract_skeletal_mesh_physics(skeletal_mesh):
     }
     
     for body_setup in body_setups:
-        bone_name = body_setup.get_editor_property("bone_name")
-        agg_geom = body_setup.get_editor_property("agg_geom")
+        if not body_setup:
+            continue
+        try:
+            bone_name = body_setup.get_editor_property("bone_name")
+            agg_geom = body_setup.get_editor_property("agg_geom")
+        except Exception as e:
+            unreal.log_warning(f"Failed to read body setup on skeletal mesh {skeletal_mesh.get_name()}: {str(e)}")
+            continue
+        if not agg_geom:
+            continue
         
         collision_data = {
             "boxes": [],
@@ -586,10 +613,26 @@ def get_mesh_lod_count(mesh):
     Returns the number of LOD levels for a StaticMesh or SkeletalMesh.
     """
     if isinstance(mesh, unreal.StaticMesh):
+        if hasattr(unreal, "get_editor_subsystem") and hasattr(unreal, "StaticMeshEditorSubsystem"):
+            try:
+                subsys = unreal.get_editor_subsystem(unreal.StaticMeshEditorSubsystem)
+                if subsys is not None:
+                    count = int(subsys.get_lod_count(mesh))
+                    if count > 0:
+                        return count
+            except Exception:
+                pass
         if hasattr(unreal, "EditorStaticMeshLibrary"):
-            return unreal.EditorStaticMeshLibrary.get_lod_count(mesh)
+            try:
+                count = int(unreal.EditorStaticMeshLibrary.get_lod_count(mesh))
+                if count > 0:
+                    return count
+            except Exception:
+                pass
         try:
-            return mesh.get_num_lods()
+            count = int(mesh.get_num_lods())
+            if count > 0:
+                return count
         except Exception:
             pass
     elif hasattr(unreal, "SkeletalMesh") and isinstance(mesh, unreal.SkeletalMesh):
@@ -600,6 +643,65 @@ def get_mesh_lod_count(mesh):
         except Exception:
             pass
     return 1
+
+
+def _get_skeletal_mesh(comp):
+    """Reads a SkeletalMeshComponent's SkeletalMesh across UE 4.x and UE 5.1+ APIs."""
+    skel_cls = getattr(unreal, "SkeletalMesh", None)
+    if hasattr(comp, "get_skeletal_mesh_asset"):
+        try:
+            m = comp.get_skeletal_mesh_asset()
+            if m is not None:
+                return m
+        except Exception:
+            pass
+    for prop in ("skeletal_mesh_asset", "skinned_asset", "skeletal_mesh"):
+        m = ue2g_common.safe_get_prop(comp, prop, None)
+        if m is not None and (skel_cls is None or isinstance(m, skel_cls)):
+            return m
+    if hasattr(comp, "skeletal_mesh"):
+        try:
+            return comp.skeletal_mesh
+        except Exception:
+            pass
+    return None
+
+
+def collect_level_extra_textures(all_actors):
+    """Collects textures referenced by level component overrides, decals, and
+    landscapes so texture name-collision disambiguation matches export_level_to_json."""
+    extra = set()
+    decal_cls = getattr(unreal, "DecalComponent", None)
+    landscape_cls = getattr(unreal, "LandscapeProxy", None)
+    mesh_comp_classes = [unreal.StaticMeshComponent]
+    if hasattr(unreal, "SkeletalMeshComponent"):
+        mesh_comp_classes.append(unreal.SkeletalMeshComponent)
+
+    for actor in (all_actors or ()):
+        if actor is None:
+            continue
+        try:
+            for cls in mesh_comp_classes:
+                for comp in (actor.get_components_by_class(cls) or ()):
+                    if ue2g_common.safe_get_prop(comp, "is_editor_only", False):
+                        continue
+                    for mat in (ue2g_common.safe_get_prop(comp, "override_materials", None) or ()):
+                        if mat is not None:
+                            collect_textures_from_material(mat, extra)
+            if decal_cls is not None:
+                for comp in (actor.get_components_by_class(decal_cls) or ()):
+                    if ue2g_common.safe_get_prop(comp, "is_editor_only", False):
+                        continue
+                    mat = ue2g_common.safe_get_prop(comp, "decal_material", None)
+                    if mat is not None:
+                        collect_textures_from_material(mat, extra)
+            if landscape_cls is not None and isinstance(actor, landscape_cls):
+                mat = ue2g_common.safe_get_prop(actor, "landscape_material", None)
+                if mat is not None:
+                    collect_textures_from_material(mat, extra)
+        except Exception:
+            continue
+    return extra
 
 def collect_textures_for_meshes(meshes):
     """Returns the set of every texture the given meshes' materials reference."""
@@ -616,13 +718,17 @@ def collect_textures_for_meshes(meshes):
     return collected_textures
 
 
-def build_texture_name_map(meshes):
+def build_texture_name_map(meshes, extra_textures=None):
     """Collision-safe export filenames for a mesh batch's textures.
 
     Returns ({texture: name}, {asset_path: name}); the second is what the .gltf
     injection needs, since a material's parameters only remember the asset NAME.
+    `extra_textures` lets level-wide exports include decal/override/landscape
+    textures in collision detection so filenames match export_level_to_json.
     """
     textures = collect_textures_for_meshes(meshes)
+    if extra_textures:
+        textures = set(textures) | set(extra_textures)
     by_asset = ue2g_common.build_export_name_map(textures, kind="texture")
     by_path = {}
     for tex, name in by_asset.items():
@@ -699,7 +805,7 @@ def copy_exports_to_godot(export_dir, meshes_exported, separate_textures, godot_
                     src_path = os.path.join(export_dir, filename)
                     dest_path = os.path.join(godot_models_dir, filename)
                     try:
-                        if os.path.abspath(src_path) != os.path.abspath(dest_path):
+                        if os.path.normcase(os.path.abspath(src_path)) != os.path.normcase(os.path.abspath(dest_path)):
                             shutil.copy2(src_path, dest_path)
                             unreal.log(f"Transferred mesh file: {filename} -> {godot_models_dir}")
                             # Textures always land in <project>/textures, so the
@@ -749,13 +855,15 @@ def copy_exports_to_godot(export_dir, meshes_exported, separate_textures, godot_
                     src_path = os.path.join(textures_dir, filename)
                     dest_path = os.path.join(godot_textures_dir, filename)
                     try:
-                        if os.path.abspath(src_path) != os.path.abspath(dest_path):
+                        if os.path.normcase(os.path.abspath(src_path)) != os.path.normcase(os.path.abspath(dest_path)):
                             shutil.copy2(src_path, dest_path)
                             unreal.log(f"Transferred texture file: {filename} -> {godot_textures_dir}")
                     except Exception as copy_err:
                         unreal.log_warning(f"Failed to copy texture {filename} to Godot: {str(copy_err)}")
 
 def export_selected_static_meshes(export_dir=None, export_animations=False, export_lods=False, separate_textures=True, show_dialogs=True, godot_project_dir=None):
+    ue2g_common.clear_material_trace_cache()
+    material_shader.clear_cache()
     # 1. Check requirements
     if not hasattr(unreal, "GLTFExporter"):
         if show_dialogs:
@@ -867,6 +975,7 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
     exported_count = 0
     failed_exports = []
     exported_meshes = []
+    pngs_before = _png_names(export_dir)
     # Deterministic collision-safe export filenames (asset packs often reuse mesh names)
     export_names = ue2g_common.build_export_name_map(meshes_to_export, kind="mesh")
     # Texture filenames are disambiguated the same way, and the map has to exist
@@ -924,7 +1033,6 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
                             selected_actors
                         )
                     if success:
-                        exported_count += 1
                         mesh_has_exported = True
                         unreal.log(f"Successfully exported LOD {lod_index}: {mesh_name} -> {export_path}")
                         
@@ -949,6 +1057,7 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
                     unreal.log_error(f"Error exporting {mesh_name} LOD {lod_index}: {str(e)}")
             
             if mesh_has_exported:
+                exported_count += 1
                 exported_meshes.append(mesh)
                 inject_textures_for_exported_mesh(mesh, export_dir, mesh_name,
                                                   separate_textures, texture_names_by_path)
@@ -969,6 +1078,7 @@ def export_selected_static_meshes(export_dir=None, export_animations=False, expo
                 relocate_baked_textures(
                     clean_export_dir,
                     os.path.join(os.path.dirname(clean_export_dir), "textures"),
+                    keep=pngs_before,
                 )
             except Exception as scan_err:
                 unreal.log_warning(f"Failed to scan and relocate baked textures: {str(scan_err)}")
@@ -1020,7 +1130,7 @@ def prompt_for_folder(initial_dir):
         unreal.log_warning(f"Could not open directory browser dialog via tkinter: {str(e)}")
     return None
 
-def export_all_level_meshes(export_dir=None, export_animations=False, export_lods=False, separate_textures=True, show_dialogs=True, godot_project_dir=None):
+def export_all_level_meshes(export_dir=None, export_animations=False, export_lods=False, separate_textures=True, show_dialogs=True, godot_project_dir=None, exported_textures_out=None):
     # 1. Check requirements
     if not hasattr(unreal, "GLTFExporter"):
         if show_dialogs:
@@ -1066,7 +1176,7 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
             for comp in skeletal_comps:
                 if ue2g_common.safe_get_prop(comp, "is_editor_only", False):
                     continue
-                mesh = ue2g_common.safe_get_prop(comp, "skeletal_mesh")
+                mesh = _get_skeletal_mesh(comp)
                 if mesh:
                     unique_meshes.add(mesh)
         except Exception:
@@ -1105,12 +1215,16 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
     exported_count = 0
     failed_exports = []
     exported_meshes = []
+    pngs_before = _png_names(export_dir)
     # Deterministic collision-safe export filenames (asset packs often reuse mesh names)
     export_names = ue2g_common.build_export_name_map(meshes_to_export, kind="mesh")
     # Texture filenames are disambiguated the same way, and the map has to exist
     # BEFORE the first .gltf is written: the uris injected into it must name the
-    # files the texture export is going to produce.
-    texture_names, texture_names_by_path = build_texture_name_map(meshes_to_export)
+    # files the texture export is going to produce. Include level overrides,
+    # decals, and landscapes so cross-feature name collisions match the layout JSON.
+    extra_level_textures = collect_level_extra_textures(all_actors)
+    texture_names, texture_names_by_path = build_texture_name_map(
+        meshes_to_export, extra_textures=extra_level_textures)
     selected_actors = set()
     
     with unreal.ScopedSlowTask(len(meshes_to_export), "Batch Exporting Level Meshes to glTF...") as slow_task:
@@ -1159,7 +1273,6 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
                             selected_actors
                         )
                     if success:
-                        exported_count += 1
                         mesh_has_exported = True
                         # Only export Physics Asset for LOD 0
                         if lod_index == 0:
@@ -1181,6 +1294,7 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
                     unreal.log_error(f"Error exporting {mesh_name} LOD {lod_index}: {str(e)}")
             
             if mesh_has_exported:
+                exported_count += 1
                 exported_meshes.append(mesh)
                 inject_textures_for_exported_mesh(mesh, export_dir, mesh_name,
                                                   separate_textures, texture_names_by_path)
@@ -1188,8 +1302,11 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
     # Automatically export referenced textures
     if exported_count > 0:
         try:
-            export_textures_for_meshes(exported_meshes, export_dir, separate_textures,
-                                       name_map=texture_names)
+            tex_res = export_textures_for_meshes(exported_meshes, export_dir, separate_textures,
+                                                 name_map=texture_names)
+            if exported_textures_out is not None and separate_textures and isinstance(tex_res, dict):
+                exported_textures_out.update(tex_res.get("exported") or ())
+                exported_textures_out.update(tex_res.get("reused") or ())
         except Exception as tex_err:
             unreal.log_warning(f"Failed to export textures for meshes: {str(tex_err)}")
 
@@ -1201,6 +1318,7 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
                 relocate_baked_textures(
                     clean_export_dir,
                     os.path.join(os.path.dirname(clean_export_dir), "textures"),
+                    keep=pngs_before,
                 )
             except Exception as scan_err:
                 unreal.log_warning(f"Failed to scan and relocate baked textures: {str(scan_err)}")

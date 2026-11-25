@@ -23,6 +23,7 @@ extends RefCounted
 # ==============================================================================
 
 const Common = preload("res://addons/unreal_importer/import_common.gd")
+const TextureLimit = preload("res://addons/unreal_importer/texture_import_limit.gd")
 
 # Godot's fog is e^-(density per m). Unreal's, measured on UE 5.8, is e^-(ln 2 * ln 2 *
 # FogDensity / 1000 per cm): one ln 2 from its base-2 exponential, one from its line
@@ -323,6 +324,9 @@ func _apply_environment(data: Dictionary, root: Node, scene_owner: Node, warning
 			if settings.get("ao_radius") != null:
 				env.ssao_radius = maxf(0.01, Common.get_num(settings, "ao_radius", 200.0) * 0.01)
 		camera_attributes = _apply_exposure(settings, env)
+		var white_temp := Common.get_num(settings, "white_temp", 6500.0)
+		if absf(white_temp - 6500.0) > 1.0:
+			warnings.append("Post-process white balance (%d K) has no Godot setting and was not applied; use an adjustment color-correction LUT." % int(white_temp))
 		var saturation = settings.get("saturation")
 		var contrast = settings.get("contrast")
 		if saturation != null or contrast != null:
@@ -478,10 +482,10 @@ func _apply_decals(decals, root: Node, scene_owner: Node, options: Dictionary, w
 
 		var textures = entry.get("textures")
 		if textures is Dictionary:
-			_bind_decal_texture(decal, textures, "albedo", folders, Decal.TEXTURE_ALBEDO)
-			_bind_decal_texture(decal, textures, "normal", folders, Decal.TEXTURE_NORMAL)
-			_bind_decal_texture(decal, textures, "orm", folders, Decal.TEXTURE_ORM)
-			_bind_decal_texture(decal, textures, "emission", folders, Decal.TEXTURE_EMISSION)
+			_bind_decal_texture(decal, textures, "albedo", folders, Decal.TEXTURE_ALBEDO, options)
+			_bind_decal_texture(decal, textures, "normal", folders, Decal.TEXTURE_NORMAL, options)
+			_bind_decal_texture(decal, textures, "orm", folders, Decal.TEXTURE_ORM, options)
+			_bind_decal_texture(decal, textures, "emission", folders, Decal.TEXTURE_EMISSION, options)
 		if decal.get_texture(Decal.TEXTURE_ALBEDO) == null:
 			warnings.append("Decal '%s': no albedo texture found on disk." % decal.name)
 
@@ -493,14 +497,26 @@ func _apply_decals(decals, root: Node, scene_owner: Node, options: Dictionary, w
 	return count
 
 
-func _bind_decal_texture(decal: Decal, textures: Dictionary, key: String, folders: Array, slot: int) -> void:
+func _bind_decal_texture(decal: Decal, textures: Dictionary, key: String, folders: Array, slot: int, options: Dictionary = {}) -> void:
 	var tex_name := Common.get_str(textures, key, "")
 	if tex_name == "":
 		return
 	var path := Common.find_texture_path(folders, tex_name)
 	if path == "":
 		return
-	var tex := Common.load_texture_file(path)
+	var is_normal := (slot == Decal.TEXTURE_NORMAL)
+	var tex: Texture2D = null
+	if is_normal and not path.begins_with("res://"):
+		var mat_helper = options.get("material_helper")
+		if mat_helper != null and mat_helper.has_method("_load_normal_texture"):
+			tex = mat_helper._load_normal_texture(path, tex_name)
+		elif bool(options.get("flip_normal_green", true)):
+			var raw_img := Common.load_image_file(path)
+			if raw_img != null:
+				raw_img.clear_mipmaps()
+				tex = Common.texture_from_image(TextureLimit.invert_green_channel(raw_img))
+	if tex == null:
+		tex = Common.load_texture_file(path)
 	if tex == null:
 		return
 	# Decal packs share one atlas across many materials and crop to a cell in the
@@ -513,7 +529,8 @@ func _bind_decal_texture(decal: Decal, textures: Dictionary, key: String, folder
 		var cropped := _crop_decal_texture(
 			path, tex, rect,
 			bool(textures.get("flip_u", false)),
-			bool(textures.get("flip_v", false)))
+			bool(textures.get("flip_v", false)),
+			is_normal)
 		if cropped != null:
 			tex = cropped
 	decal.set_texture(slot, tex)
@@ -521,12 +538,12 @@ func _bind_decal_texture(decal: Decal, textures: Dictionary, key: String, folder
 
 func _crop_decal_texture(
 		path: String, tex: Texture2D, rect: Array,
-		flip_u: bool, flip_v: bool) -> Texture2D:
+		flip_u: bool, flip_v: bool, is_normal: bool = false) -> Texture2D:
 	"""One atlas cell of `tex` as a standalone texture, or null if it cannot be cut."""
 	# 15 of the sci-fi station's 29 decals share a single cell, and every distinct
 	# ImageTexture costs its own slot in Godot's decal atlas, so caching here is
 	# what keeps that from becoming 15 copies of the same crop.
-	var cache_key := "%s|%s|%s|%s" % [path, str(rect), flip_u, flip_v]
+	var cache_key := "%s|%s|%s|%s|%s" % [path, str(rect), flip_u, flip_v, is_normal]
 	if _decal_crop_cache.has(cache_key):
 		return _decal_crop_cache[cache_key]
 
@@ -556,6 +573,17 @@ func _crop_decal_texture(
 		out.flip_x()
 	if flip_v:
 		out.flip_y()
+	# Mirroring a tangent-space normal map in pixels flips the tangent/bitangent
+	# handedness, so invert the matching normal channel (R for X, G for Y).
+	if is_normal and (flip_u or flip_v):
+		for py in out.get_height():
+			for px in out.get_width():
+				var c := out.get_pixel(px, py)
+				if flip_u:
+					c.r = 1.0 - c.r
+				if flip_v:
+					c.g = 1.0 - c.g
+				out.set_pixel(px, py, c)
 	if img.has_mipmaps():
 		out.generate_mipmaps()
 
@@ -582,6 +610,9 @@ func _apply_reflection_probes(probes, root: Node, scene_owner: Node, uses_lumen:
 		probe.size = Vector3(maxf(sz.x, 0.1), maxf(sz.y, 0.1), maxf(sz.z, 0.1))
 		probe.intensity = clampf(Common.get_num(entry, "intensity", 1.0), 0.0, 16.0)
 		probe.box_projection = bool(entry.get("box_projection", true))
+		var blend_dist = entry.get("blend_distance_m")
+		if (blend_dist is float or blend_dist is int) and "blend_distance" in probe:
+			probe.set("blend_distance", maxf(0.0, float(blend_dist)))
 		probe.update_mode = ReflectionProbe.UPDATE_ONCE
 		# Unreal's captures only reflect; a probe's own ambient would replace SDFGI's.
 		if uses_lumen:
@@ -642,13 +673,20 @@ func _apply_audio(entries, root: Node, scene_owner: Node, options: Dictionary) -
 	for entry in entries:
 		if not (entry is Dictionary):
 			continue
-		var player := AudioStreamPlayer3D.new()
+		var is_spatial := bool(entry.get("is_spatialized", true))
+		var player: Node
+		if is_spatial:
+			var p3d := AudioStreamPlayer3D.new()
+			p3d.transform = Common.get_transform_from_dict(entry.get("godot_transform", {}))
+			p3d.max_distance = maxf(0.1, Common.get_num(entry, "attenuation_radius_m", 40.0))
+			player = p3d
+		else:
+			player = AudioStreamPlayer.new()
 		player.name = Common.get_str(entry, "name", "Audio")
-		player.transform = Common.get_transform_from_dict(entry.get("godot_transform", {}))
-		player.volume_db = clampf(Common.get_num(entry, "volume_db", 0.0), -80.0, 24.0)
-		player.pitch_scale = clampf(Common.get_num(entry, "pitch_scale", 1.0), 0.01, 4.0)
-		player.max_distance = maxf(0.1, Common.get_num(entry, "attenuation_radius_m", 40.0))
-		player.autoplay = bool(entry.get("auto_play", true))
+		player.set("volume_db", clampf(Common.get_num(entry, "volume_db", 0.0), -80.0, 24.0))
+		player.set("pitch_scale", clampf(Common.get_num(entry, "pitch_scale", 1.0), 0.01, 4.0))
+		player.set("autoplay", bool(entry.get("auto_play", true)))
+		var loaded_stream: AudioStream = null
 		var sound_file := Common.get_str(entry, "sound_file", "")
 		if sound_file != "":
 			var stream_path := ""
@@ -657,10 +695,30 @@ func _apply_audio(entries, root: Node, scene_owner: Node, options: Dictionary) -
 				if found != "":
 					stream_path = found
 					break
-			if stream_path != "" and stream_path.begins_with("res://") and ResourceLoader.exists(stream_path):
-				var stream = ResourceLoader.load(stream_path)
-				if stream is AudioStream:
-					player.stream = stream as AudioStream
+			if stream_path != "":
+				if stream_path.begins_with("res://") and ResourceLoader.exists(stream_path):
+					var stream = ResourceLoader.load(stream_path)
+					if stream is AudioStream:
+						loaded_stream = stream as AudioStream
+				elif stream_path.to_lower().ends_with(".wav") and ClassDB.class_has_method(&"AudioStreamWAV", &"load_from_file"):
+					# Through a Variant: AudioStreamWAV.load_from_file() is a parse error before
+					# Godot 4.4, and call("load_from_file") does not reach static methods.
+					var wav_cls: Variant = AudioStreamWAV
+					var ext_wav = wav_cls.load_from_file(stream_path)
+					if ext_wav is AudioStream:
+						loaded_stream = ext_wav as AudioStream
+		if bool(entry.get("looping", false)):
+			player.set_meta("unreal_looping", true)
+			if loaded_stream is AudioStreamWAV:
+				var wav := (loaded_stream as AudioStreamWAV).duplicate() as AudioStreamWAV
+				wav.loop_mode = AudioStreamWAV.LOOP_FORWARD
+				# Godot imports WAVs as QOA by default, so count frames from the length,
+				# not the bytes: a loop_end left at 0 plays silence.
+				if wav.loop_end <= 0:
+					wav.loop_end = int(wav.get_length() * wav.mix_rate)
+				loaded_stream = wav
+		if loaded_stream != null:
+			player.set("stream", loaded_stream)
 		var sound_name := Common.get_str(entry, "sound_name", "")
 		if sound_name != "":
 			player.set_meta("unreal_sound_name", sound_name)

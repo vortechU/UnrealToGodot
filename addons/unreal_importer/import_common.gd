@@ -27,6 +27,12 @@ const MODEL_EXTENSIONS: Array[String] = [".gltf", ".glb"]
 const GLTF_MESH_AXIS_FIX := Basis(Quaternion(0.0, 0.70710678118654752, 0.0, 0.70710678118654752))
 
 
+# Group the navigation bake reads its source geometry from: a NavigationRegion3D is
+# a sibling of the imported geometry, so baking its own children finds nothing.
+# Kept in step with tscn_writer.py's NAV_SOURCE_GROUP.
+const NAV_SOURCE_GROUP := &"unreal_nav_source"
+
+
 static func gltf_mesh_placement(placement: Transform3D) -> Transform3D:
 	"""Corrects a layout-convention placement so a glTF mesh (baked in the glTF
 	axis order) sitting at identity beneath it renders aligned with its neighbours.
@@ -146,12 +152,22 @@ static func physics_body_transform(placement: Transform3D) -> Transform3D:
 
 
 static func scaled_shape_transform(local: Transform3D, scale: Vector3) -> Transform3D:
-	"""A collision shape's local transform once `scale` has been taken off the
-	body: the shape's OFFSET still has to move with the scale, its rotation must
-	not."""
+	"""A box/sphere/capsule's local transform once `scale` has been taken off the
+	body: the shape's OFFSET moves with the scale and its rotation is mirrored by
+	the scale's signs, but never sheared. Convex hulls carry the mirror in their
+	points instead and must keep their own basis."""
 	if scale == Vector3.ONE:
 		return local
-	return Transform3D(local.basis, local.origin * scale)
+	var mirror := Vector3(
+		-1.0 if scale.x < 0.0 else 1.0,
+		-1.0 if scale.y < 0.0 else 1.0,
+		-1.0 if scale.z < 0.0 else 1.0)
+	var basis := Basis.from_scale(mirror) * local.basis
+	# A reflected basis is not a rotation. These shapes are symmetric about their
+	# own axes, so negating one column is the same shape in a right-handed frame.
+	if mirror.x * mirror.y * mirror.z < 0.0:
+		basis.x = -basis.x
+	return Transform3D(basis, local.origin * scale)
 
 
 static func scaled_axis_factors(local_basis: Basis, scale: Vector3) -> Vector3:
@@ -217,6 +233,39 @@ static func get_str(d: Dictionary, key: String, def: String = "") -> String:
 	if v == null:
 		return def
 	return str(v)
+
+
+static func find_material_entry(mat_list: Array, mat_name: String, slot_idx: int, claimed: Dictionary) -> Dictionary:
+	"""The exported material entry behind one glTF surface.
+
+	Name beats slot, because the glTF drops unused slots and shifts indices. But
+	several slots may share one material name, so a name match prefers the entry on
+	the surface's own slot, then one no earlier surface of this mesh took. `claimed`
+	remembers those; pass the same Dictionary for every surface of a mesh."""
+	var best := -1
+	var best_rank := 0
+	for i in mat_list.size():
+		var mat = mat_list[i]
+		if not (mat is Dictionary):
+			continue
+		var entry_name := get_str(mat, "material_name", "")
+		var name_matches := mat_name != "" and entry_name != "" and entry_name != "None" \
+			and entry_name.to_lower() == mat_name.to_lower()
+		var slot_matches := int(get_num(mat, "slot_index", -1.0)) == slot_idx
+		var rank := 0
+		if name_matches:
+			rank = 2
+			if not claimed.has(i):
+				rank = 4 if slot_matches else 3
+		elif slot_matches:
+			rank = 1
+		if rank > best_rank:
+			best = i
+			best_rank = rank
+	if best < 0:
+		return {}
+	claimed[best] = true
+	return mat_list[best]
 
 
 static func find_file_case_insensitive(folder: String, base_name: String, extensions: Array) -> String:
@@ -307,17 +356,22 @@ static func load_image_file(path: String, notes = null) -> Image:
 	if path.begins_with("res://"):
 		raw_path = ProjectSettings.globalize_path(path)
 	if raw_path != "" and FileAccess.file_exists(raw_path):
-		var direct := _load_image_by_content(raw_path, path.get_extension().to_lower(), notes)
+		var direct := _decompressed(_load_image_by_content(raw_path, path.get_extension().to_lower(), notes))
 		if direct != null:
 			return direct
 	if path.begins_with("res://"):
 		var tex := load(path)
 		if tex is Texture2D:
-			var img := (tex as Texture2D).get_image()
-			if img != null and img.is_compressed():
-				img.decompress()
-			return img
+			return _decompressed((tex as Texture2D).get_image())
 	return null
+
+
+static func _decompressed(img: Image) -> Image:
+	"""A BC1/BC3/BC7 .dds loads still compressed, and resize()/get_pixel() reject
+	that. Returns null when the format cannot be unpacked."""
+	if img != null and img.is_compressed() and img.decompress() != OK:
+		return null
+	return img
 
 
 static func _image_format_from_magic(header: PackedByteArray) -> String:
@@ -350,10 +404,11 @@ static func _load_image_by_content(raw_path: String, claimed_ext: String, notes)
 
 	var actual := _image_format_from_magic(header)
 	var claimed := "jpg" if claimed_ext == "jpeg" else claimed_ext
-	if actual == "" or actual == claimed:
+	# Image.load_from_file() has no .dds loader; only the buffer decoder reads one.
+	if actual == "" or (actual == claimed and actual != "dds"):
 		return Image.load_from_file(raw_path)
 
-	if notes is Array:
+	if notes is Array and actual != claimed:
 		notes.append("'%s' is actually a %s file mislabeled as .%s (Unreal's ExportRenderTarget picks the format itself); loaded by content instead."
 			% [raw_path.get_file(), actual.to_upper(), claimed_ext])
 		# PNG IHDR bit depth lives at byte 24.
@@ -399,16 +454,16 @@ static func load_texture_file(tex_path: String) -> Texture2D:
 		var loaded := load(tex_path) as Texture2D
 		if loaded != null:
 			return loaded
-		var global_path := ProjectSettings.globalize_path(tex_path)
-		if global_path != "" and FileAccess.file_exists(global_path):
-			var fallback_img := Image.load_from_file(global_path)
-			if fallback_img:
-				return ImageTexture.create_from_image(fallback_img)
+	return texture_from_image(load_image_file(tex_path))
+
+
+static func texture_from_image(img: Image) -> ImageTexture:
+	"""An in-memory texture with mipmaps, which a res:// import would have had."""
+	if img == null:
 		return null
-	var img := Image.load_from_file(tex_path)
-	if img:
-		return ImageTexture.create_from_image(img)
-	return null
+	if not img.has_mipmaps():
+		img.generate_mipmaps()
+	return ImageTexture.create_from_image(img)
 
 
 static func instantiate_model(model_path: String) -> Node3D:
@@ -453,7 +508,8 @@ static func set_owner_recursive(node: Node, owner_node: Node) -> void:
 
 static func add_owned_child(parent: Node, child: Node, scene_owner: Node) -> void:
 	"""Adds child to parent and marks it (and its subtree) as owned by the scene root."""
-	parent.add_child(child)
+	# Readable: a duplicate label becomes "Rock2", not "@Node3D@12".
+	parent.add_child(child, true)
 	child.owner = scene_owner
 	set_owner_recursive(child, scene_owner)
 

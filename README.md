@@ -161,7 +161,7 @@ Both plugins stamp and verify a schema `format_version`. A mismatched plugin/add
 > **Keeping textures light (avoiding Godot OOM crashes)**
 > Unreal exports full-resolution source art, so a full level can easily produce several gigabytes of 4K PNGs—enough to make Godot's importer run out of memory and crash mid-import. Because Unreal's Python API cannot resize source art ([technical explanation](docs/texture-sizing.md)), texture sizing is handled in the **Godot Importer dock**:
 > - **Texture size limit** *(default: `1024`)* — Caps the resolution Godot imports textures at, applying to both newly exported and already-imported textures.
-> - **Also shrink texture files on disk** — Rewrites oversized exported PNGs down to the capped size, shrinking multi-gigabyte 4K exports down to a few hundred megabytes. **This is destructive**: the full-resolution originals remain only in Unreal, so raising the limit later requires re-exporting.
+> - **Also shrink texture files on disk** — Rewrites oversized PNGs named in the layout JSON down to the capped size, shrinking multi-gigabyte 4K exports down to a few hundred megabytes. **This is destructive**: the full-resolution originals remain only in Unreal, so raising the limit later requires re-exporting.
 
 ### Step 2: Import into Godot
 
@@ -220,7 +220,7 @@ Heightmaps and paint-layer weightmaps export as float EXRs, and the terrain surf
 ### Workflow Boundaries
 
 - **Only loaded levels are exported (with diagnostics):** The exporter reads actors from the currently loaded world and now inspects World Partition / streaming sublevels, warning in `ue2g_report.txt` and the dock preview whenever unloaded sublevels or World Partition cells are detected.
-- **Incremental re-import:** Enable **Update existing scene (incremental)** in the Godot importer dock to match actors by `unreal_actor_id` and update them in place (preserving custom Godot scripts and children), with optional pruning of removed actors. Lights, decals, probes, cameras, audio, foliage, and navigation are rebuilt on each update, so edits to those generated nodes are lost unless the node has a script or children of its own (then it is kept as is); nodes you add to their containers stay. An existing WorldEnvironment or terrain is left alone, and on actors with several components only the actor itself is moved. Leave it off for a clean one-shot import into a fresh scene.
+- **Incremental re-import:** Enable **Update existing scene (incremental)** in the Godot importer dock to match actors by `unreal_actor_id` and update them in place (preserving custom Godot scripts and children), with optional pruning of removed actors. Lights, decals, probes, cameras, audio, foliage, and navigation are rebuilt on each update, so edits to those generated nodes are lost unless the node has a script or children of its own (then it is kept as is); nodes you add to their containers stay. An existing WorldEnvironment or terrain is left alone. An actor whose components, mesh, collision, shadows, or material overrides changed in Unreal is rebuilt around your additions: child nodes, scripts, groups, and saved signal connections stay, edits to the imported nodes themselves do not. Material parameters edited in Unreal only reach existing actors on a fresh import. Leave it off for a clean one-shot import into a fresh scene.
 
 ---
 

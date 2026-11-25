@@ -20,6 +20,8 @@ extends EditorPlugin
 
 const Importer = preload("res://addons/unreal_importer/import_unreal_layout.gd")
 const EnvImporter = preload("res://addons/unreal_importer/import_environment.gd")
+const Common = preload("res://addons/unreal_importer/import_common.gd")
+const SplineHelper = preload("res://addons/unreal_importer/import_spline_mesh.gd")
 
 var failures: Array[String] = []
 var results: Array[String] = []
@@ -280,6 +282,8 @@ func _run_tests() -> void:
 	_test_survives_save(root)
 	await _test_phase4_workflow(root)
 	_test_terrain(root)
+	_test_sweep2()
+	await _test_sweep3()
 
 	print("\\n============================================")
 	_write_results()
@@ -404,7 +408,8 @@ func _test_foliage(root: Node) -> void:
 			grass.cast_shadow == GeometryInstance3D.SHADOW_CASTING_SETTING_OFF,
 			str(grass.cast_shadow))
 		check("UE cull distance becomes the Godot visibility range",
-			absf(grass.visibility_range_end - 50.0) < 0.001, str(grass.visibility_range_end))
+			# plus the radius of the two instances, 3 m apart on X and Z
+			absf(grass.visibility_range_end - 52.1213) < 0.001, str(grass.visibility_range_end))
 		check("UE cull fade becomes the visibility range end margin",
 			absf(grass.visibility_range_end_margin - 20.0) < 0.001,
 			str(grass.visibility_range_end_margin))
@@ -887,8 +892,30 @@ func _test_phase4_workflow(root: Node) -> void:
 	get_tree().get_root().add_child(pref_root)
 	var pref_opts := base_opts.duplicate()
 	pref_opts["extract_prefabs"] = true
-	await Importer.new().do_import("res://level_layout.json", "res://models/", "res://textures/", pref_root, pref_opts)
+	# Only uniformly scaled actors share a prefab, and only without per-placement data:
+	# the first, overridden copy must neither use the prefab nor leak into it.
+	var pref_layout: Dictionary = JSON.parse_string(FileAccess.get_file_as_string("res://level_layout.json"))
+	var piers: Array = []
+	for a in pref_layout["actors"]:
+		if a["name"] == "BP_Pier":
+			a["godot_transform"]["scale"] = [1.0, 1.0, 1.0]
+			var painted: Dictionary = a.duplicate(true)
+			painted["name"] = "BP_Pier_Override"
+			painted["actor_id"] = "ID_BP_PIER_OVERRIDE"
+			painted["components"][0]["material_overrides"] = [{"slot_index": 0, "material_name": "MI_Leak",
+				"parameters": {"base_color": [1, 0, 0, 1]}}]
+			piers = [painted, a]
+	pref_layout["actors"] = piers
+	var pref_file := FileAccess.open("res://level_layout_prefab.json", FileAccess.WRITE)
+	pref_file.store_string(JSON.stringify(pref_layout))
+	pref_file.close()
+	await Importer.new().do_import("res://level_layout_prefab.json", "res://models/", "res://textures/", pref_root, pref_opts)
 	var bp_inst := find_node(pref_root, "BP_Pier")
+	var bp_override := find_node(pref_root, "BP_Pier_Override")
+	check("an actor with material overrides does not use the shared prefab",
+		bp_override != null and bp_override.scene_file_path == "")
+	check("per-placement overrides do not leak into the shared prefab",
+		not FileAccess.get_file_as_string("res://prefabs/BP_Pier_C.tscn").contains("MI_Leak"))
 	check("Blueprint prefab file res://prefabs/BP_Pier_C.tscn saved on disk",
 		FileAccess.file_exists("res://prefabs/BP_Pier_C.tscn"))
 	check("BP_Pier instantiated from shared .tscn prefab",
@@ -917,6 +944,535 @@ func _test_phase4_workflow(root: Node) -> void:
 		and d2.update_existing_check.button_pressed
 		and d2.extract_prefabs_check.button_pressed)
 	d2.queue_free()
+
+
+func _strip(fwd: Vector3, lateral: Vector3) -> ArrayMesh:
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	for v in [Vector3.ZERO, fwd, lateral, fwd, fwd + lateral, lateral]:
+		st.set_normal(Vector3.UP)
+		st.add_vertex(v)
+	return st.commit()
+
+
+func _rolled(mesh: ArrayMesh, axis: String, roll: float) -> PackedVector3Array:
+	var mi := MeshInstance3D.new()
+	mi.mesh = mesh
+	var dir := [0.0, 0.0, 1.0] if axis == "z" else [1.0, 0.0, 0.0]
+	SplineHelper.deform_instance(mi, {"start_pos": [0.0, 0.0, 0.0], "end_pos": dir,
+		"start_tangent": dir, "end_tangent": dir, "forward_axis": axis,
+		"start_roll_rad": roll, "end_roll_rad": roll, "up_dir": [0.0, 1.0, 0.0]})
+	var out: PackedVector3Array = mi.mesh.surface_get_arrays(0)[Mesh.ARRAY_VERTEX]
+	mi.free()
+	return out
+
+
+func _test_sweep2() -> void:
+	print("\\n--- second code sweep ---")
+	var holder := Node3D.new()
+	holder.name = "Sweep2"
+	get_tree().get_root().add_child(holder)
+	var tmp := OS.get_cache_dir().path_join("ue2g_harness")
+	for sub in ["audio", "models"]:
+		DirAccess.make_dir_recursive_absolute(tmp.path_join(sub))
+
+	# 1. An external .wav really loads through the dynamic static call.
+	var wav := AudioStreamWAV.new()
+	wav.format = AudioStreamWAV.FORMAT_16_BITS
+	wav.data = PackedByteArray([0, 0, 1, 0, 2, 0, 3, 0])
+	wav.save_to_wav(tmp.path_join("audio/Sweep2Hum.wav"))
+	EnvImporter.new()._apply_audio([{"name": "Hum", "sound_file": "Sweep2Hum.wav"}],
+		holder, holder, {"json_dir": tmp})
+	var hum := find_node(holder, "Hum")
+	check("external WAV stream loads", hum != null and hum.get("stream") is AudioStreamWAV, str(hum))
+
+	# 2. A bake sees geometry beside the region.
+	var geo := Node3D.new()
+	geo.add_to_group(Common.NAV_SOURCE_GROUP, true)
+	holder.add_child(geo)
+	var floor_mi := MeshInstance3D.new()
+	var box_mesh := BoxMesh.new()
+	box_mesh.size = Vector3(10, 0.2, 10)
+	floor_mi.mesh = box_mesh
+	geo.add_child(floor_mi)
+	load("res://addons/unreal_importer/import_gameplay.gd").new().apply({"navigation": {"bounds_volumes": [
+		{"name": "Nav", "extent_m": [6, 3, 6]}]}}, holder, holder, {"navigation_bake": true})
+	var region := find_node(holder, "Nav") as NavigationRegion3D
+	check("navigation bake finds sibling geometry", region != null
+		and region.navigation_mesh.get_polygon_count() > 0,
+		str(region.navigation_mesh.get_polygon_count()) if region else "no region")
+
+	# 3. A rotated box under a mirror is the reflection of the original box.
+	var local := Transform3D(Basis(Vector3(1, 2, 3).normalized(), 0.8), Vector3(1, 2, 3))
+	var mirrored := Common.scaled_shape_transform(local, Vector3(-1, 1, 1))
+	var reflected := Basis.from_scale(Vector3(-1, 1, 1)) * local.basis
+	var same := absf(mirrored.basis.determinant() - 1.0) < 0.0001
+	for i in 3:
+		same = same and absf(absf(mirrored.basis[i].dot(reflected[i])) - 1.0) < 0.0001
+	check("mirrored box collider is a right-handed reflection", same, str(mirrored))
+	check("unmirrored scale leaves the shape rotation alone",
+		Common.scaled_shape_transform(local, Vector3(2, 1, 1)).basis.is_equal_approx(local.basis))
+
+	# A mirrored hull must land exactly where S * local puts every point.
+	var hull_quat := [0.0, 0.0, 0.38268343, 0.92387953]
+	var hull_lib := {"SM_Hull": {"collision": {"convex_hulls": [{
+		"vertices": [[100, 0, 0], [0, 100, 0], [0, 0, 100], [50, 60, 70]],
+		"godot_local_transform": {"translation": [1, 0, 0], "rotation_quat": hull_quat, "scale": [1, 1, 1]}}]}}}
+	var imp = Importer.new()
+	imp.active_scene_root = holder
+	var hull_body := StaticBody3D.new()
+	holder.add_child(hull_body)
+	imp._populate_collision_shapes(hull_body, Transform3D(Basis.from_scale(Vector3(-1, 1, 1)), Vector3.ZERO), "SM_Hull", hull_lib)
+	var hull_node := hull_body.get_child(0) as CollisionShape3D
+	var hull_local := Transform3D(Basis(Vector3.BACK, PI / 4.0), Vector3(1, 0, 0))
+	var got: Vector3 = hull_node.transform * (hull_node.shape as ConvexPolygonShape3D).points[3]
+	var want: Vector3 = Vector3(-1, 1, 1) * (hull_local * (Vector3(50, 70, 60) * 0.01))
+	check("mirrored convex hull stays exact", near(got, want), "%s vs %s" % [got, want])
+
+	# 4. Incremental update: no false rebuild on a mirror, and user nodes untouched.
+	var upd := StaticBody3D.new()
+	holder.add_child(upd)
+	var upd_mesh := load("res://models/SM_Rock.gltf").instantiate() as Node3D
+	upd.add_child(upd_mesh)
+	upd_mesh.transform = Transform3D(Basis.from_scale(Vector3(-1, 1, 1)), Vector3.ZERO)
+	var user_area := Area3D.new()
+	user_area.position = Vector3(4, 5, 6)
+	upd.add_child(user_area)
+	var user_model := load("res://models/SM_Crate.gltf").instantiate() as Node3D
+	user_model.position = Vector3(7, 8, 9)
+	upd.add_child(user_model)
+	var kept := CollisionShape3D.new()
+	kept.shape = BoxShape3D.new()
+	upd.add_child(kept)
+	var rock := {"mesh_key": "SM_Rock", "mesh_name": "SM_Rock"}
+	var rock_lib := {"SM_Rock": {"collision": {"boxes": [{"size": [100, 100, 100]}]}}}
+	imp._update_existing_body(upd, Transform3D(Basis.from_scale(Vector3(-1, 1, 1)), Vector3.ZERO), rock, rock_lib)
+	check("a mirrored actor does not rebuild collision when nothing changed", is_instance_valid(kept))
+	imp._update_existing_body(upd, Transform3D(Basis.from_scale(Vector3(2, 1, 1)), Vector3.ZERO), rock, rock_lib)
+	check("a real scale change rescales the mesh and rebuilds collision",
+		not is_instance_valid(kept) and near(upd_mesh.transform.basis.get_scale(), Vector3(2, 1, 1)))
+	check("user nodes and models under an imported body keep their transform",
+		near(user_area.position, Vector3(4, 5, 6)) and near(user_model.position, Vector3(7, 8, 9)))
+
+	# 5 + 15. Nodes added inside instances survive undo/redo and save.
+	var scene := Node3D.new()
+	scene.name = "Scene"
+	holder.add_child(scene)
+	var hero := load("res://models/SK_Dummy.gltf").instantiate() as Node3D
+	scene.add_child(hero)
+	hero.owner = scene
+	var bones: int = load("res://addons/unreal_importer/import_skeletal_physics.gd").new().attach_in_scene(scene, "res://models/", scene)
+	check("attach_in_scene builds bones and makes the instance editable",
+		bones == 2 and scene.is_editable_instance(hero), str(bones))
+	var lod := load("res://models/SM_Crate_LOD1.gltf").instantiate() as Node3D
+	lod.name = "TestLOD1"
+	lod.set_meta("unreal_lod_index", 1)
+	hero.add_child(lod)
+	lod.owner = scene
+	var inner_owner := find_node(hero, "SkMesh").owner
+	scene.remove_child(hero)
+	check("undo clears the added nodes' owner (fixture is real)", lod.owner == null)
+	scene.add_child(hero)
+	var dock = load("res://addons/unreal_importer/importer_dock.gd").new()
+	dock._reown_subtree(hero, scene)
+	check("redo leaves the model's own nodes owned by the model",
+		inner_owner == hero and find_node(hero, "SkMesh").owner == hero)
+	var packed := PackedScene.new()
+	packed.pack(scene)
+	var again := packed.instantiate()
+	var spine := find_node(again, "PhysicalBone_spine")
+	check("LODs and skeletal physics survive undo, redo and save",
+		find_node(again, "TestLOD1") != null and spine != null and spine.get_child_count() == 1)
+	check("no node is duplicated by the round trip", node_names(again) == node_names(scene),
+		"%s vs %s" % [node_names(again), node_names(scene)])
+	again.free()
+
+	# 10. Re-docking keeps one UI.
+	holder.add_child(dock)
+	var ui_children: int = dock.get_child_count()
+	holder.remove_child(dock)
+	holder.add_child(dock)
+	check("re-docking does not build the UI twice", ui_children == 1 and dock.get_child_count() == 1)
+	dock.free()
+
+	# 6. Per-placement data keeps an actor out of the shared prefab.
+	check("per-instance geometry is detected",
+		imp._has_per_instance_geometry([{"vertex_paint": "AAAA"}])
+		and imp._has_per_instance_geometry([{}, {"material_overrides": [{"slot_index": 0}]}])
+		and imp._has_per_instance_geometry([{"spline_mesh": {"roll": 1}}])
+		and not imp._has_per_instance_geometry([{"vertex_paint": null, "material_overrides": [], "spline_mesh": {}}]))
+
+	# 7. Positive roll turns right-handed about the direction of travel on every axis.
+	for axis in ["x", "z"]:
+		var fwd := Vector3.BACK if axis == "z" else Vector3.RIGHT
+		var lateral := Vector3.RIGHT if axis == "z" else Vector3.UP
+		var flat := _rolled(_strip(fwd, lateral), axis, 0.0)
+		var turned := _rolled(_strip(fwd, lateral), axis, 0.5)
+		var ok := flat.size() > 0
+		for i in flat.size():
+			ok = ok and near(flat[i].rotated(fwd, 0.5), turned[i])
+		check("spline roll direction on the %s axis" % axis, ok, "%s -> %s" % [flat, turned])
+
+	# 8. Same-named slots each get their own entry; shifted slots still match by name.
+	var mats := [{"material_name": "M", "slot_index": 0}, {"material_name": "M", "slot_index": 1}]
+	var claimed := {}
+	check("duplicate material names resolve to their own slots",
+		Common.find_material_entry(mats, "M", 0, claimed)["slot_index"] == 0
+		and Common.find_material_entry(mats, "M", 1, claimed)["slot_index"] == 1)
+	mats = [{"material_name": "X", "slot_index": 0}, {"material_name": "M", "slot_index": 1}, {"material_name": "M", "slot_index": 2}]
+	claimed = {}
+	check("duplicate names survive a dropped slot",
+		Common.find_material_entry(mats, "M", 0, claimed)["slot_index"] == 1
+		and Common.find_material_entry(mats, "M", 1, claimed)["slot_index"] == 2)
+
+	# 9. A block-compressed opacity map is usable.
+	var src := Image.create_empty(4, 4, false, Image.FORMAT_RGBA8)
+	src.fill(Color(0.25, 0.5, 0.75, 1.0))
+	src.compress(Image.COMPRESS_S3TC)
+	var dds := tmp.path_join("op.dds")
+	src.save_dds(dds)
+	var raw_dds := Image.new()
+	raw_dds.load_dds_from_buffer(FileAccess.get_file_as_bytes(dds))
+	check("fixture .dds is really compressed", raw_dds.is_compressed())
+	var merged: Texture2D = imp._combine_albedo_and_opacity("", dds, 0)
+	check("compressed opacity packs into alpha", merged != null
+		and absf(merged.get_image().get_pixel(1, 1).a - 0.25) < 0.05)
+
+	# 11. A merged-away empty container does not push the kept one to "<Name>2".
+	var merge_root := Node3D.new()
+	holder.add_child(merge_root)
+	var old_audio := Node3D.new()
+	old_audio.name = "UnrealAudio"
+	merge_root.add_child(old_audio)
+	old_audio.add_child(Node3D.new())
+	imp.active_scene_root = merge_root
+	var previous: Dictionary = imp._set_aside_feature_containers()
+	var empty := Node3D.new()
+	empty.name = "UnrealAudio"
+	merge_root.add_child(empty)
+	empty.queue_free()
+	imp._merge_feature_containers(previous)
+	check("kept container gets its own name back", String(old_audio.name) == "UnrealAudio", old_audio.name)
+
+	# 12. Component names are looked up the way Godot stored them; prefabs are not edited.
+	var multi := Node3D.new()
+	holder.add_child(multi)
+	var part := Node3D.new()
+	part.name = "Part.A"
+	multi.add_child(part)
+	var comps := [{"name": "Part.A", "godot_world_transform": {"translation": [3, 0, 0]}}, {"name": "B"}]
+	imp._update_existing_actor_node(multi, holder, Transform3D.IDENTITY, {}, comps, null)
+	check("a component with a sanitized name is updated", near(part.position, Vector3(3, 0, 0)), str(part.position))
+	multi.scene_file_path = "res://prefabs/fake.tscn"
+	part.position = Vector3.ZERO
+	imp._update_existing_actor_node(multi, holder, Transform3D(Basis.IDENTITY, Vector3(1, 0, 0)), {}, comps, null)
+	check("a prefab instance moves but its children are left alone",
+		near(part.position, Vector3.ZERO) and near(multi.position, Vector3(1, 0, 0)))
+
+	# 14. A LOD that cannot load must not cull LOD0.
+	var broken := FileAccess.open(tmp.path_join("models/SM_Bad_LOD1.gltf"), FileAccess.WRITE)
+	broken.store_string("not a gltf")
+	broken.close()
+	imp.active_scene_root = holder
+	imp.active_models_folder = tmp.path_join("models")
+	var lod0 := load("res://models/SM_Rock.gltf").instantiate() as Node3D
+	holder.add_child(lod0)
+	var lod_lib := {"SM_Bad": {"lods": [{"lod_index": 0}, {"lod_index": 1, "switch_distance_m": 12.0}]}}
+	var wired: int = imp._apply_lod_chain(lod0, lod0, Transform3D.IDENTITY, "SM_Bad", "SM_Bad", [], lod_lib, {})
+	var lod0_mi := find_node(lod0, "TriNode") as MeshInstance3D
+	check("a broken LOD1 leaves LOD0 visible at any distance",
+		wired == 0 and lod0_mi.visibility_range_end == 0.0, str(lod0_mi.visibility_range_end))
+	holder.queue_free()
+
+
+func _t3(x := 0.0, s := 1.0) -> Dictionary:
+	return {"translation": [x, 0, 0], "rotation_quat": [0, 0, 0, 1], "scale": [s, s, s]}
+
+
+func _comp3(n: String, key: String, x := 0.0, s := 1.0) -> Dictionary:
+	return {"name": n, "mesh_key": key, "mesh_name": key, "godot_world_transform": _t3(x, s), "material_overrides": []}
+
+
+func _actor3(n: String, id: String, comps: Array, x := 0.0) -> Dictionary:
+	return {"name": n, "actor_id": id, "class": "BP_Sweep3_C" if comps.size() > 1 else "StaticMeshActor",
+		"godot_transform": _t3(x), "components": comps}
+
+
+func _import3(actors, root: Node, opts := {}, meshes := {}, extra := {}, models := "res://models/") -> bool:
+	var layout := {"format_version": 2, "actors": actors, "meshes": meshes}
+	layout.merge(extra)
+	var f := FileAccess.open("res://sweep3.json", FileAccess.WRITE)
+	f.store_string(JSON.stringify(layout))
+	f.close()
+	return await Importer.new().do_import("res://sweep3.json", models, "res://textures/", root, opts)
+
+
+func _root3() -> Node3D:
+	var r := Node3D.new()
+	r.name = "Sweep3Root"
+	get_tree().get_root().add_child(r, true)
+	return r
+
+
+func _test_sweep3() -> void:
+	var update := {"update_existing": true}
+	var prune := {"update_existing": true, "prune_removed": true}
+	var cube := {"collision": {"boxes": [{"size": [100, 100, 100], "godot_local_transform": _t3()}]}}
+	var lib := {"SM_Rock": cube, "SM_Crate": cube}
+	var holder3 := _root3()
+
+	# 5. Level Instance copies share actor guids.
+	var r := _root3()
+	await _import3([_actor3("A", "DUP", [_comp3("c", "SM_Rock", 1.0)], 1), _actor3("B", "DUP", [_comp3("c", "SM_Rock", 50.0)], 50)], r)
+	await _import3([_actor3("A", "DUP", [_comp3("c", "SM_Rock", 2.0)], 2), _actor3("B", "DUP", [_comp3("c", "SM_Rock", 52.0)], 52)], r, prune)
+	var box: Node = r.get_node("UnrealStaticMeshes")
+	check("actors sharing an id are each updated", box.get_child_count() == 2
+		and near(box.get_node("A").position, Vector3(2, 0, 0)) and near(box.get_node("B").position, Vector3(52, 0, 0)))
+	await _import3([_actor3("A", "DUP", [_comp3("c", "SM_Rock", 2.0)], 2)], r, prune)
+	check("a copy that could be the user's is not pruned", box.get_child_count() == 2)
+	await _import3([_actor3("Z", "OTHER", [_comp3("c", "SM_Rock", 2.0)], 2)], r, prune)
+	await get_tree().process_frame
+	check("actors gone from the level are pruned", box.get_child_count() == 1, str(node_names(box)))
+	r.queue_free()
+
+	# 15. Duplicate labels stay readable.
+	r = _root3()
+	await _import3([_actor3("Same", "1", [_comp3("c", "SM_Rock")]), _actor3("Same", "2", [_comp3("c", "SM_Rock")])], r, {}, lib)
+	check("duplicate labels get readable names", not node_names(r).any(func(n): return "@" in n), str(node_names(r)))
+	r.queue_free()
+
+	# 4. Structural changes arrive, and the user's work stays.
+	var script := GDScript.new()
+	script.source_code = "@tool\\nextends Node3D\\n@export var hp := 1\\nsignal hurt\\nfunc on_hurt() -> void:\\n\\tpass\\n"
+	script.reload()
+	r = _root3()
+	var rock := _comp3("c", "SM_Rock", 3.0)
+	await _import3([_actor3("A", "X", [rock], 3)], r, {}, lib)
+	var node: Node3D = r.get_node("UnrealStaticMeshes/A")
+	node.name = "Renamed"
+	node.set_script(script)
+	node.set("hp", 7)
+	node.add_to_group("enemies", true)
+	var mine := Marker3D.new()
+	mine.name = "Mine"
+	node.add_child(mine)
+	mine.owner = r
+	mine.position = Vector3(0, 4, 0)
+	var deep := Marker3D.new()
+	deep.name = "Deep"
+	node.get_node("SM_Rock").add_child(deep)
+	deep.owner = r
+	node.connect("hurt", Callable(node, "on_hurt"), CONNECT_PERSIST)
+	var unchanged: Node = node.get_node("SM_Rock")
+	await _import3([_actor3("A", "X", [_comp3("c", "SM_Rock", 5.0)], 5)], r, update, lib)
+	check("a move alone rebuilds nothing", node.get_node_or_null("SM_Rock") == unchanged and near(node.position, Vector3(5, 0, 0)))
+
+	await _import3([_actor3("A", "X", [_comp3("c", "SM_Crate", 5.0)], 5)], r, update, lib)
+	check("a swapped mesh arrives in the same node", is_instance_valid(node)
+		and node.has_node("SM_Crate") and not node.has_node("SM_Rock") and node.name == &"Renamed")
+	check("the swap keeps the script, its values, groups and child nodes",
+		node.get_script() == script and node.get("hp") == 7 and node.is_in_group("enemies")
+		and mine.get_parent() == node and near(mine.position, Vector3(0, 4, 0)) and is_instance_valid(deep))
+	check("the swap has one collision shape", node.find_children("*", "CollisionShape3D", true, false).size() == 1)
+	check("nothing is left unowned", node.find_children("*", "", true, true).all(func(n): return n.owner != null) and mine.owner == r and deep.owner == r)
+
+	await _import3([_actor3("A", "X", [_comp3("c", "SM_Crate", 5.0), _comp3("d", "SM_Rock", 8.0)], 5)], r, update, lib)
+	box = r.get_node("UnrealStaticMeshes")
+	var grown: Node3D = box.get_node_or_null("Renamed")
+	check("a second component arrives", box.get_child_count() == 1 and grown != null
+		and grown.has_node("c") and grown.has_node("d"), str(node_names(box)))
+	check("a root of another type keeps the script, values, groups and connections",
+		grown.get_script() == script and grown.get("hp") == 7 and grown.is_in_group("enemies")
+		and grown.is_connected("hurt", Callable(grown, "on_hurt")))
+	check("the user's child stays where it was in the world", mine.get_parent() == grown
+		and near(grown.transform * mine.position, Vector3(5, 4, 0)), str(grown.transform * mine.position))
+	await _import3([_actor3("A", "X", [_comp3("c", "SM_Crate", 5.0)], 5)], r, update, lib)
+	var shrunk: Node3D = box.get_node_or_null("Renamed")
+	check("a removed component goes", shrunk is StaticBody3D and not shrunk.has_node("d") and mine.get_parent() == shrunk)
+	await _import3([_actor3("A", "X", [_comp3("c", "SM_NotHere", 5.0)], 5)], r, update, lib)
+	check("a mesh with no model file does not replace one on screen", box.get_node_or_null("Renamed") == shrunk and shrunk.has_node("SM_Crate"))
+	var no_body := _comp3("c", "SM_Crate", 5.0)
+	no_body["collision_enabled"] = false
+	await _import3([_actor3("A", "X", [no_body], 5)], r, update, lib)
+	check("switching collision off removes it", r.find_children("*", "CollisionShape3D", true, false).is_empty()
+		and mine.get_parent() == box.get_node("Renamed"))
+	var saved := PackedScene.new()
+	saved.pack(r)
+	var again := saved.instantiate()
+	check("a rebuilt actor survives saving", node_names(again) == node_names(r), "%s vs %s" % [node_names(again), node_names(r)])
+	again.free()
+	r.queue_free()
+
+	# 4. A scene imported before structures were recorded.
+	r = _root3()
+	await _import3([_actor3("A", "X", [rock], 3)], r, {}, lib)
+	node = r.get_node("UnrealStaticMeshes/A")
+	for key in ["unreal_structure", "unreal_nodes"]:
+		node.remove_meta(key)
+	mine = Marker3D.new()
+	node.add_child(mine)
+	mine.owner = r
+	await _import3([_actor3("A", "X", [_comp3("c", "SM_Crate", 3.0)], 3)], r, update, lib)
+	check("an older scene is rebuilt too", node.has_node("SM_Crate") and not node.has_node("SM_Rock") and mine.get_parent() == node)
+	r.queue_free()
+
+	# 4. A prefab on disk follows its Blueprint.
+	var prefabs := {"update_existing": true, "extract_prefabs": true}
+	DirAccess.remove_absolute("res://prefabs/BP_Sweep3_C.tscn")
+	var two := [_comp3("c", "SM_Rock", 1.0), _comp3("d", "SM_Crate", 2.0)]
+	r = _root3()
+	await _import3([_actor3("P", "P1", two, 1), _actor3("Q", "P2", two, 1)], r, prefabs, lib)
+	var stale := (load("res://prefabs/BP_Sweep3_C.tscn") as PackedScene).instantiate(PackedScene.GEN_EDIT_STATE_MAIN)
+	mine = Marker3D.new()
+	mine.name = "Mine"
+	stale.add_child(mine)
+	mine.owner = stale
+	saved = PackedScene.new()
+	saved.pack(stale)
+	ResourceSaver.save(saved, "res://prefabs/BP_Sweep3_C.tscn")
+	saved.take_over_path("res://prefabs/BP_Sweep3_C.tscn")
+	stale.free()
+	var swapped := [_comp3("c", "SM_Rock", 1.0), _comp3("d", "SM_Rock", 2.0)]
+	await _import3([_actor3("P", "P1", swapped, 1), _actor3("Q", "P2", two, 1)], r, prefabs, lib)
+	var p: Node = r.get_node("UnrealStaticMeshes/P")
+	var on_disk := (load("res://prefabs/BP_Sweep3_C.tscn") as PackedScene).instantiate()
+	check("one changed instance leaves the shared prefab alone", p.scene_file_path == "" and p.has_node("d/SM_Rock")
+		and on_disk.has_node("d/SM_Crate"), str(node_names(p)))
+	on_disk.free()
+	await _import3([_actor3("P", "P1", swapped, 1), _actor3("Q", "P2", swapped, 1), _actor3("N", "P3", swapped, 1)], r, prefabs, lib)
+	p = r.get_node("UnrealStaticMeshes/N")
+	check("a changed Blueprint rebuilds its prefab around the user's nodes", p.scene_file_path == "res://prefabs/BP_Sweep3_C.tscn"
+		and p.has_node("d/SM_Rock") and not p.has_node("d/SM_Crate") and p.has_node("Mine"), str(node_names(p)))
+	var q: Node = r.get_node("UnrealStaticMeshes/Q")
+	check("an existing instance follows", q.scene_file_path == "res://prefabs/BP_Sweep3_C.tscn" and q.has_node("d/SM_Rock")
+		and not q.has_node("d/SM_Crate") and q.has_node("Mine"), str(node_names(q)))
+	on_disk = (load("res://prefabs/BP_Sweep3_C.tscn") as PackedScene).instantiate()
+	check("and so does the file", on_disk.has_node("d/SM_Rock") and not on_disk.has_node("d/SM_Crate") and on_disk.has_node("Mine"))
+	on_disk.free()
+	r.queue_free()
+	DirAccess.remove_absolute("res://prefabs/BP_Sweep3_C.tscn")
+
+	# 10. A model that will not load leaves a reminder, not a hole.
+	DirAccess.make_dir_recursive_absolute("res://models_bad")
+	var bad := FileAccess.open("res://models_bad/SM_Bad.gltf", FileAccess.WRITE)
+	bad.store_string("not a gltf")
+	bad.close()
+	r = _root3()
+	await _import3([_actor3("One", "1", [_comp3("c", "SM_Bad")]), _actor3("Two", "2", [_comp3("c", "SM_Bad"), _comp3("d", "SM_Bad")])],
+		r, {}, {"SM_Bad": cube}, {}, "res://models_bad/")
+	var markers := r.find_children("*", "Marker3D", true, false)
+	check("an unreadable model leaves placeholders", markers.size() == 3
+		and r.find_children("*", "StaticBody3D", true, false).is_empty(), str(node_names(r)))
+	check("the report names an unreadable model", FileAccess.get_file_as_string("res://ue2g_import_report.txt").contains("SM_Bad"))
+	DirAccess.remove_absolute("res://models_bad/SM_Bad.gltf")
+	DirAccess.remove_absolute("res://models_bad")
+	r.queue_free()
+
+	# 7. Unreal's LOD switch is a screen size, so it moves out with scale.
+	r = _root3()
+	var lods := {"SM_Crate": {"lods": [{"lod_index": 0}, {"lod_index": 1, "export_name": "SM_Crate_LOD1", "switch_distance_m": 10.0}]}}
+	await _import3([_actor3("S1", "1", [_comp3("c", "SM_Crate")]), _actor3("S4", "2", [_comp3("c", "SM_Crate", 0.0, 4.0)])], r, {}, lods)
+	var ends := []
+	for n in ["S1", "S4"]:
+		ends.append(r.get_node("UnrealStaticMeshes/" + n).find_children("*", "MeshInstance3D", true, false)[0].visibility_range_end)
+	check("LOD distances follow the actor's scale", is_equal_approx(ends[0], 10.0) and is_equal_approx(ends[1], 40.0), str(ends))
+	r.queue_free()
+
+	# 3. Culled foliage is split, and no instance within the cull distance is hidden.
+	r = _root3()
+	var floats := []
+	for i in 400:
+		floats.append_array([1, 0, 0, 0, 1, 0, 0, 0, 1, i, 0, 0])
+	await _import3([], r, {}, {}, {"foliage": [{"name": "Grass", "mesh_key": "SM_Rock", "mesh_name": "SM_Rock",
+		"instance_count": 400, "godot_transforms": floats, "cull_end_m": 50.0}]})
+	var chunks := r.find_children("*", "MultiMeshInstance3D", true, false)
+	var total := 0
+	var tight := true
+	for mmi in chunks:
+		total += mmi.multimesh.instance_count
+		tight = tight and mmi.visibility_range_end >= 50.0 + (mmi.multimesh.instance_count - 1) * 0.5 and mmi.visibility_range_end < 75.0
+	check("culled foliage is split into chunks of every instance", chunks.size() == 16 and total == 400 and tight, "%d chunks, %d instances" % [chunks.size(), total])
+	r.queue_free()
+
+	# 13. JSON that is not an object fails cleanly.
+	var arr := FileAccess.open("res://sweep3_array.json", FileAccess.WRITE)
+	arr.store_string("[1, 2]")
+	arr.close()
+	check("a JSON array is refused", not await Importer.new().do_import("res://sweep3_array.json", "res://models/", "res://textures/", holder3, {}))
+
+	# 11. A non-square Terrain3D heightmap keeps its proportions.
+	var Terrain = load("res://addons/unreal_importer/import_terrain.gd")
+	var shape: Vector2i = Terrain.new()._to_terrain3d_image(Image.create(2017, 1009, false, Image.FORMAT_RF), Vector3.ZERO, Vector3(100800, 50400, 100)).get_size()
+	check("a capped heightmap keeps square texels", shape == Vector2i(513, 1025), str(shape))
+
+	# 6. Every WAV format gets a loop end (QOA is Godot's import default).
+	var wav := AudioStreamWAV.new()
+	wav.mix_rate = 22050
+	wav.format = AudioStreamWAV.FORMAT_16_BITS
+	var pcm := PackedByteArray()
+	pcm.resize(22050 * 2)
+	wav.data = pcm
+	DirAccess.make_dir_recursive_absolute("res://audio")
+	wav.save_to_wav("res://audio/Sweep3Hum.wav")
+	var loaded: AudioStreamWAV = AudioStreamWAV.load_from_file("res://audio/Sweep3Hum.wav", {"compress/mode": 2})
+	check("fixture WAV is QOA with no loop end", loaded.format == AudioStreamWAV.FORMAT_QOA and loaded.loop_end <= 0)
+	ResourceSaver.save(loaded, "res://audio/Sweep3Hum.res")
+	var sound_root := _root3()
+	var by_path := ResourceLoader.load("res://audio/Sweep3Hum.res") as AudioStreamWAV
+	by_path.take_over_path("res://audio/Sweep3Hum.wav")
+	EnvImporter.new()._apply_audio([{"name": "Hum", "sound_file": "Sweep3Hum.wav", "looping": true}],
+		sound_root, sound_root, {"json_dir": "res://"})
+	var players := sound_root.find_children("Hum", "", true, false)
+	check("a looping sound has a loop end", players.size() == 1 and players[0].stream != null
+		and absi(players[0].stream.loop_end - 22050) < 600 and players[0].stream.loop_mode == AudioStreamWAV.LOOP_FORWARD,
+		str(players[0].stream.loop_end if players.size() == 1 and players[0].stream else -1))
+	sound_root.queue_free()
+
+	# 14. Textures outside the project decode by content and get mipmaps.
+	var dir := OS.get_cache_dir().path_join("ue2g_sweep3")
+	DirAccess.make_dir_recursive_absolute(dir)
+	var img := Image.create(16, 16, false, Image.FORMAT_RGBA8)
+	img.fill(Color.RED)
+	img.save_jpg(dir.path_join("mislabeled.png"))
+	var tex: Texture2D = Common.load_texture_file(dir.path_join("mislabeled.png"))
+	check("a mislabeled external texture loads with mipmaps", tex != null and tex.get_image().has_mipmaps())
+
+	# 2. Only the layout's own textures are shrunk.
+	var Limit = load("res://addons/unreal_importer/texture_import_limit.gd")
+	for n in ["T_Layout", "my_photo"]:
+		img.save_png(dir.path_join(n + ".png"))
+	var lf := FileAccess.open("res://sweep3.json", FileAccess.WRITE)
+	lf.store_string(JSON.stringify({"meshes": {"M": {"materials": [{"parameters": {"albedo_texture": "T_Layout"}}]}},
+		"decals": [{"textures": {"albedo": "T_Decal", "uv_rect": [0, 0, 1, 1]}}], "texture_metadata": {"T_Meta": {}},
+		"landscapes": [{"material": {"textures": [{"texture": "T_Land"}]}}],
+		"foliage": [{"material_overrides": [{"parameters": {"shader": {"tex_0": "T_Shader", "texture_paths": {"tex_0": "/Game/T"}}}}]}]}))
+	lf.close()
+	var names: Dictionary = Limit.layout_texture_names("res://sweep3.json")
+	check("every texture the layout names is found", names.keys().all(func(k): return k in ["t_layout", "t_decal", "t_meta", "t_land", "t_shader"]) and names.size() == 5, str(names.keys()))
+	Limit.shrink_source_files(dir, 8, names)
+	check("shrinking leaves the user's own art alone", Image.load_from_file(dir.path_join("T_Layout.png")).get_width() == 8
+		and Image.load_from_file(dir.path_join("my_photo.png")).get_width() == 16)
+
+	# 20. A saved material follows Unreal, and another material never borrows its file.
+	DirAccess.make_dir_recursive_absolute("res://materials3")
+	for f in DirAccess.get_files_at("res://materials3"):
+		DirAccess.remove_absolute("res://materials3/" + f)
+	var make := func(path: String, rough: float) -> Material:
+		var imp = Importer.new()
+		imp.import_options = {"save_external_materials": true, "materials_folder": "res://materials3/"}
+		return imp.get_or_create_material("M_S3", path, {"roughness": rough})
+	var in_scene: StandardMaterial3D = make.call("/Game/A/M_S3", 0.25)
+	make.call("/Game/A/M_S3", 0.75)
+	check("a changed material updates what the scene already uses", is_equal_approx(in_scene.roughness, 0.75)
+		and in_scene.resource_path == "res://materials3/M_S3.tres")
+	check("and its file", FileAccess.get_file_as_string("res://materials3/M_S3.tres").contains("roughness = 0.75"))
+	var tweaked: StandardMaterial3D = load("res://materials3/M_S3.tres")
+	tweaked.metallic = 0.5
+	ResourceSaver.save(tweaked, "res://materials3/M_S3.tres")
+	check("an unchanged one keeps the user's edits", is_equal_approx(make.call("/Game/A/M_S3", 0.75).metallic, 0.5))
+	check("a same-named material gets its own file", make.call("/Game/B/M_S3", 0.1).resource_path != "res://materials3/M_S3.tres"
+		and is_equal_approx(make.call("/Game/A/M_S3", 0.75).roughness, 0.75))
+	holder3.queue_free()
 
 
 func _dump(n: Node, depth: int) -> void:

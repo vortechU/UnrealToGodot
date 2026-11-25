@@ -52,6 +52,9 @@ func apply(data: Dictionary, root: Node, scene_owner: Node, options: Dictionary)
 		var ls_name := Common.get_str(ls, "name", "Landscape")
 		if options.get("update_existing", false) and (root.has_node(ls_name)
 				or root.has_node(ls_name + "_Terrain3D")):
+			for existing_name in [ls_name, ls_name + "_Terrain3D"]:
+				if root.has_node(existing_name):
+					root.get_node(existing_name).add_to_group(Common.NAV_SOURCE_GROUP, true)
 			warnings.append("Landscape '%s' already exists in the scene; delete it to rebuild it." % ls_name)
 			continue
 		var img := _load_heightmap(ls, json_dir, warnings)
@@ -230,6 +233,8 @@ func _build_mesh_terrain(ls: Dictionary, img: Image, root: Node, scene_owner: No
 	var terrain_root := Node3D.new()
 	terrain_root.name = ls_name
 	_store_terrain_metadata(terrain_root, ls)
+	terrain_root.visible = bool(ls.get("visible", true))
+	terrain_root.add_to_group(Common.NAV_SOURCE_GROUP, true)
 	Common.add_owned_child(root, terrain_root, scene_owner)
 
 	var mesh_inst := MeshInstance3D.new()
@@ -329,6 +334,7 @@ func _pack_splatmap(ls: Dictionary, json_dir: String) -> Dictionary:
 	var images: Array[Image] = []
 	var tints: Array = []
 	var names: Array = []
+	var first_weight_path := ""
 	for layer in layers:
 		if not (layer is Dictionary):
 			continue
@@ -341,6 +347,8 @@ func _pack_splatmap(ls: Dictionary, json_dir: String) -> Dictionary:
 		var wimg := Common.load_image_file(path)
 		if wimg == null:
 			continue
+		if first_weight_path == "":
+			first_weight_path = path
 		if wimg.is_compressed():
 			wimg.decompress()
 		if wimg.get_width() != SPLAT_RESOLUTION or wimg.get_height() != SPLAT_RESOLUTION:
@@ -353,17 +361,18 @@ func _pack_splatmap(ls: Dictionary, json_dir: String) -> Dictionary:
 	if images.is_empty():
 		return {}
 
-	var packed := Image.create(SPLAT_RESOLUTION, SPLAT_RESOLUTION, false, Image.FORMAT_RGBAF)
+	var packed := Image.create(SPLAT_RESOLUTION, SPLAT_RESOLUTION, false, Image.FORMAT_RGBA8)
 	for y in SPLAT_RESOLUTION:
 		for x in SPLAT_RESOLUTION:
 			var c := Color(0.0, 0.0, 0.0, 0.0)
 			for i in images.size():
-				c[i] = images[i].get_pixel(x, y).r
+				c[i] = clampf(images[i].get_pixel(x, y).r, 0.0, 1.0)
 			packed.set_pixel(x, y, c)
 	while tints.size() < MAX_SPLAT_LAYERS:
 		tints.append(Color.WHITE)
+	var ls_name := Common.get_str(ls, "name", "Landscape")
 	return {
-		"texture": ImageTexture.create_from_image(packed),
+		"texture": Common.save_generated_texture(packed, first_weight_path, ls_name + "_splat"),
 		"tints": tints,
 		"names": names,
 		"count": images.size(),
@@ -517,6 +526,8 @@ func _try_terrain3d(ls: Dictionary, img: Image, root: Node, scene_owner: Node,
 
 	_disown_children(terrain)
 	_store_terrain_metadata(terrain, ls)
+	terrain.visible = bool(ls.get("visible", true))
+	terrain.add_to_group(Common.NAV_SOURCE_GROUP, true)
 	warnings.append(("Landscape '%s' imported via Terrain3D at %.2f m vertex spacing, %d region(s) "
 		+ "saved to '%s'. It renders as a flat checkerboard until you assign a Terrain3DAssets "
 		+ "resource — that is Terrain3D's untextured default, not a failed import; the exported "
@@ -588,10 +599,13 @@ func _to_terrain3d_image(img: Image, center: Vector3, extent: Vector3) -> Image:
 	source maps +U -> Godot -Z and +V -> Godot +X. So new(ix, iz) = src(W-1-iz, ix),
 	and the result is the transpose-and-flip of the source."""
 	var src := img.duplicate() as Image
-	var cap_w := mini(src.get_width(), MAX_TERRAIN3D_RES)
-	var cap_h := mini(src.get_height(), MAX_TERRAIN3D_RES)
-	if src.get_width() != cap_w or src.get_height() != cap_h:
-		src.resize(cap_w, cap_h, Image.INTERPOLATE_BILINEAR)
+	# One factor for both axes: Terrain3D has a single vertex spacing, so texels that
+	# were square have to stay square.
+	var longest := maxi(src.get_width(), src.get_height())
+	if longest > MAX_TERRAIN3D_RES:
+		var shrink := float(MAX_TERRAIN3D_RES - 1) / float(longest - 1)
+		src.resize(maxi(roundi((src.get_width() - 1) * shrink) + 1, 2),
+			maxi(roundi((src.get_height() - 1) * shrink) + 1, 2), Image.INTERPOLATE_BILINEAR)
 	var mm := _scan_min_max(src)
 	var v_range := maxf(mm.y - mm.x, 0.000001)
 	var h_min := (center.z - extent.z) * 0.01

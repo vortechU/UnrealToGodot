@@ -14,6 +14,7 @@ are not reflected into the Python wrapper type, only tags are exported — this
 limitation is inherent to the stock UE Python API.
 """
 
+import math
 import unreal
 import ue2g_common
 
@@ -137,11 +138,19 @@ def _extract_bp_properties(actor):
     if not py_type.__name__.endswith("_C"):
         return props
 
-    base = py_type.__mro__[1] if len(py_type.__mro__) > 1 else None
+    # Diff against the first non-Blueprint (_C) native base class so inherited
+    # variables from parent Blueprint classes (BP_Parent_C -> BP_Child_C) are kept.
+    base = None
+    for cls in py_type.__mro__[1:]:
+        if not cls.__name__.endswith("_C"):
+            base = cls
+            break
     base_attrs = set(dir(base)) if base is not None else set()
     candidates = [a for a in dir(py_type) if a not in base_attrs and not a.startswith("_")]
 
-    for name in candidates[:_MAX_BP_PROPERTIES]:
+    for name in candidates:
+        if len(props) >= _MAX_BP_PROPERTIES:
+            break
         try:
             value = actor.get_editor_property(name)
         except Exception:
@@ -159,7 +168,8 @@ def _coerce_simple_value(value):
     if isinstance(value, int):
         return int(value)
     if isinstance(value, float):
-        return float(value)
+        v = float(value)
+        return v if math.isfinite(v) else None
     if isinstance(value, str):
         return value
     try:

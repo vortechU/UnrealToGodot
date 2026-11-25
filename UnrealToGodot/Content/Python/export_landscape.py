@@ -60,6 +60,7 @@ The importer reconstructs vertices in Unreal world space from ue_bounds and
 converts each to Godot space, so orientation is correct by construction.
 """
 
+import math
 import os
 import struct
 import unreal
@@ -232,8 +233,14 @@ class _ComponentGrid:
     not its centre: that mistake dropped the trace hit rate to 27%).
     """
 
-    def __init__(self, entries):
+    def __init__(self, entries, yaw_deg=0.0, flip_x=1.0, flip_y=1.0):
         # entries: [(world_x, world_y, component), ...]
+        # yaw_deg / flip: the landscape's own rotation and scale signs. The lattice
+        # only exists along its axes, so everything is indexed in that frame.
+        self._cos = math.cos(math.radians(yaw_deg))
+        self._sin = math.sin(math.radians(yaw_deg))
+        self._flip = (flip_x, flip_y)
+        entries = [self._local(wx, wy) + (comp,) for wx, wy, comp in entries]
         self.entries = entries
         self.ok = False
         if len(entries) < 1:
@@ -241,8 +248,9 @@ class _ComponentGrid:
         xs = sorted(set(round(e[0], 1) for e in entries))
         ys = sorted(set(round(e[1], 1) for e in entries))
         self.min_x, self.min_y = xs[0], ys[0]
-        self.pitch_x = min((b - a for a, b in zip(xs, xs[1:])), default=0.0)
-        self.pitch_y = min((b - a for a, b in zip(ys, ys[1:])), default=0.0)
+        # Gaps under a centimetre are rotation noise within one row, not a pitch.
+        self.pitch_x = min((b - a for a, b in zip(xs, xs[1:]) if b - a > 1.0), default=0.0)
+        self.pitch_y = min((b - a for a, b in zip(ys, ys[1:]) if b - a > 1.0), default=0.0)
         if self.pitch_x <= 0.0:
             self.pitch_x = self.pitch_y
         if self.pitch_y <= 0.0:
@@ -267,12 +275,16 @@ class _ComponentGrid:
             self.max_iy = max(self.max_iy, iy)
         self.ok = True
 
+    def _local(self, wx, wy):
+        return ((wx * self._cos + wy * self._sin) * self._flip[0],
+                (wy * self._cos - wx * self._sin) * self._flip[1])
+
     def at(self, wx, wy):
         if not self.ok:
             return None
         if self.single is not None:
             return self.single
-        import math
+        wx, wy = self._local(wx, wy)
         # Clamped, so the landscape's outer edge -- where the sample sits
         # exactly on the last component's boundary -- still resolves to that
         # component instead of falling off the lattice.
@@ -283,6 +295,7 @@ class _ComponentGrid:
 
 def _build_component_grid(actors, comp_class):
     entries = []
+    frame = None
     for actor in actors:
         try:
             comps = list(actor.get_components_by_class(comp_class))
@@ -294,7 +307,24 @@ def _build_component_grid(actors, comp_class):
             except Exception:
                 continue
             entries.append((loc.x, loc.y, c))
-    return _ComponentGrid(entries)
+            if frame is None:
+                try:
+                    scale = c.get_world_scale()
+                    frame = (float(c.get_world_rotation().yaw),
+                             -1.0 if scale.x < 0 else 1.0, -1.0 if scale.y < 0 else 1.0)
+                except Exception:
+                    frame = (0.0, 1.0, 1.0)
+    return _ComponentGrid(entries, *(frame or ()))
+
+
+def _is_hidden(actor):
+    """True when the actor is hidden in the editor or in game."""
+    try:
+        if actor.is_hidden_ed():
+            return True
+    except Exception:
+        pass
+    return ue2g_common.safe_get_prop(actor, "hidden", False) is True
 
 
 def _export_one_landscape(world, landscape, related_proxies, terrain_dir, opts,
@@ -342,6 +372,7 @@ def _export_one_landscape(world, landscape, related_proxies, terrain_dir, opts,
     transform = ue2g_common.unreal_to_godot_transform(landscape.get_actor_transform())
     return {
         "name": label,
+        "visible": not _is_hidden(landscape),
         "godot_transform": transform,
         "heightmap_file": f"terrain/{height_file}",
         "heightmap_resolution": [width, height],
@@ -435,10 +466,10 @@ def _gpu_heightmap_to_file(world, landscape, label, terrain_dir, height_file, wi
             # what this used to do -- leaves the importer reading only the high
             # half out of R, i.e. a 256-step staircase instead of a heightfield.
             try:
-                landscape.landscape_export_heightmap_to_render_target(rt, True, True)
+                res = landscape.landscape_export_heightmap_to_render_target(rt, True, True)
             except TypeError:
-                landscape.landscape_export_heightmap_to_render_target(rt, True)
-            drew = True
+                res = landscape.landscape_export_heightmap_to_render_target(rt, True)
+            drew = True if res is None else bool(res)
         except Exception as e:
             unreal.log_warning(f"export_landscape: legacy heightmap export failed for '{label}': {str(e)}")
         if drew and not _rt_readback_varies(world, rt, width, height):
@@ -728,7 +759,17 @@ def _collect_material_textures(landscape, collected_textures):
                         yielded_any = True
                         yield item
                 if not yielded_any and not is_parent:
-                    for tex in ue2g_common.iter_material_dependency_textures(node):
+                    # Walk up to the base Material before crawling package dependencies:
+                    # a MaterialInstance's direct dependencies only list its parent.
+                    base_mat = node
+                    for _ in range(16):
+                        if not (mi_types and isinstance(base_mat, mi_types)):
+                            break
+                        parent_mat = ue2g_common.safe_get_prop(base_mat, "parent", None)
+                        if parent_mat is None:
+                            break
+                        base_mat = parent_mat
+                    for tex in ue2g_common.iter_material_dependency_textures(base_mat):
                         yield "", tex
             else:
                 for item in ue2g_common.iter_base_material_textures(

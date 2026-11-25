@@ -44,6 +44,9 @@ func apply(data: Dictionary, root: Node, scene_owner: Node, options: Dictionary)
 		navmesh.agent_max_slope = clampf(Common.get_num(nav, "max_slope_deg", 44.0), 0.1, 89.9)
 		navmesh.cell_size = clampf(Common.get_num(nav, "cell_size_m", 0.25), 0.01, 1.0)
 		navmesh.geometry_parsed_geometry_type = NavigationMesh.PARSED_GEOMETRY_BOTH
+		# The imported geometry sits beside the region, not under it.
+		navmesh.geometry_source_geometry_mode = NavigationMesh.SOURCE_GEOMETRY_GROUPS_WITH_CHILDREN
+		navmesh.geometry_source_group_name = Common.NAV_SOURCE_GROUP
 
 		# Confine baking to the exported bounds volume (AABB is centered on the
 		# region node, which sits at the volume's transform).

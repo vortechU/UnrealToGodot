@@ -32,6 +32,15 @@ static func deform_instance(instanced_mesh: Node, spline_data: Dictionary) -> bo
 		float(s1_arr[0]) if (s1_arr is Array and s1_arr.size() > 0) else 1.0,
 		float(s1_arr[1]) if (s1_arr is Array and s1_arr.size() > 1) else 1.0)
 
+	var off0_arr = spline_data.get("start_offset", [0.0, 0.0])
+	var off1_arr = spline_data.get("end_offset", [0.0, 0.0])
+	var off0 := Vector2(
+		float(off0_arr[0]) if (off0_arr is Array and off0_arr.size() > 0) else 0.0,
+		float(off0_arr[1]) if (off0_arr is Array and off0_arr.size() > 1) else 0.0)
+	var off1 := Vector2(
+		float(off1_arr[0]) if (off1_arr is Array and off1_arr.size() > 0) else 0.0,
+		float(off1_arr[1]) if (off1_arr is Array and off1_arr.size() > 1) else 0.0)
+
 	var roll0 := Common.get_num(spline_data, "start_roll_rad", 0.0)
 	var roll1 := Common.get_num(spline_data, "end_roll_rad", 0.0)
 	var fwd_axis := Common.get_str(spline_data, "forward_axis", "x").to_lower()
@@ -108,24 +117,38 @@ static func deform_instance(instanced_mesh: Node, spline_data: Dictionary) -> bo
 				var ref := up_ref
 				if absf(fwd.dot(ref)) > 0.995:
 					ref = Vector3.FORWARD if absf(fwd.dot(Vector3.FORWARD)) < 0.9 else Vector3.RIGHT
-				var right := fwd.cross(ref).normalized()
-				var up := right.cross(fwd).normalized()
+				var right: Vector3
+				var up: Vector3
+				if fwd_axis == "z":
+					# Keep (right, up, fwd) right-handed (det = +1) so UE ESplineMeshAxis::Y
+					# does not mirror vertices along X and invert triangle winding.
+					right = ref.cross(fwd).normalized()
+					up = fwd.cross(right).normalized()
+				else:
+					right = fwd.cross(ref).normalized()
+					up = right.cross(fwd).normalized()
 
 				# Apply smoothstep-interpolated roll around forward axis
 				var st := t * t * (3.0 - 2.0 * t)
 				var roll := lerpf(roll0, roll1, st)
 				if absf(roll) > 1e-6:
+					# The glTF axis swap reverses handedness, so `right`/`up` turn the
+					# opposite way to before. The "z" frame points `right` the other way,
+					# which reverses it once more.
 					var cr := cos(roll)
-					var sr := sin(roll)
-					var r2 := right * cr + up * sr
-					var u2 := -right * sr + up * cr
+					var sr := sin(-roll if fwd_axis == "z" else roll)
+					var r2 := right * cr - up * sr
+					var u2 := right * sr + up * cr
 					right = r2
 					up = u2
 
 				var sc := s0.lerp(s1, st)
-				var deformed := pos + right * (lateral_u * sc.x) + up * (lateral_v * sc.y)
+				var off := off0.lerp(off1, st)
+				var deformed := pos + right * (lateral_u * sc.x + off.x) + up * (lateral_v * sc.y + off.y)
 				mdt.set_vertex(vi, deformed)
 
+				var inv_sx := (1.0 / sc.x) if absf(sc.x) > 1e-4 else 1.0
+				var inv_sy := (1.0 / sc.y) if absf(sc.y) > 1e-4 else 1.0
 				var n := mdt.get_vertex_normal(vi)
 				if n.length_squared() > 1e-8:
 					var n_fwd: float
@@ -138,8 +161,24 @@ static func deform_instance(instanced_mesh: Node, spline_data: Dictionary) -> bo
 							n_fwd = n.z; n_u = n.x; n_v = n.y
 						_:
 							n_fwd = n.x; n_u = n.z; n_v = n.y
-					var dn := (fwd * n_fwd + right * n_u + up * n_v).normalized()
+					var dn := (fwd * n_fwd + right * (n_u * inv_sx) + up * (n_v * inv_sy)).normalized()
 					mdt.set_vertex_normal(vi, dn)
+
+				var tan_p := mdt.get_vertex_tangent(vi)
+				if tan_p.normal.length_squared() > 1e-8:
+					var tv := tan_p.normal
+					var t_fwd: float
+					var t_u: float
+					var t_v: float
+					match fwd_axis:
+						"y":
+							t_fwd = tv.y; t_u = tv.x; t_v = tv.z
+						"z":
+							t_fwd = tv.z; t_u = tv.x; t_v = tv.y
+						_:
+							t_fwd = tv.x; t_u = tv.z; t_v = tv.y
+					var dt := (fwd * t_fwd + right * (t_u * sc.x) + up * (t_v * sc.y)).normalized()
+					mdt.set_vertex_tangent(vi, Plane(dt.x, dt.y, dt.z, tan_p.d))
 
 			mdt.commit_to_surface(out_mesh)
 			var mat := mi.get_active_material(surf_idx)

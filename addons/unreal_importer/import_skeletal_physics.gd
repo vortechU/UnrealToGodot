@@ -56,17 +56,31 @@ func attach_in_scene(root: Node, models_folder: String, scene_owner: Node) -> in
 		var data := _read_json(physics_path)
 		var bodies = data.get("bodies", [])
 		if bodies is Array and not (bodies as Array).is_empty():
+			_make_instances_editable(skel, scene_owner)
 			total_bones += _build_simulator(skel, bodies, scene_owner)
 	return total_bones
+
+
+func _make_instances_editable(skeleton: Node, scene_owner: Node) -> void:
+	"""Godot drops nodes added inside an instanced scene on save unless every
+	instance between them and the scene root is editable."""
+	var node := skeleton
+	while node != null and node != scene_owner:
+		if node.scene_file_path != "" and not scene_owner.is_editable_instance(node):
+			scene_owner.set_editable_instance(node, true)
+			node.set_display_folded(true)
+		node = node.get_parent()
 
 
 func _build_simulator(skeleton: Skeleton3D, bodies: Array, scene_owner: Node) -> int:
 	# Map lowercase bone names -> exact Skeleton3D bone name so minor casing
 	# differences between Unreal PhysicsAsset and glTF skeleton still match.
 	var bone_lookup := {}
+	var bone_idx_lookup := {}
 	for i in skeleton.get_bone_count():
 		var bname := skeleton.get_bone_name(i)
 		bone_lookup[bname.to_lower()] = bname
+		bone_idx_lookup[bname.to_lower()] = i
 
 	var simulator: Node3D
 	if ClassDB.class_exists("PhysicalBoneSimulator3D"):
@@ -99,16 +113,20 @@ func _build_simulator(skeleton: Skeleton3D, bodies: Array, scene_owner: Node) ->
 		var phys_bone := PhysicalBone3D.new()
 		phys_bone.name = "PhysicalBone_" + matched_bone
 		phys_bone.bone_name = matched_bone
+		var bone_idx: int = int(bone_idx_lookup.get(matched_bone.to_lower(), -1))
+		if bone_idx >= 0:
+			phys_bone.transform = skeleton.get_bone_global_rest(bone_idx)
 		Common.add_owned_child(simulator, phys_bone, scene_owner)
 
 		var shape_count := _add_collision_shapes(phys_bone, shapes, scene_owner)
 		if shape_count > 0:
 			created_bones += 1
 		else:
-			phys_bone.queue_free()
+			# free(), not queue_free(): a Blueprint prefab is packed before the queue runs.
+			phys_bone.free()
 
 	if created_bones == 0:
-		simulator.queue_free()
+		simulator.free()
 	return created_bones
 
 

@@ -82,6 +82,8 @@ var _alpha_merged_cache: Dictionary = {}
 var _external_normal_cache: Dictionary = {}
 var _external_mat_paths: Dictionary = {}
 var _prefab_cache: Dictionary = {}
+# Blueprint key -> structure signature of the first actor a shared prefab can stand for.
+var _prefab_templates: Dictionary = {}
 var active_scene_root: Node
 var active_textures_folder: String
 var active_models_folder: String
@@ -142,9 +144,9 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 
 	# Parse JSON data
 	var data = JSON.parse_string(json_string)
-	if data == null:
+	if not (data is Dictionary):
 		printerr("Import Error: Failed to parse JSON file.")
-		_fail_report("level_layout.json is not valid JSON. The export may have "
+		_fail_report("level_layout.json is not a valid JSON object. The export may have "
 			+ "been interrupted, leaving a truncated file.")
 		return false
 
@@ -201,8 +203,11 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 	var extract_prefabs := bool(import_options.get("extract_prefabs", false))
 	var existing_by_id: Dictionary = {}
 	var seen_actor_ids: Dictionary = {}
+	var ambiguous_leftovers := 0
+	var rebuild: Dictionary = {}
 	if update_existing:
 		_index_existing_actors(active_scene_root, existing_by_id)
+	_prefab_templates = _collect_prefab_templates(actors, meshes_lib) if extract_prefabs else {}
 
 	# Every mesh actor goes under one container, the way lights (UnrealLights),
 	# decals (UnrealDecals), foliage and navigation already do. A level is mostly
@@ -226,10 +231,13 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 				container.name = STATIC_MESH_CONTAINER
 				Common.add_owned_child(active_scene_root, container, active_scene_root)
 				mesh_root = container
+			mesh_root.add_to_group(Common.NAV_SOURCE_GROUP, true)
 			break
 
 	# Iterate and instance actors
 	for actor_data in actors:
+		_finish_rebuild(rebuild)
+		rebuild = {}
 		if not (actor_data is Dictionary):
 			continue
 		var actor_name: String = Common.get_str(actor_data, "name", "Actor")
@@ -263,15 +271,28 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 				actor_transform = get_transform_from_dict(g_trans)
 
 		# Incremental re-import: update existing actor node in place, preserving user scripts & children.
-		if update_existing and actor_id != "" and existing_by_id.has(actor_id):
-			var existing_node: Node = existing_by_id[actor_id]
-			if existing_node is Marker3D and String(existing_node.name).contains("_MISSING_"):
+		var signature := _structure_signature(components, actor_transform, meshes_lib)
+		var existing_node: Node = _take_existing(existing_by_id, actor_id, actor_transform, components) if update_existing and actor_id != "" else null
+		if existing_node != null:
+			if existing_node is Marker3D and (String(existing_node.name).contains("MISSING_") or existing_node.has_meta("missing_mesh")):
 				# A placeholder: import again, its mesh may have arrived since.
-				existing_by_id.erase(actor_id)
 				existing_node.free()
-			elif is_instance_valid(existing_node):
+			elif _needs_rebuild(existing_node, signature, components):
+				# Its components, mesh or materials changed in Unreal: import it afresh
+				# below, then swap the result in around whatever the user added.
 				seen_actor_ids[actor_id] = true
-				_update_existing_actor_node(existing_node, actor_parent, actor_transform, actor_data, components, gameplay_helper)
+				rebuild = {"old": existing_node, "parent": actor_parent, "count": actor_parent.get_child_count()}
+				updated_count += 1
+				imported_count -= 1
+			else:
+				seen_actor_ids[actor_id] = true
+				_update_existing_actor_node(existing_node, actor_parent, actor_transform, actor_data, components, gameplay_helper, meshes_lib)
+				if not existing_node.has_meta("unreal_structure"):
+					existing_node.set_meta("unreal_structure", signature)
+				for comp in components:
+					var key := Common.get_str(comp, "mesh_key", Common.get_str(comp, "mesh_name", "")) if comp is Dictionary else ""
+					if key != "" and find_model_for(models_folder, key, Common.get_str(comp, "mesh_name", "")) == "":
+						missing_meshes[key] = true
 				updated_count += 1
 				continue
 
@@ -323,7 +344,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					# Jolt could not have applied to the shapes -- which the mesh has
 					# to take instead, or it would render unscaled.
 					instanced_mesh.name = mesh_name if mesh_name != "" else (mesh_key if mesh_key != "" else "Mesh")
-					physics_body.add_child(instanced_mesh)
+					physics_body.add_child(instanced_mesh, true)
 					physics_body.owner = active_scene_root
 					instanced_mesh.owner = active_scene_root
 					_set_owner_recursive(instanced_mesh, active_scene_root)
@@ -333,7 +354,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					# Direct visual-only mesh instance at the component's world
 					# transform (axis-corrected, same as the physics-body case).
 					instanced_mesh.name = actor_name
-					actor_parent.add_child(instanced_mesh)
+					actor_parent.add_child(instanced_mesh, true)
 					instanced_mesh.owner = active_scene_root
 					_set_owner_recursive(instanced_mesh, active_scene_root)
 					instanced_mesh.transform = mesh_place
@@ -357,22 +378,34 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					gameplay_helper.apply_actor_metadata(target_node, actor_data, import_options)
 					if gameplay_helper.has_method("apply_component_metadata"):
 						gameplay_helper.apply_component_metadata(instanced_mesh if physics_body else target_node, comp_data, import_options)
+				_stamp_structure(target_node, signature)
 			else:
+				# The file is there but unreadable: same reminder as a missing one.
 				if physics_body:
-					physics_body.queue_free()
+					physics_body.free()
+				missing_meshes[mesh_key] = true
+				var broken := create_placeholder(actor_parent, actor_name, comp_transform, mesh_key)
+				if actor_id != "":
+					broken.set_meta("unreal_actor_id", actor_id)
 		else:
 			# Multi-mesh Blueprint actor (optionally extracted as a shared .tscn prefab)
 			var actor_frame := Common.physics_body_transform(actor_transform)
+			var actor_extra_scale := Common.physics_body_scale(actor_transform)
 			var bp_key := _prefab_template_key(actor_data)
-			if extract_prefabs and bp_key != "":
+			# Only share a prefab when the actor carries uniform positive scale;
+			# non-uniform/mirrored instances need per-instance Jolt collision baking.
+			if extract_prefabs and bp_key != "" and actor_extra_scale == Vector3.ONE \
+					and not _has_per_instance_geometry(components) \
+					and not _has_scaled_lods(components, actor_transform, meshes_lib) \
+					and _prefab_templates.get(bp_key, "") == signature:
 				var prefab_scene := _get_or_create_blueprint_prefab(
-					bp_key, actor_class, actor_transform, actor_frame, components,
-					models_folder, meshes_lib, skel_physics_helper)
+					bp_key, actor_class, actor_transform, components,
+					models_folder, meshes_lib, skel_physics_helper, gameplay_helper, signature)
 				if prefab_scene != null:
 					var prefab_inst := prefab_scene.instantiate() as Node3D
 					if prefab_inst != null:
 						prefab_inst.name = actor_name
-						actor_parent.add_child(prefab_inst)
+						actor_parent.add_child(prefab_inst, true)
 						prefab_inst.owner = active_scene_root
 						prefab_inst.transform = actor_frame
 						if actor_id != "":
@@ -380,13 +413,14 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 							seen_actor_ids[actor_id] = true
 						if gameplay_helper:
 							gameplay_helper.apply_actor_metadata(prefab_inst, actor_data, import_options)
+						_stamp_structure(prefab_inst, signature)
 						imported_count += 1
 						prefabs_built += 1
 						continue
 
 			var actor_node := Node3D.new()
 			actor_node.name = actor_name
-			actor_parent.add_child(actor_node)
+			actor_parent.add_child(actor_node, true)
 			actor_node.owner = active_scene_root
 			actor_node.transform = actor_frame
 
@@ -429,7 +463,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					
 					if physics_body:
 						instanced_mesh.name = mesh_name if mesh_name != "" else (mesh_key if mesh_key != "" else "Mesh")
-						physics_body.add_child(instanced_mesh)
+						physics_body.add_child(instanced_mesh, true)
 						physics_body.owner = active_scene_root
 						instanced_mesh.owner = active_scene_root
 						_set_owner_recursive(instanced_mesh, active_scene_root)
@@ -437,7 +471,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 							Basis.from_scale(Common.physics_body_scale(mesh_place)), Vector3.ZERO)
 					else:
 						instanced_mesh.name = comp_name
-						actor_node.add_child(instanced_mesh)
+						actor_node.add_child(instanced_mesh, true)
 						instanced_mesh.owner = active_scene_root
 						_set_owner_recursive(instanced_mesh, active_scene_root)
 						instanced_mesh.transform = mesh_place
@@ -457,7 +491,9 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 						gameplay_helper.apply_component_metadata(comp_target, comp_data, import_options)
 				else:
 					if physics_body:
-						physics_body.queue_free()
+						physics_body.free()
+					missing_meshes[mesh_key] = true
+					create_placeholder(actor_node, comp_name, comp_transform, mesh_key)
 					
 			if actor_node.get_child_count() > 0:
 				imported_count += 1
@@ -466,17 +502,26 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					seen_actor_ids[actor_id] = true
 				if gameplay_helper:
 					gameplay_helper.apply_actor_metadata(actor_node, actor_data, import_options)
+				_stamp_structure(actor_node, signature)
 			else:
-				actor_node.queue_free()
+				actor_node.free()
+
+	_finish_rebuild(rebuild)
 
 	# Incremental re-import pruning: remove actors whose unreal_actor_id vanished from the layout.
 	if update_existing and prune_removed:
 		for old_id in existing_by_id:
-			if not seen_actor_ids.has(old_id):
-				var old_node: Node = existing_by_id[old_id]
-				if is_instance_valid(old_node) and old_node != active_scene_root:
+			for old_node in existing_by_id[old_id]:
+				if not is_instance_valid(old_node) or old_node == active_scene_root:
+					continue
+				if seen_actor_ids.has(old_id):
+					# Either a Level Instance copy removed in Unreal or a copy the user
+					# made in Godot; nothing tells them apart, so keep it and say so.
+					ambiguous_leftovers += 1
+				else:
 					old_node.queue_free()
 					pruned_count += 1
+
 			
 	# Feature modules: lights/environment/decals, terrain, foliage, navigation.
 	# Each is optional — a missing module file simply disables that feature.
@@ -515,7 +560,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 	for w in feature_warnings:
 		print("Warning: ", w)
 	if missing_meshes.size() > 0:
-		print("Warning: The following meshes were missing from the models directory:")
+		print("Warning: The following meshes were missing from the models directory, or unreadable:")
 		for mesh in missing_meshes.keys():
 			print(" - ", mesh, " (Looked in: ", models_folder, ")")
 		print("Placeholders (Marker3Ds) were created at their respective transforms.")
@@ -530,6 +575,9 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 			report.fact("actors updated in place", updated_count)
 		if pruned_count > 0:
 			report.fact("actors pruned", pruned_count)
+		if ambiguous_leftovers > 0:
+			report.warn(("%d node(s) share an actor id with an actor still in the level and were kept. "
+				+ "Delete them by hand if they are Level Instance copies removed in Unreal.") % ambiguous_leftovers)
 		if prefabs_built > 0:
 			report.fact("Blueprint prefab instances", prefabs_built)
 		if lod_chains_wired > 0:
@@ -675,7 +723,7 @@ func create_placeholder(parent: Node, name_str: String, local_transform: Transfo
 	"""Creates a Marker3D node in the editor to serve as a placement reminder."""
 	var marker := Marker3D.new()
 	marker.name = name_str + "_MISSING_" + mesh_name
-	parent.add_child(marker)
+	parent.add_child(marker, true)
 	marker.owner = active_scene_root
 	marker.transform = local_transform
 	# Print to console
@@ -786,9 +834,23 @@ func setup_physics_body(parent: Node, node_name: String, transform: Transform3D,
 	# Create the StaticBody3D node
 	var body := StaticBody3D.new()
 	body.name = node_name
-	parent.add_child(body)
+	parent.add_child(body, true)
 	body.owner = active_scene_root
 	body.transform = Common.physics_body_transform(transform)
+
+	_populate_collision_shapes(body, transform, mesh_name, meshes_lib)
+	return body
+
+
+func _populate_collision_shapes(body: StaticBody3D, transform: Transform3D, mesh_name: String, meshes_lib: Dictionary) -> void:
+	"""Populates CollisionShape3D children on `body` from `meshes_lib[mesh_name].collision`,
+	baking any Jolt-unsafe scale from `transform` into the shapes."""
+	var mesh_data = meshes_lib.get(mesh_name, {})
+	if not (mesh_data is Dictionary):
+		return
+	var collision = mesh_data.get("collision", null)
+	if collision == null or not (collision is Dictionary):
+		return
 
 	# Vector3.ONE for a uniformly scaled prop, in which case every shape below is
 	# built exactly as it was before and the body keeps its scale.
@@ -809,7 +871,7 @@ func setup_physics_body(parent: Node, node_name: String, transform: Transform3D,
 
 			var shape_node := CollisionShape3D.new()
 			shape_node.name = "BoxCollision"
-			body.add_child(shape_node)
+			body.add_child(shape_node, true)
 			shape_node.owner = active_scene_root
 
 			var local := get_transform_from_dict(local_trans)
@@ -834,7 +896,7 @@ func setup_physics_body(parent: Node, node_name: String, transform: Transform3D,
 
 			var shape_node := CollisionShape3D.new()
 			shape_node.name = "SphereCollision"
-			body.add_child(shape_node)
+			body.add_child(shape_node, true)
 			shape_node.owner = active_scene_root
 
 			var sphere_shape := SphereShape3D.new()
@@ -861,7 +923,7 @@ func setup_physics_body(parent: Node, node_name: String, transform: Transform3D,
 
 			var shape_node := CollisionShape3D.new()
 			shape_node.name = "CapsuleCollision"
-			body.add_child(shape_node)
+			body.add_child(shape_node, true)
 			shape_node.owner = active_scene_root
 
 			var local := get_transform_from_dict(local_trans)
@@ -894,7 +956,7 @@ func setup_physics_body(parent: Node, node_name: String, transform: Transform3D,
 
 			var shape_node := CollisionShape3D.new()
 			shape_node.name = "ConvexCollision"
-			body.add_child(shape_node)
+			body.add_child(shape_node, true)
 			shape_node.owner = active_scene_root
 
 			var local := get_transform_from_dict(local_trans)
@@ -913,14 +975,13 @@ func setup_physics_body(parent: Node, node_name: String, transform: Transform3D,
 				# glTF axis order (X, Z, Y), cm -> m, matching the mesh geometry.
 				points.append(point_map * (Vector3(float(v[0]), float(v[2]), float(v[1])) * 0.01))
 			if points.is_empty():
-				shape_node.queue_free()
+				shape_node.free()
 				continue
 			convex_shape.points = points
 
 			shape_node.shape = convex_shape
-			shape_node.transform = Common.scaled_shape_transform(local, scale)
-
-	return body
+			# Not scaled_shape_transform(): point_map already mirrored the points.
+			shape_node.transform = Transform3D(local.basis, local.origin * scale)
 
 
 func _note_approximate_collision(mesh_name: String, shape_kind: String) -> void:
@@ -944,28 +1005,12 @@ func apply_materials_to_instance(instanced_mesh: Node3D, mesh_name: String, over
 	var mesh_instances: Array[MeshInstance3D] = []
 	_find_mesh_instances_recursive(instanced_mesh, mesh_instances)
 	
-	# Helper to find a material entry in a list by name or slot index
-	var find_in_list = func(mat_list: Array, mat_name: String, slot_idx: int) -> Dictionary:
-		# By name first
-		for mat in mat_list:
-			if not (mat is Dictionary):
-				continue
-			var o_name: String = Common.get_str(mat, "material_name", "")
-			if o_name != "" and o_name != "None" and mat_name != "" and o_name.to_lower() == mat_name.to_lower():
-				return mat
-		# By slot index
-		for mat in mat_list:
-			if not (mat is Dictionary):
-				continue
-			if int(mat.get("slot_index", -1)) == slot_idx:
-				return mat
-		return {}
-
 	# Apply overrides on a per-MeshInstance3D basis
 	for mesh_inst in mesh_instances:
 		if not mesh_inst.mesh:
 			continue
 		var surface_count: int = mesh_inst.mesh.get_surface_count()
+		var claimed := {}
 		for slot_idx in range(surface_count):
 			var existing_mat = mesh_inst.get_active_material(slot_idx)
 			if not existing_mat:
@@ -977,7 +1022,7 @@ func apply_materials_to_instance(instanced_mesh: Node3D, mesh_name: String, over
 			
 			# Resolve the default material first so we know the true Unreal slot_index
 			# even when the glTF dropped unused material slots and shifted indices.
-			var default_data = find_in_list.call(default_mats, mat_name, slot_idx)
+			var default_data := Common.find_material_entry(default_mats, mat_name, slot_idx, claimed)
 			var unreal_slot_idx: int = int(default_data.get("slot_index", slot_idx)) if default_data.size() > 0 else slot_idx
 
 			# Check override_mats by slot index (not by the default material's name,
@@ -1066,21 +1111,298 @@ func _apply_component_render_flags(target_node: Node, instanced_mesh: Node, comp
 		for mi in instances:
 			if not cast_shadow:
 				mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-			# Only set visibility_range_end when no LOD band already capped it.
-			if has_max_draw and absf(mi.visibility_range_end) < 1e-4:
-				mi.visibility_range_end = float(max_draw)
+			if has_max_draw:
+				var max_d := float(max_draw)
+				# Clamp LOD visibility bands against max_draw_distance_m; hide
+				# LODs whose range starts beyond the cull distance altogether.
+				if mi.visibility_range_begin >= max_d:
+					mi.visible = false
+				elif absf(mi.visibility_range_end) < 1e-4 or mi.visibility_range_end > max_d:
+					mi.visibility_range_end = max_d
 
 
 func _index_existing_actors(node: Node, out: Dictionary) -> void:
-	"""Recursively indexes existing nodes by their unreal_actor_id metadata."""
+	"""Recursively indexes existing nodes by their unreal_actor_id metadata. An id maps
+	to a list: every copy of a Level Instance carries the same actor guids."""
 	if node == null:
 		return
 	if node.has_meta("unreal_actor_id"):
 		var aid := str(node.get_meta("unreal_actor_id"))
 		if aid != "":
-			out[aid] = node
+			if not out.has(aid):
+				out[aid] = []
+			out[aid].append(node)
 	for child in node.get_children():
 		_index_existing_actors(child, out)
+
+
+func _take_existing(existing_by_id: Dictionary, actor_id: String, actor_transform: Transform3D, components: Array) -> Node:
+	"""Removes and returns the indexed node nearest to the actor's placement, or null."""
+	var candidates: Array = existing_by_id.get(actor_id, [])
+	var target := actor_transform.origin
+	if components.size() == 1 and components[0] is Dictionary:
+		target = component_world_transform(components[0], actor_transform).origin
+	var best: Node = null
+	var best_dist := INF
+	for node in candidates:
+		if not is_instance_valid(node):
+			continue
+		var dist: float = (node as Node3D).position.distance_squared_to(target) if node is Node3D else 0.0
+		if best == null or dist < best_dist:
+			best = node
+			best_dist = dist
+	candidates.erase(best)
+	return best
+
+
+func _structure_signature(components: Array, actor_transform: Transform3D, meshes_lib: Dictionary) -> String:
+	"""Identifies everything about an actor an in-place update cannot change, as
+	"<models found>|<hash>"."""
+	var found := 0
+	var parts: Array = []
+	for comp in components:
+		if not (comp is Dictionary):
+			continue
+		var mesh_name := Common.get_str(comp, "mesh_name", "")
+		var mesh_key := Common.get_str(comp, "mesh_key", mesh_name)
+		var has_model := find_model_for(active_models_folder, mesh_key, mesh_name) != ""
+		found += 1 if has_model else 0
+		var mesh_entry = meshes_lib.get(mesh_key)
+		var has_shapes: bool = mesh_entry is Dictionary and mesh_entry.get("collision") is Dictionary
+		var slots: Array = []
+		for ov in (comp.get("material_overrides") if comp.get("material_overrides") is Array else []):
+			if ov is Dictionary:
+				slots.append([ov.get("slot_index"), ov.get("material_name")])
+		# Only a mesh with LODs depends on scale: its switch distances carry it.
+		var lods = mesh_entry.get("lods") if mesh_entry is Dictionary else null
+		var lod_scale := ""
+		if lods is Array and (lods as Array).size() > 1:
+			lod_scale = "%.2f" % _max_scale(component_world_transform(comp, actor_transform))
+		parts.append([Common.get_str(comp, "name", ""), mesh_key, has_model, has_shapes,
+			bool(comp.get("collision_enabled", true)), bool(comp.get("cast_shadow", true)),
+			comp.get("max_draw_distance_m"), comp.get("spline_mesh"), comp.get("vertex_paint"), slots, lod_scale])
+	return "%d|%s" % [found, JSON.stringify(parts).md5_text()]
+
+
+static func _max_scale(xform: Transform3D) -> float:
+	var s := xform.basis.get_scale().abs()
+	return maxf(s.x, maxf(s.y, s.z))
+
+
+func _needs_rebuild(node: Node, signature: String, components: Array) -> bool:
+	"""Whether an imported node no longer has the structure the layout asks for. Never
+	true when that would trade a model on screen for a missing one."""
+	var found := int(signature.get_slice("|", 0))
+	if node.has_meta("unreal_structure"):
+		var old := str(node.get_meta("unreal_structure"))
+		return old != signature and (found == components.size() or found >= int(old.get_slice("|", 0)))
+	# Imported before signatures existed: compare what is in the scene.
+	if found < components.size() or node.scene_file_path.ends_with(".tscn"):
+		return false
+	var is_model := node.scene_file_path != ""
+	if components.size() > 1:
+		if is_model or node is StaticBody3D:
+			return true
+		for comp in components:
+			var comp_name := Common.get_str(comp, "name", "") if comp is Dictionary else ""
+			if comp_name != "" and node.get_node_or_null(NodePath(comp_name.validate_node_name())) == null:
+				return true
+		return false
+	if not (components[0] is Dictionary):
+		return false
+	if is_model:
+		return not _is_imported_mesh(node, components[0])
+	if node is StaticBody3D:
+		for child in node.get_children():
+			if _is_imported_mesh(child, components[0]):
+				return false
+		return true
+	var only_name := Common.get_str(components[0], "name", "").validate_node_name()
+	return only_name != "" and node.has_node(NodePath(only_name))
+
+
+func _stamp_structure(node: Node, signature: String) -> void:
+	"""Records what the importer built, so a re-import can tell a structural change
+	from a move, and the importer's own nodes from ones the user added."""
+	node.set_meta("unreal_structure", signature)
+	var paths := PackedStringArray()
+	for child in _owned_descendants(node, active_scene_root):
+		# Collision shapes are recognised by name instead; hulls can run to dozens.
+		if not (child is CollisionShape3D):
+			paths.append(String(node.get_path_to(child)))
+	node.set_meta("unreal_nodes", paths)
+
+
+func _owned_descendants(node: Node, node_owner: Node) -> Array[Node]:
+	var out: Array[Node] = []
+	for child in node.get_children():
+		if child.owner == node_owner:
+			out.append(child)
+		out.append_array(_owned_descendants(child, node_owner))
+	return out
+
+
+func _finish_rebuild(rebuild: Dictionary) -> void:
+	"""Swaps in the actor the loop just re-imported, if it was a rebuild."""
+	if rebuild.is_empty():
+		return
+	var parent: Node = rebuild["parent"]
+	if parent.get_child_count() <= int(rebuild["count"]):
+		return
+	var fresh := parent.get_child(-1)
+	if fresh is Marker3D:
+		# Its model would not load after all; the old one is better than a marker.
+		fresh.free()
+		return
+	_merge_rebuilt(rebuild["old"], fresh, active_scene_root, active_scene_root)
+
+
+func _merge_rebuilt(old: Node, fresh: Node, old_owner: Node, fresh_owner: Node) -> Node:
+	"""Replaces what the importer built under `old` with `fresh`, carrying over what the
+	user added: nodes, scripts, groups and signal connections. Keeps the `old` node
+	itself where its type allows, so references to it survive. Returns the survivor."""
+	var user_nodes: Array = []
+	var scripted: Array = []
+	_split_user_content(old, old, old_owner, old.get_meta("unreal_nodes") if old.has_meta("unreal_nodes") else null, user_nodes, scripted)
+
+	var moved_frame := _is_mesh_root(old) != _is_mesh_root(fresh)
+	for item in user_nodes:
+		var node: Node = item["node"]
+		var dest := fresh.get_node_or_null(item["parent"])
+		_move_node(node, dest if dest != null else fresh, old_owner, fresh_owner)
+		if not (node is Node3D):
+			continue
+		if dest == null:
+			(node as Node3D).transform = item["in_actor"]
+		# The actor frame itself changed (a mesh's axes against an actor's): stay put.
+		if moved_frame and (dest == null or dest == fresh) and old is Node3D and fresh is Node3D:
+			var in_scene: Transform3D = (old as Node3D).transform * item["in_actor"]
+			(node as Node3D).transform = (fresh as Node3D).transform.affine_inverse() * in_scene
+
+	var survivor := fresh
+	var keeps_old := old.get_class() == fresh.get_class() and old.scene_file_path == "" and fresh.scene_file_path == ""
+	if keeps_old:
+		survivor = old
+		for child in old.get_children():
+			child.free()
+		for child in fresh.get_children():
+			_move_node(child, old, fresh_owner, old_owner)
+		if old is Node3D:
+			(old as Node3D).transform = (fresh as Node3D).transform
+			(old as Node3D).visible = (fresh as Node3D).visible
+		for key in fresh.get_meta_list():
+			old.set_meta(key, fresh.get_meta(key))
+		if fresh.get_parent() != null and old.get_parent() != fresh.get_parent():
+			_move_node(old, fresh.get_parent(), old_owner, old_owner)
+	else:
+		for key in old.get_meta_list():
+			if not fresh.has_meta(key) and not String(key).begins_with("unreal_"):
+				fresh.set_meta(key, old.get_meta(key))
+		if fresh.get_parent() == old.get_parent():
+			fresh.get_parent().move_child(fresh, old.get_index())
+
+	for item in scripted:
+		var target := survivor.get_node_or_null(item["path"])
+		if target == null:
+			report.warn("'%s': %s no longer exists in Unreal, so the script or groups on it were dropped." % [old.name, item["path"]])
+			continue
+		for group in item["groups"]:
+			target.add_to_group(group, true)
+		var script: Script = item["script"]
+		if script == null or target.get_script() != null:
+			continue
+		if not ClassDB.is_parent_class(target.get_class(), script.get_instance_base_type()):
+			report.warn("'%s' is now a %s, so its script %s (for %s) could not be kept." % [old.name, target.get_class(), script.resource_path, script.get_instance_base_type()])
+			continue
+		target.set_script(script)
+		for prop in item["values"]:
+			target.set(prop, item["values"][prop])
+
+	if keeps_old:
+		fresh.free()
+	else:
+		# After the scripts: their methods and signals are what is connected.
+		_copy_connections(old, fresh)
+		var kept_name := old.name
+		old.free()
+		fresh.name = kept_name
+	return survivor
+
+
+func _split_user_content(node: Node, actor: Node, node_owner: Node, recorded, user_nodes: Array, scripted: Array) -> void:
+	"""Sorts an actor's subtree into nodes the user added (topmost only) and imported
+	nodes the user put a script or group on."""
+	var path := actor.get_path_to(node)
+	var groups := node.get_groups().filter(func(g): return not String(g).begins_with("_"))
+	var script = node.get_script()
+	if script != null or not groups.is_empty():
+		var values := {}
+		if script != null:
+			for prop in script.get_script_property_list():
+				if int(prop["usage"]) & PROPERTY_USAGE_STORAGE:
+					values[prop["name"]] = node.get(prop["name"])
+		scripted.append({"path": path, "script": script, "values": values, "groups": groups})
+	for child in node.get_children():
+		# A node inside a model belongs to that model's scene, so it is never the user's.
+		if (child.owner == null or child.owner == node_owner) and not _is_generated(child, actor, recorded):
+			var local := Transform3D.IDENTITY
+			var up: Node = child
+			while up != actor:
+				if up is Node3D:
+					local = (up as Node3D).transform * local
+				up = up.get_parent()
+			user_nodes.append({"node": child, "parent": path, "in_actor": local})
+		else:
+			_split_user_content(child, actor, node_owner, recorded, user_nodes, scripted)
+
+
+func _is_generated(node: Node, actor: Node, recorded) -> bool:
+	if node is CollisionShape3D and (node.get_parent() is StaticBody3D or node.get_parent() is PhysicalBone3D) and node.get_script() == null:
+		for prefix in ["BoxCollision", "SphereCollision", "CapsuleCollision", "ConvexCollision"]:
+			if String(node.name).begins_with(prefix):
+				return true
+	if recorded != null:
+		return String(actor.get_path_to(node)) in recorded
+	# shortcut: scenes imported before paths were recorded are judged by node kind, so a
+	# user's own model dropped in from the models folder reads as imported; a rebuild or
+	# a fresh import records the paths.
+	if node.get_script() != null:
+		return false
+	return node is StaticBody3D or node is PhysicalBone3D or node.is_class("PhysicalBoneSimulator3D") 		or node.has_meta("unreal_lod_index") or String(node.name).contains("_MISSING_") 		or (node.scene_file_path != "" and node.scene_file_path.get_base_dir() == active_models_folder.trim_suffix("/"))
+
+
+static func _is_mesh_root(node: Node) -> bool:
+	"""True for a single-mesh actor, whose node sits in the mesh's axes."""
+	return node is StaticBody3D or (node.scene_file_path != "" and not node.scene_file_path.ends_with(".tscn"))
+
+
+func _move_node(node: Node, parent: Node, old_owner: Node, new_owner: Node) -> void:
+	"""Reparents `node`, handing it and everything `old_owner` owned under it to
+	`new_owner` (leaving the tree clears owners)."""
+	var owned := _owned_descendants(node, old_owner)
+	owned.append(node)
+	for n in owned:
+		n.owner = null
+	node.get_parent().remove_child(node)
+	parent.add_child(node, true)
+	for n in owned:
+		n.owner = new_owner
+
+
+func _copy_connections(from: Node, to: Node) -> void:
+	"""Re-makes the saved signal connections of `from` on `to`."""
+	for sig in from.get_signal_list():
+		if not to.has_signal(sig["name"]):
+			continue
+		for c in from.get_signal_connection_list(sig["name"]):
+			var cb: Callable = c["callable"]
+			if int(c["flags"]) & CONNECT_PERSIST and cb.get_object() != null:
+				var target: Object = to if cb.get_object() == from else cb.get_object()
+				to.connect(sig["name"], Callable(target, cb.get_method()), c["flags"])
+	for c in from.get_incoming_connections():
+		var source: Signal = c["signal"]
+		if int(c["flags"]) & CONNECT_PERSIST and source.get_object() != from:
+			source.connect(Callable(to, (c["callable"] as Callable).get_method()), c["flags"])
 
 
 func _set_aside_feature_containers() -> Dictionary:
@@ -1090,6 +1412,9 @@ func _set_aside_feature_containers() -> Dictionary:
 		var old := active_scene_root.get_node_or_null(container_name)
 		if old != null:
 			old.name = container_name + "_previous"
+			# Out of the navigation bake until merged, or it bakes stale geometry too.
+			if old.is_in_group(Common.NAV_SOURCE_GROUP):
+				old.remove_from_group(Common.NAV_SOURCE_GROUP)
 			previous[container_name] = old
 	return previous
 
@@ -1102,6 +1427,8 @@ func _merge_feature_containers(previous: Dictionary) -> void:
 	for container_name in FEATURE_CONTAINERS:
 		var fresh := active_scene_root.get_node_or_null(container_name)
 		if fresh != null and fresh.is_queued_for_deletion():
+			# Still attached until the queue runs, so it would keep the name.
+			fresh.free()
 			fresh = null
 		if fresh != null:
 			for child in fresh.get_children():
@@ -1109,32 +1436,40 @@ func _merge_feature_containers(previous: Dictionary) -> void:
 		if not previous.has(container_name):
 			continue
 		var old: Node = previous[container_name]
-		if fresh != null:
-			for child in old.get_children():
-				if not child.has_meta("unreal_generated"):
-					continue
-				if child.get_script() != null or child.get_child_count() > 0:
+		for child in old.get_children():
+			if not child.has_meta("unreal_generated"):
+				continue
+			if child.get_script() != null or child.get_child_count() > 0:
+				if fresh != null:
 					var twin := fresh.get_node_or_null(NodePath(child.name))
 					if twin != null:
 						twin.free()
-					continue
-				child.free()
+				continue
+			child.free()
+		if fresh != null:
 			for child in fresh.get_children():
 				child.reparent(old, false)
 			fresh.free()
-		old.name = container_name
+		if fresh == null and old.get_child_count() == 0:
+			old.free()
+		else:
+			old.name = container_name
+			if container_name == "UnrealFoliage":
+				old.add_to_group(Common.NAV_SOURCE_GROUP, true)
 
 
 func _update_existing_actor_node(existing_node: Node, desired_parent: Node,
 		actor_transform: Transform3D, actor_data: Dictionary,
-		components: Array, gameplay_helper) -> void:
+		components: Array, gameplay_helper, meshes_lib: Dictionary = {}) -> void:
 	"""Updates an existing actor's transform, folder parent, visibility, and
 	metadata in place without destroying user scripts or custom child nodes."""
 	if desired_parent != null and existing_node.get_parent() != desired_parent:
 		if existing_node.get_parent() != null:
-			existing_node.get_parent().remove_child(existing_node)
-		desired_parent.add_child(existing_node)
+			existing_node.reparent(desired_parent, false)
+		else:
+			desired_parent.add_child(existing_node)
 		existing_node.owner = active_scene_root
+		_set_owner_recursive(existing_node, active_scene_root)
 
 	if existing_node is Node3D:
 		var n3d := existing_node as Node3D
@@ -1143,16 +1478,157 @@ func _update_existing_actor_node(existing_node: Node, desired_parent: Node,
 			var world := component_world_transform(comp0, actor_transform)
 			var mesh_place := Common.gltf_mesh_placement(world)
 			if existing_node is StaticBody3D:
-				n3d.transform = Common.physics_body_transform(mesh_place)
+				_update_existing_body(existing_node as StaticBody3D, mesh_place, comp0, meshes_lib)
 			else:
 				n3d.transform = mesh_place
 			if comp0.has("visible"):
 				n3d.visible = bool(comp0.get("visible", true))
+		elif n3d.scene_file_path != "":
+			# A shared prefab: its children belong to the .tscn, so only the instance moves.
+			n3d.transform = actor_transform
 		else:
-			n3d.transform = Common.physics_body_transform(actor_transform)
+			var actor_frame := Common.physics_body_transform(actor_transform)
+			n3d.transform = actor_frame
+			var actor_inverse := Transform3D.IDENTITY
+			if absf(actor_frame.basis.determinant()) > 1e-12:
+				actor_inverse = actor_frame.affine_inverse()
+			for comp_data in components:
+				if not (comp_data is Dictionary):
+					continue
+				var comp_name: String = Common.get_str(comp_data, "name", "")
+				if comp_name == "":
+					continue
+				var child := n3d.get_node_or_null(NodePath(comp_name.validate_node_name()))
+				if child is Node3D:
+					var comp_xform := actor_inverse * component_world_transform(comp_data, actor_transform)
+					var mesh_place := Common.gltf_mesh_placement(comp_xform)
+					if child is StaticBody3D:
+						_update_existing_body(child as StaticBody3D, mesh_place, comp_data, meshes_lib)
+					else:
+						(child as Node3D).transform = mesh_place
+					if comp_data.has("visible"):
+						(child as Node3D).visible = bool(comp_data.get("visible", true))
 
 	if gameplay_helper:
 		gameplay_helper.apply_actor_metadata(existing_node, actor_data, import_options)
+
+
+func _update_existing_body(body: StaticBody3D, mesh_place: Transform3D, comp_data: Dictionary, meshes_lib: Dictionary) -> void:
+	"""Moves an imported body and, when the scale baked into it changed, rescales its
+	meshes and rebuilds its collision. Nodes the user added under it stay as they are."""
+	var new_scale := Common.physics_body_scale(mesh_place)
+	body.transform = Common.physics_body_transform(mesh_place)
+	var mesh_key: String = Common.get_str(comp_data, "mesh_key", Common.get_str(comp_data, "mesh_name", ""))
+	var scale_changed := false
+	for child in body.get_children():
+		if not (child is Node3D) or not _is_imported_mesh(child, comp_data):
+			continue
+		# Not Basis.get_scale(): it negates all three axes of a mirrored basis, where
+		# physics_body_scale() folds the mirror into X.
+		if not Common.basis_local_scale((child as Node3D).transform.basis).is_equal_approx(new_scale):
+			scale_changed = true
+			(child as Node3D).transform = Transform3D(Basis.from_scale(new_scale), Vector3.ZERO)
+	if scale_changed and mesh_key != "" and not meshes_lib.is_empty():
+		for child in body.get_children():
+			if child is CollisionShape3D and child.get_script() == null and child.get_child_count() == 0:
+				child.free()
+		_populate_collision_shapes(body, mesh_place, mesh_key, meshes_lib)
+
+
+func _is_imported_mesh(node: Node, comp_data: Dictionary) -> bool:
+	"""Whether a body's child is a mesh or LOD this importer put there, rather than
+	something the user added (possibly a model or scene instance of their own)."""
+	if node.has_meta("unreal_lod_index"):
+		return true
+	# A model loaded from outside res:// has no scene file, only the name it was given.
+	var stem := node.scene_file_path.get_file().get_basename() if node.scene_file_path != "" else String(node.name)
+	for key in ["mesh_key", "mesh_name"]:
+		var mesh := Common.get_str(comp_data, key, "")
+		if mesh != "" and stem.to_lower() == (mesh if node.scene_file_path != "" else mesh.validate_node_name()).to_lower():
+			return true
+	return false
+
+
+func _has_per_instance_geometry(components: Array) -> bool:
+	"""True when a component carries data of this one placement (spline, vertex
+	paint, material overrides), which a shared prefab would stamp on every copy."""
+	for comp in components:
+		if not (comp is Dictionary):
+			continue
+		for key in ["spline_mesh", "vertex_paint", "material_overrides"]:
+			var value = comp.get(key)
+			if (value is Dictionary or value is Array or value is String) and not value.is_empty():
+				return true
+	return false
+
+
+func _has_scaled_lods(components: Array, actor_transform: Transform3D, meshes_lib: Dictionary) -> bool:
+	"""True when the actor's own scale would have to change a shared prefab's LOD
+	switch distances."""
+	if not bool(import_options.get("apply_lods", true)) or is_equal_approx(_max_scale(actor_transform), 1.0):
+		return false
+	for comp in components:
+		if not (comp is Dictionary):
+			continue
+		var mesh_name := Common.get_str(comp, "mesh_name", "")
+		var mesh_key := Common.get_str(comp, "mesh_key", mesh_name)
+		var entry = meshes_lib.get(mesh_key)
+		if entry is Dictionary and entry.get("lods") is Array and (entry["lods"] as Array).size() > 1:
+			return true
+		if find_model_for(active_models_folder, mesh_key + "_LOD1", mesh_name + "_LOD1") != "":
+			return true
+	return false
+
+
+func _collect_prefab_templates(actors: Array, meshes_lib: Dictionary) -> Dictionary:
+	"""The structure each Blueprint's shared prefab has to have; only actors with that
+	signature use it. A prefab on disk stays the template while any actor still matches
+	it, since rebuilding it would change that actor too; otherwise the first actor wins."""
+	var out := {}
+	var settled := {}
+	for actor_data in actors:
+		if not (actor_data is Dictionary) or not (actor_data.get("components") is Array):
+			continue
+		var components: Array = actor_data["components"]
+		var key := _prefab_template_key(actor_data)
+		if components.size() < 2 or key == "" or settled.has(key) or _has_per_instance_geometry(components):
+			continue
+		var xform := get_transform_from_dict(actor_data["godot_transform"]) if actor_data.get("godot_transform") is Dictionary else Transform3D.IDENTITY
+		if Common.physics_body_scale(xform) == Vector3.ONE and not _has_scaled_lods(components, xform, meshes_lib):
+			var signature := _structure_signature(components, xform, meshes_lib)
+			if not out.has(key):
+				out[key] = signature
+			if signature == _saved_prefab_signature(_prefab_res_path(key, Common.get_str(actor_data, "class", "StaticMeshActor"))):
+				out[key] = signature
+				settled[key] = true
+	return out
+
+
+func _saved_prefab_signature(res_path: String) -> String:
+	"""The structure signature stored on a prefab's root, or '' when there is none."""
+	var scene = ResourceLoader.load(res_path) if res_path != "" and ResourceLoader.exists(res_path) else null
+	if scene is PackedScene:
+		var state := (scene as PackedScene).get_state()
+		for i in state.get_node_property_count(0):
+			if state.get_node_property_name(0, i) == &"metadata/unreal_structure":
+				return str(state.get_node_property_value(0, i))
+	return ""
+
+
+func _prefab_res_path(bp_key: String, actor_class: String) -> String:
+	var prefabs_folder := str(import_options.get("prefabs_folder", "res://prefabs/"))
+	if not prefabs_folder.begins_with("res://"):
+		return ""
+	var raw_name := actor_class if actor_class != "" else bp_key.get_file().get_basename()
+	var safe := ""
+	for i in raw_name.length():
+		var c := raw_name.unicode_at(i)
+		var ch := raw_name[i]
+		var ok := (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or (c >= 48 and c <= 57) or ch == "_" or ch == "-"
+		safe += ch if ok else "_"
+	if safe == "":
+		safe = "BlueprintPrefab"
+	return prefabs_folder.path_join(safe + ".tscn")
 
 
 func _prefab_template_key(actor_data: Dictionary) -> String:
@@ -1167,42 +1643,43 @@ func _prefab_template_key(actor_data: Dictionary) -> String:
 
 
 func _get_or_create_blueprint_prefab(bp_key: String, actor_class: String,
-		actor_transform: Transform3D, actor_frame: Transform3D, components: Array,
-		models_folder: String, meshes_lib: Dictionary, skel_physics_helper) -> PackedScene:
+		actor_transform: Transform3D, components: Array,
+		models_folder: String, meshes_lib: Dictionary, skel_physics_helper,
+		gameplay_helper = null, signature: String = "") -> PackedScene:
 	"""Builds (once) and saves a reusable res://prefabs/<Class>.tscn PackedScene
-	for a multi-component Blueprint actor, or reuses an existing one on disk."""
+	for a multi-component Blueprint actor. One already on disk is reused as it is, or
+	rebuilt around the user's additions when the Blueprint's components changed."""
 	if _prefab_cache.has(bp_key):
 		return _prefab_cache[bp_key] as PackedScene
 
-	var prefabs_folder := str(import_options.get("prefabs_folder", "res://prefabs/"))
-	if not prefabs_folder.begins_with("res://"):
+	var res_path := _prefab_res_path(bp_key, actor_class)
+	if res_path == "":
 		return null
 
-	var raw_name := actor_class if actor_class != "" else bp_key.get_file().get_basename()
-	var safe := ""
-	for i in raw_name.length():
-		var c := raw_name.unicode_at(i)
-		var ch := raw_name[i]
-		var ok := (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or (c >= 48 and c <= 57) or ch == "_" or ch == "-"
-		safe += ch if ok else "_"
-	if safe == "":
-		safe = "BlueprintPrefab"
-	var res_path := prefabs_folder.path_join(safe + ".tscn")
-
+	var stale: Node = null
 	if ResourceLoader.exists(res_path):
 		var existing = ResourceLoader.load(res_path)
 		if existing is PackedScene:
-			_prefab_cache[bp_key] = existing
-			return existing as PackedScene
+			stale = (existing as PackedScene).instantiate(PackedScene.GEN_EDIT_STATE_MAIN)
+			if stale != null:
+				stale.scene_file_path = ""
+			if stale == null or signature == "" or not _needs_rebuild(stale, signature, components):
+				if stale != null:
+					stale.free()
+				_prefab_cache[bp_key] = existing
+				return existing as PackedScene
 
 	var prefab_root := Node3D.new()
-	prefab_root.name = safe
+	prefab_root.name = res_path.get_file().get_basename()
 	var saved_owner := active_scene_root
 	active_scene_root = prefab_root
 
+	# Divide out the full actor_transform (including scale) so the shared prefab
+	# stores unit-scale local component transforms regardless of the first
+	# instance's world scale.
 	var actor_inverse := Transform3D.IDENTITY
-	if absf(actor_frame.basis.determinant()) > 1e-12:
-		actor_inverse = actor_frame.affine_inverse()
+	if absf(actor_transform.basis.determinant()) > 1e-12:
+		actor_inverse = actor_transform.affine_inverse()
 
 	for comp_data in components:
 		if not (comp_data is Dictionary):
@@ -1216,15 +1693,20 @@ func _get_or_create_blueprint_prefab(bp_key: String, actor_class: String,
 		if gltf_path == "":
 			continue
 		var want_collision := bool(comp_data.get("collision_enabled", true))
-		var physics_body = setup_physics_body(prefab_root, comp_name, mesh_place, mesh_key, meshes_lib) if want_collision else null
+		var spline_raw = comp_data.get("spline_mesh")
+		var has_spline := bool(import_options.get("apply_spline_meshes", true)) and (spline_raw is Dictionary) and not (spline_raw as Dictionary).is_empty()
+		var physics_body = setup_physics_body(prefab_root, comp_name, mesh_place, mesh_key, meshes_lib) if (want_collision and not has_spline) else null
 		var instanced_mesh = instance_gltf(gltf_path)
 		if instanced_mesh:
 			var overrides_raw = comp_data.get("material_overrides", [])
 			var overrides: Array = overrides_raw if overrides_raw is Array else []
 			apply_materials_to_instance(instanced_mesh, mesh_key, overrides, meshes_lib)
+			_apply_vertex_paint(instanced_mesh, mesh_key, comp_data, meshes_lib)
+			if has_spline:
+				SplineMeshHelper.deform_instance(instanced_mesh, spline_raw as Dictionary)
 			if physics_body:
 				instanced_mesh.name = mesh_name if mesh_name != "" else (mesh_key if mesh_key != "" else "Mesh")
-				physics_body.add_child(instanced_mesh)
+				physics_body.add_child(instanced_mesh, true)
 				physics_body.owner = prefab_root
 				instanced_mesh.owner = prefab_root
 				_set_owner_recursive(instanced_mesh, prefab_root)
@@ -1232,22 +1714,35 @@ func _get_or_create_blueprint_prefab(bp_key: String, actor_class: String,
 					Basis.from_scale(Common.physics_body_scale(mesh_place)), Vector3.ZERO)
 			else:
 				instanced_mesh.name = comp_name
-				prefab_root.add_child(instanced_mesh)
+				prefab_root.add_child(instanced_mesh, true)
 				instanced_mesh.owner = prefab_root
 				_set_owner_recursive(instanced_mesh, prefab_root)
 				instanced_mesh.transform = mesh_place
 			var target: Node = physics_body if physics_body else instanced_mesh
+			if bool(import_options.get("apply_lods", true)) and not has_spline:
+				var lod_parent: Node = physics_body if physics_body else instanced_mesh
+				var lod_xform: Transform3D = instanced_mesh.transform if physics_body else Transform3D.IDENTITY
+				_apply_lod_chain(instanced_mesh, lod_parent, lod_xform, mesh_key, mesh_name, overrides, meshes_lib, comp_data)
 			_apply_component_render_flags(target, instanced_mesh, comp_data)
 			if bool(import_options.get("apply_skeletal_physics", true)) and skel_physics_helper:
 				skel_physics_helper.attach_to_instance(instanced_mesh, mesh_key, models_folder, prefab_root, meshes_lib)
+			if gameplay_helper and gameplay_helper.has_method("apply_component_metadata"):
+				gameplay_helper.apply_component_metadata(target, comp_data, import_options)
 		elif physics_body:
-			physics_body.queue_free()
+			# free(), not queue_free(): prefab_root is packed before the queue runs.
+			physics_body.free()
 
+	_stamp_structure(prefab_root, signature)
 	active_scene_root = saved_owner
 
 	if prefab_root.get_child_count() == 0:
 		prefab_root.free()
+		if stale != null:
+			stale.free()
 		return null
+	var rebuilt := stale != null
+	if rebuilt:
+		prefab_root = _merge_rebuilt(stale, prefab_root, stale, prefab_root) as Node3D
 
 	var packed := PackedScene.new()
 	var pack_err := packed.pack(prefab_root)
@@ -1255,11 +1750,14 @@ func _get_or_create_blueprint_prefab(bp_key: String, actor_class: String,
 	if pack_err != OK:
 		return null
 
-	var dir_global := ProjectSettings.globalize_path(prefabs_folder)
+	var dir_global := ProjectSettings.globalize_path(res_path.get_base_dir())
 	if dir_global != "":
 		DirAccess.make_dir_recursive_absolute(dir_global)
 	var save_err := ResourceSaver.save(packed, res_path)
 	if save_err == OK:
+		if rebuilt:
+			# The old one is still cached under this path.
+			packed.take_over_path(res_path)
 		var reloaded = ResourceLoader.load(res_path)
 		if reloaded is PackedScene:
 			_prefab_cache[bp_key] = reloaded
@@ -1389,32 +1887,43 @@ func _apply_lod_chain(lod0_node: Node3D, lod_parent: Node, lod_transform: Transf
 
 	candidates.sort_custom(func(a, b): return int(a["lod_index"]) < int(b["lod_index"]))
 
+	# Only LODs that actually load count: LOD0 must not be culled for a missing one.
+	var loaded: Array = []
+	for c in candidates:
+		var inst := instance_gltf(str(c["path"]))
+		if inst != null:
+			c["instance"] = inst
+			loaded.append(c)
+	candidates = loaded
+	if candidates.is_empty():
+		return 0
+
+	# Unreal switches on screen size, so a mesh scaled up switches further out.
+	var scale := _max_scale(component_world_transform(comp_data, Transform3D.IDENTITY))
 	# Ensure strictly increasing switch distances.
 	var prev_dist := 0.0
 	for c in candidates:
-		var d := float(c["switch_distance_m"])
+		var d := float(c["switch_distance_m"]) * (scale if scale > 0.0 else 1.0)
 		if d <= prev_dist:
 			d = prev_dist + 10.0
 		c["switch_distance_m"] = d
 		prev_dist = d
 
-	# Set LOD0 visibility end at LOD1's switch distance BEFORE adding LOD1..N as children
+	# Set LOD0 visibility end at the next LOD's switch distance BEFORE adding LOD1..N as children
 	# of lod0_node (otherwise _set_visibility_range_recursive would overwrite them).
 	_set_visibility_range_recursive(lod0_node, 0.0, float(candidates[0]["switch_distance_m"]))
 
 	var wired := 0
 	for i in range(candidates.size()):
 		var entry: Dictionary = candidates[i]
-		var lod_inst := instance_gltf(str(entry["path"]))
-		if lod_inst == null:
-			continue
+		var lod_inst: Node3D = entry["instance"]
 		apply_materials_to_instance(lod_inst, mesh_key, overrides, meshes_lib)
 		_apply_vertex_paint(lod_inst, mesh_key, comp_data, meshes_lib)
 		var r_begin := float(entry["switch_distance_m"])
 		var r_end := float(candidates[i + 1]["switch_distance_m"]) if (i + 1 < candidates.size()) else 0.0
 		_set_visibility_range_recursive(lod_inst, r_begin, r_end)
 		lod_inst.name = "%s_LOD%d" % [mesh_name if mesh_name != "" else mesh_key, int(entry["lod_index"])]
-		lod_parent.add_child(lod_inst)
+		lod_parent.add_child(lod_inst, true)
 		lod_inst.owner = active_scene_root
 		_set_owner_recursive(lod_inst, active_scene_root)
 		lod_inst.transform = lod_transform
@@ -1432,27 +1941,44 @@ func get_or_create_material(mat_name: String, mat_path: String, params: Dictiona
 	"""
 	var has_path := mat_path != "" and mat_path != "None"
 	var has_name := mat_name != "" and mat_name != "None"
-	if has_path and material_cache.has(mat_path):
-		return material_cache[mat_path]
-	if has_name and material_cache.has(mat_name):
+	if has_path:
+		if material_cache.has(mat_path):
+			return material_cache[mat_path]
+	elif has_name and material_cache.has(mat_name):
 		return material_cache[mat_name]
 
 	var tres_path := ""
+	var outdated: Material = null
+	var params_hash := JSON.stringify(params).md5_text()
 	if bool(import_options.get("save_external_materials", false)) and (has_name or has_path):
 		tres_path = _external_material_res_path(mat_name, mat_path)
 		if tres_path != "" and ResourceLoader.exists(tres_path):
 			var existing_res = ResourceLoader.load(tres_path)
-			if existing_res is Material:
+			# One saved from other parameters is out of date. No hash: saved before
+			# hashes were kept, or the user's own, so leave it alone.
+			if existing_res is Material and existing_res.get_meta("unreal_params", params_hash) == params_hash:
 				if has_path:
 					material_cache[mat_path] = existing_res
 				elif has_name:
 					material_cache[mat_name] = existing_res
 				return existing_res as Material
+			if existing_res is Material:
+				outdated = existing_res
 
 	var mat := create_godot_material(params, existing_mat)
 	mat.resource_name = mat_name
 
 	if tres_path != "":
+		mat.set_meta("unreal_params", params_hash)
+		mat.set_meta("unreal_material", mat_path if has_path else mat_name)
+		if outdated != null and outdated.get_class() == mat.get_class():
+			# In place: nodes already in the scene hold this resource.
+			for prop in mat.get_property_list():
+				if int(prop["usage"]) & PROPERTY_USAGE_STORAGE and not prop["name"] in ["resource_path", "resource_local_to_scene"]:
+					outdated.set(prop["name"], mat.get(prop["name"]))
+			mat = outdated
+		elif outdated != null:
+			mat.take_over_path(tres_path)
 		var dir_global := ProjectSettings.globalize_path(tres_path.get_base_dir())
 		if dir_global != "":
 			DirAccess.make_dir_recursive_absolute(dir_global)
@@ -1490,11 +2016,16 @@ func _external_material_res_path(mat_name: String, mat_path: String) -> String:
 		safe = "Material"
 	var key := safe.to_lower()
 	var identity := mat_path if (mat_path != "" and mat_path != "None") else mat_name
-	if _external_mat_paths.has(key) and _external_mat_paths[key] != identity:
-		safe = "%s_%s" % [safe, identity.md5_text().substr(0, 8)]
-	else:
-		_external_mat_paths[key] = identity
-	return folder.path_join(safe + ".tres")
+	var plain := folder.path_join(safe + ".tres")
+	var taken: bool = _external_mat_paths.get(key, identity) != identity
+	if not taken and ResourceLoader.exists(plain):
+		# Saved by an earlier import, possibly for another level's same-named material.
+		var saved = ResourceLoader.load(plain)
+		taken = saved is Resource and saved.get_meta("unreal_material", identity) != identity
+	if taken:
+		return folder.path_join("%s_%s.tres" % [safe, identity.md5_text().substr(0, 8)])
+	_external_mat_paths[key] = identity
+	return plain
 
 
 func _collect_normal_map_targets(data: Dictionary) -> Dictionary:
@@ -1560,10 +2091,11 @@ func _load_normal_texture(tex_path: String, tex_stem: String) -> Texture2D:
 	if not tex_path.begins_with("res://") and want_flip:
 		if _external_normal_cache.has(tex_path):
 			return _external_normal_cache[tex_path]
-		var img := Image.load_from_file(tex_path)
+		var img := Common.load_image_file(tex_path)
 		if img != null:
-			var flipped := TextureLimit.invert_green_channel(img)
-			var tex := ImageTexture.create_from_image(flipped)
+			# Flip before the mipmaps are built: only the top level is rewritten.
+			img.clear_mipmaps()
+			var tex := Common.texture_from_image(TextureLimit.invert_green_channel(img))
 			_external_normal_cache[tex_path] = tex
 			return tex
 	return load_texture(tex_path)
@@ -1580,7 +2112,11 @@ func _combine_albedo_and_opacity(albedo_path: String, opacity_path: String,
 	var op_img := Common.load_image_file(opacity_path)
 	if op_img == null:
 		return null
+	# load_image_file() decompresses; null means unreadable, where the caller keeps
+	# the plain albedo rather than a white one.
 	var alb_img: Image = Common.load_image_file(albedo_path) if albedo_path != "" else null
+	if albedo_path != "" and alb_img == null:
+		return null
 	var w := alb_img.get_width() if alb_img != null else op_img.get_width()
 	var h := alb_img.get_height() if alb_img != null else op_img.get_height()
 	if w <= 0 or h <= 0:
@@ -1662,10 +2198,12 @@ func create_godot_material(params: Dictionary, existing_mat: Material = null) ->
 	match blend_mode:
 		"masked":
 			mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR
+			mat.blend_mode = BaseMaterial3D.BLEND_MODE_MIX
 			mat.alpha_scissor_threshold = clampf(
 				Common.get_num(params, "opacity_mask_clip_value", 0.3333), 0.0, 1.0)
 		"translucent":
 			mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+			mat.blend_mode = BaseMaterial3D.BLEND_MODE_MIX
 			var op := clampf(Common.get_num(params, "opacity", 1.0), 0.0, 1.0)
 			if op < 1.0:
 				mat.albedo_color.a *= op
@@ -1675,8 +2213,10 @@ func create_godot_material(params: Dictionary, existing_mat: Material = null) ->
 			var op := clampf(Common.get_num(params, "opacity", 1.0), 0.0, 1.0)
 			if op < 1.0:
 				mat.albedo_color.a *= op
-	if bool(params.get("two_sided", false)):
-		mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+		_:
+			mat.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
+			mat.blend_mode = BaseMaterial3D.BLEND_MODE_MIX
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED if bool(params.get("two_sided", false)) else BaseMaterial3D.CULL_BACK
 
 	# 5. Find and load textures (Only override if a valid file path is resolved on disk)
 	var albedo_tex: String = _safe_str(params.get("albedo_texture"))
@@ -1748,6 +2288,8 @@ func create_godot_material(params: Dictionary, existing_mat: Material = null) ->
 	var emissive_energy := maxf(0.0, Common.get_num(params, "emissive_energy", 1.0))
 
 	# A color multiplies the map, so an explicit black one switches it off.
+	# Reset first so duplicating an emissive existing_mat does not leak emission.
+	mat.emission_enabled = false
 	if emissive_tex != "" and (has_emissive_color or not (emissive_raw is Array)):
 		var tex_path := find_texture_path(active_textures_folder, emissive_tex)
 		if tex_path != "":

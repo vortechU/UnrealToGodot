@@ -66,6 +66,18 @@ def _b(value, default=False):
         return default
 
 
+def _actor_is_hidden(actor):
+    """True when the actor itself is hidden in editor or hidden in game."""
+    if actor is None:
+        return False
+    try:
+        if hasattr(actor, "is_hidden_ed") and bool(actor.is_hidden_ed()):
+            return True
+    except Exception:
+        pass
+    return _b(ue2g_common.safe_get_prop(actor, "hidden", False), False)
+
+
 def _cull_distances_m(comp):
     """
     UE's per-instance cull pair (cm) as Godot metres, or (None, None) when the
@@ -185,7 +197,8 @@ def collect_foliage(all_actors, register_mesh, collected_textures=None):
                     "source": source,
                     "visible": (_b(ue2g_common.safe_get_prop(comp, "visible", True), True)
                                 and not _b(ue2g_common.safe_get_prop(
-                                    comp, "hidden_in_game", False), False)),
+                                    comp, "hidden_in_game", False), False)
+                                and not _actor_is_hidden(actor)),
                     "cast_shadow": _b(ue2g_common.safe_get_prop(comp, "cast_shadow", True), True),
                     "cull_begin_m": cull_begin_m,
                     "cull_end_m": cull_end_m,

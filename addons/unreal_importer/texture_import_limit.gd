@@ -63,6 +63,48 @@ static func find_textures(folder: String) -> PackedStringArray:
 	return out
 
 
+static func layout_texture_names(json_path: String) -> Dictionary:
+	## Lowercase filename stems of every texture the layout uses, as a set.
+	var names := {}
+	if FileAccess.file_exists(json_path):
+		_collect_texture_names(JSON.parse_string(FileAccess.get_file_as_string(json_path)), names)
+	return names
+
+
+static func _collect_texture_names(value, names: Dictionary) -> void:
+	if value is Array:
+		for item in value:
+			_collect_texture_names(item, names)
+	if not (value is Dictionary):
+		return
+	for key in value:
+		var item = value[key]
+		var found: Array = []
+		if key == "texture_metadata" and item is Dictionary:
+			found = item.keys()
+		elif key == "texture_paths" and item is Dictionary:
+			# A shader's slots: uniform -> Unreal path, its file name sits beside this.
+			for uniform in item:
+				found.append(value.get(uniform))
+		elif key == "textures" and item is Dictionary:
+			found = item.values()
+		elif item is String and (key == "texture" or str(key).ends_with("_texture")):
+			found = [item]
+		for tex_name in found:
+			if tex_name is String and tex_name != "":
+				names[tex_name.to_lower()] = true
+		if item is Array or item is Dictionary:
+			_collect_texture_names(item, names)
+
+
+static func _named_textures(folder: String, names) -> PackedStringArray:
+	var out := PackedStringArray()
+	for tex_path in find_textures(folder):
+		if names == null or names.has(tex_path.get_file().get_basename().to_lower()):
+			out.append(tex_path)
+	return out
+
+
 static func _rewrite_import_param(import_path: String, param_key: String, value_str: String,
 		add_if_missing: bool = true) -> bool:
 	## Sets `<param_key>=<value_str>` inside the [params] section of an existing
@@ -199,8 +241,10 @@ static func target_size(width: int, height: int, size_limit: int) -> Vector2i:
 	return Vector2i(maxi(1, roundi(width * scale)), maxi(1, roundi(height * scale)))
 
 
-static func shrink_source_files(folder: String, size_limit: int) -> Dictionary:
+static func shrink_source_files(folder: String, size_limit: int, names = null) -> Dictionary:
 	## Rewrites oversized exported PNGs on disk at the capped size.
+	## `names` (see layout_texture_names) limits it to the layout's own textures: the
+	## folders searched also hold the project's other art.
 	##
 	## This is destructive and cannot be undone from inside Godot -- the source
 	## art only exists back in Unreal. It is deliberately limited to .png, the
@@ -219,7 +263,7 @@ static func shrink_source_files(folder: String, size_limit: int) -> Dictionary:
 		return result
 
 	var changed := PackedStringArray()
-	for tex_path in find_textures(folder):
+	for tex_path in _named_textures(folder, names):
 		result["total"] += 1
 		if not tex_path.to_lower().ends_with(".png"):
 			result["skipped"] += 1
@@ -274,11 +318,11 @@ static func _file_size(path: String) -> int:
 	return size
 
 
-static func apply_to_folder(folder: String, size_limit: int) -> Dictionary:
-	## Caps textures already in the project and reimports them.
+static func apply_to_folder(folder: String, size_limit: int, names = null) -> Dictionary:
+	## Caps textures already in the project and reimports them; `names` as above.
 	## Returns {"total": int, "changed": int, "reimported": int}.
 	var result := {"total": 0, "changed": 0, "reimported": 0}
-	var textures := find_textures(folder)
+	var textures := _named_textures(folder, names)
 	result["total"] = textures.size()
 	if textures.is_empty():
 		return result

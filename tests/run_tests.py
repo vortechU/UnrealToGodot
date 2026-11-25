@@ -21,6 +21,10 @@ PY_TESTS = ["test_math.py", "test_layout.py", "test_tscn_writer.py", "test_mater
             "test_landscape.py",
             "test_texture_export.py",
             "test_diagnose.py",
+            "test_code_sweep_fixes.py",
+            "test_sweep2_exporter.py",
+            "test_sweep2_godot_tscn.py",
+            "test_sweep3.py",
             # Opens a real Tk window; skips itself when there is no display.
             "test_exporter_gui.py"]
 

@@ -397,6 +397,17 @@ def _decal_size_with_min_depth(size, transform, min_depth):
 FOLIAGE_CONTAINER = "UnrealFoliage"
 NAVIGATION_CONTAINER = "UnrealNavigation"
 
+# Navigation bake source, mirroring import_common.gd's NAV_SOURCE_GROUP.
+NAV_SOURCE_GROUP = "unreal_nav_source"
+_PARSED_GEOMETRY_BOTH = 2                  # NavigationMesh.PARSED_GEOMETRY_BOTH
+_SOURCE_GEOMETRY_GROUPS_WITH_CHILDREN = 1  # NavigationMesh.SOURCE_GEOMETRY_GROUPS_WITH_CHILDREN
+
+# Metadata the writer itself puts on actor nodes. A Blueprint variable of the same
+# name would emit the key twice, which Godot rejects.
+_RESERVED_META_KEYS = frozenset((
+    "unreal_actor_id", "unreal_class", "unreal_tags", "missing_mesh", "unreal_mesh_key",
+    "unreal_physics_file", "unreal_lod_files", "unreal_spline_mesh"))
+
 
 def _mat_column(rows, j):
     return (rows[0][j], rows[1][j], rows[2][j])
@@ -461,12 +472,20 @@ def _scale_diag(scale):
 
 
 def _scaled_shape_mat(local_mat, scale):
-    """A shape's local transform once `scale` has come off the body: the OFFSET moves
-    with the scale, the rotation does not."""
+    """A box/sphere/capsule's local transform once `scale` has come off the body: the
+    OFFSET moves with the scale and the rotation is mirrored by its signs, but never
+    sheared. Twin of import_common.gd's scaled_shape_transform. Convex hulls carry the
+    mirror in their points instead and must keep their own basis."""
     if tuple(scale) == _UNIT_SCALE:
         return local_mat
     rows, origin = local_mat
-    return (rows, [origin[i] * scale[i] for i in range(3)])
+    sign = [-1.0 if s < 0.0 else 1.0 for s in scale]
+    # A reflected basis is not a rotation; negating one column of these symmetric
+    # shapes gives the same shape in a right-handed frame.
+    flip_x = sign[0] * sign[1] * sign[2]
+    out = [[sign[i] * rows[i][0] * flip_x, sign[i] * rows[i][1], sign[i] * rows[i][2]]
+           for i in range(3)]
+    return (out, [origin[i] * scale[i] for i in range(3)])
 
 
 def _scaled_axis_factors(local_rows, scale):
@@ -626,6 +645,24 @@ _MODEL_EXTS = (".gltf", ".glb")
 _TEXTURE_EXTS = (".png", ".tga", ".jpg", ".jpeg", ".dds", ".exr", ".webp")
 
 
+def _cull_chunks(vals, count, cull_end):
+    """Splits a distance-culled foliage group into grid cells of instance indices.
+
+    Unreal culls each instance; Godot culls a whole MultiMesh by the distance to its
+    centre, so one MultiMesh across a level would vanish under the camera's feet.
+    Mirrors import_foliage.gd::_cull_chunks."""
+    if count <= 0 or cull_end <= 0.0:
+        return [list(range(count))]
+    xs = [vals[i * 12 + 9] for i in range(count)]
+    zs = [vals[i * 12 + 11] for i in range(count)]
+    x0, z0 = min(xs), min(zs)
+    cell = max(cull_end * 0.5, max(max(xs) - x0, max(zs) - z0) / 32.0)
+    cells = {}
+    for i in range(count):
+        cells.setdefault((int((xs[i] - x0) / cell), int((zs[i] - z0) / cell)), []).append(i)
+    return list(cells.values())
+
+
 class _TscnWriter(object):
     def __init__(self, layout_data, res_paths, options):
         self.layout = layout_data or {}
@@ -764,7 +801,7 @@ class _TscnWriter(object):
         return parent_path + "/" + name
 
     def _add_node(self, name, godot_type=None, parent_path=".", instance_id=None,
-                  props=None, metadata=None):
+                  props=None, metadata=None, groups=None):
         """Append a node block. Returns the path used by this node's children as their `parent`.
         `parent_path=None` marks the scene root (no parent attr)."""
         uname = self._unique_child_name(parent_path, name)
@@ -773,6 +810,8 @@ class _TscnWriter(object):
             header += ' type="%s"' % godot_type
         if parent_path is not None:
             header += ' parent="%s"' % _escape_string(parent_path)
+        if groups:
+            header += " groups=[%s]" % ", ".join('"%s"' % _escape_string(g) for g in groups)
         if instance_id is not None:
             header += ' instance=ExtResource("%s")' % instance_id
         header += "]"
@@ -798,9 +837,13 @@ class _TscnWriter(object):
 
     def _actor_metadata_lines(self, actor, extra_tags=None):
         lines = []
+        # The id is what an incremental re-import matches on, so unlike the rest it
+        # does not depend on the "metadata" option.
         aid = actor.get("actor_id")
         if aid:
             lines.append('metadata/unreal_actor_id = "%s"' % _escape_string(aid))
+        if not self.options.get("metadata"):
+            return lines
         cls = actor.get("class")
         if cls:
             lines.append('metadata/unreal_class = "%s"' % _escape_string(cls))
@@ -816,7 +859,7 @@ class _TscnWriter(object):
                          % ", ".join('"%s"' % _escape_string(t) for t in merged_tags))
         props = actor.get("properties")
         if isinstance(props, dict):
-            seen_keys = {"unreal_class", "unreal_tags"}
+            seen_keys = set(_RESERVED_META_KEYS)
             for k, v in props.items():
                 if v is None:
                     continue
@@ -836,7 +879,7 @@ class _TscnWriter(object):
                          % ", ".join('"%s"' % _escape_string(t) for t in tags))
         return lines
 
-    def _mesh_extra_metadata_lines(self, mesh_key, meshes_lib):
+    def _mesh_extra_metadata_lines(self, mesh_key, meshes_lib, mesh_name=None):
         """Emits LOD / skeletal-physics handover metadata onto instanced mesh
         nodes so dock utilities can bind them on directly-generated .tscn scenes."""
         lines = []
@@ -847,9 +890,10 @@ class _TscnWriter(object):
         if isinstance(lods, list) and len(lods) > 1:
             lod_paths = []
             for item in lods:
-                if isinstance(item, dict) and int(_num(item.get("lod_index"), 0)) > 0:
-                    exp = item.get("export_name") or ""
-                    rp = self._mesh_res_path(exp)
+                lod = int(_num(item.get("lod_index"), 0)) if isinstance(item, dict) else 0
+                if lod > 0:
+                    rp = self._mesh_res_path(item.get("export_name") or "%s_LOD%d" % (mesh_key, lod),
+                                             "%s_LOD%d" % (mesh_name, lod) if mesh_name else None)
                     if rp:
                         lod_paths.append(rp)
             if lod_paths:
@@ -873,59 +917,70 @@ class _TscnWriter(object):
             return
         scale = list(scale)
         for box in collision.get("boxes") or []:
-            size = box.get("size") or [0.0, 0.0, 0.0]
+            size = box.get("size") if isinstance(box, dict) else None
+            if not isinstance(size, (list, tuple)) or len(size) < 3:
+                continue
             local = _transform_dict_to_mat(box.get("godot_local_transform"))
             factors = _scaled_axis_factors(local[0], scale)
             # Full extents cm -> m with glTF [x, z, y] axis remap (matches importer BoxShape3D.size)
-            gx = (_num(size[0]) * 0.01 if len(size) > 0 else 0.0) * factors[0]
-            gy = (_num(size[2]) * 0.01 if len(size) > 2 else 0.0) * factors[1]
-            gz = (_num(size[1]) * 0.01 if len(size) > 1 else 0.0) * factors[2]
+            gx = abs(_num(size[0])) * 0.01 * factors[0]
+            gy = abs(_num(size[2])) * 0.01 * factors[1]
+            gz = abs(_num(size[1])) * 0.01 * factors[2]
             sid = self._register_sub("BoxShape3D", ["size = " + _vec3_literal([gx, gy, gz])])
             self._add_shape_node(parent_path, "BoxCollision", _scaled_shape_mat(local, scale), sid)
         for sphere in collision.get("spheres") or []:
+            radius = abs(_num(sphere.get("radius"))) if isinstance(sphere, dict) else 0.0
+            if radius <= 0.0:
+                continue
             # A sphere cannot express a non-uniform scale, so it settles for the mean --
             # the one shape where the bake stays an approximation.
-            radius = _num(sphere.get("radius")) * 0.01 * _uniform_factor(scale)
+            radius *= 0.01 * _uniform_factor(scale)
             sid = self._register_sub("SphereShape3D", ["radius = " + _f(radius)])
             local = _transform_dict_to_mat(sphere.get("godot_local_transform"))
             self._add_shape_node(parent_path, "SphereCollision",
                                  _scaled_shape_mat(local, scale), sid)
         for cap in collision.get("capsules") or []:
+            cap_radius = abs(_num(cap.get("radius"))) if isinstance(cap, dict) else 0.0
+            if cap_radius <= 0.0:
+                continue
             local = _transform_dict_to_mat(cap.get("godot_local_transform"))
             # A Godot capsule runs along its local Y: Y stretches the cylinder, X and Z
             # stretch the radius -- and the radius takes only one of them.
             factors = _scaled_axis_factors(local[0], scale)
             radial = 0.5 * (factors[0] + factors[2])
-            radius = _num(cap.get("radius")) * 0.01 * radial
-            length = _num(cap.get("length")) * factors[1]
+            radius = cap_radius * 0.01 * radial
+            length = abs(_num(cap.get("length"))) * factors[1]
             height = length * 0.01 + 2.0 * radius
             sid = self._register_sub("CapsuleShape3D",
                                      ["radius = " + _f(radius), "height = " + _f(height)])
             self._add_shape_node(parent_path, "CapsuleCollision",
                                  _scaled_shape_mat(local, scale), sid)
         for convex in collision.get("convex_hulls") or []:
-            verts = convex.get("vertices") or []
+            verts = convex.get("vertices") if isinstance(convex, dict) else None
+            if not isinstance(verts, (list, tuple)):
+                continue
+            verts = [v for v in verts if isinstance(v, (list, tuple)) and len(v) >= 3]
             if not verts:
                 continue
             local = _transform_dict_to_mat(convex.get("godot_local_transform"))
             # A hull is a raw point cloud, so it takes the body scale EXACTLY -- shear,
             # mirror and all -- expressed in the shape's own frame: B^-1 * S * B, which is
             # identity whenever there is nothing to bake.
-            point_map = _mat_compose(_mat_affine_inverse((local[0], [0.0, 0.0, 0.0])),
-                                     _mat_compose(_scale_diag(scale),
-                                                  (local[0], [0.0, 0.0, 0.0])))[0]
+            point_map = _scale_diag(scale)[0]
+            if abs(_rows_determinant(local[0])) > 1e-12:
+                point_map = _mat_compose(_mat_affine_inverse((local[0], [0.0, 0.0, 0.0])),
+                                         _mat_compose(_scale_diag(scale),
+                                                      (local[0], [0.0, 0.0, 0.0])))[0]
             floats = []
             for v in verts:
                 # per-vertex glTF [x, z, y] * 0.01 remap (matches importer ConvexPolygonShape3D)
-                vx = _num(v[0]) * 0.01 if len(v) > 0 else 0.0
-                vy = _num(v[2]) * 0.01 if len(v) > 2 else 0.0
-                vz = _num(v[1]) * 0.01 if len(v) > 1 else 0.0
-                p = (vx, vy, vz)
+                p = (_num(v[0]) * 0.01, _num(v[2]) * 0.01, _num(v[1]) * 0.01)
                 floats.extend(sum(point_map[i][k] * p[k] for k in range(3)) for i in range(3))
             body = ["points = PackedVector3Array(%s)" % ", ".join(_f(x) for x in floats)]
             sid = self._register_sub("ConvexPolygonShape3D", body)
+            # Not _scaled_shape_mat(): point_map already mirrored the points.
             self._add_shape_node(parent_path, "ConvexCollision",
-                                 _scaled_shape_mat(local, scale), sid)
+                                 (local[0], [local[1][i] * scale[i] for i in range(3)]), sid)
 
     def _add_shape_node(self, parent_path, name, local_mat, shape_id):
         props = ["transform = " + _mat_to_transform3d(local_mat),
@@ -933,9 +988,13 @@ class _TscnWriter(object):
         self._add_node(name, "CollisionShape3D", parent_path, props=props)
 
     # --- mesh instance node / placeholder ----------------------------------------------------
-    def _mesh_res_path(self, mesh_key):
-        """Return a verified res:// glTF path for mesh_key, or None if missing on disk."""
-        return self._resolve_existing_res(self.models_res, str(mesh_key), _MODEL_EXTS)
+    def _mesh_res_path(self, mesh_key, mesh_name=None):
+        """Return a verified res:// glTF path for mesh_key, falling back to the raw mesh
+        name (v1 layouts, partial exports); None if missing on disk."""
+        path = self._resolve_existing_res(self.models_res, str(mesh_key), _MODEL_EXTS)
+        if path is None and mesh_name and mesh_name != mesh_key:
+            path = self._resolve_existing_res(self.models_res, str(mesh_name), _MODEL_EXTS)
+        return path
 
     # =========================================================================================
     # Section builders
@@ -963,7 +1022,7 @@ class _TscnWriter(object):
                                               self.layout.get("audio")))
         if self.options.get("foliage"):
             self._build_foliage(self._container(root_path, FOLIAGE_CONTAINER,
-                                                self.layout.get("foliage")))
+                                                self.layout.get("foliage"), [NAV_SOURCE_GROUP]))
         if self.options.get("navigation"):
             nav = self.layout.get("navigation")
             nav_vols = nav.get("bounds_volumes") if isinstance(nav, dict) else None
@@ -972,7 +1031,7 @@ class _TscnWriter(object):
         if self.options.get("landscape"):
             self._build_landscapes(root_path)
 
-    def _container(self, root_path, name, entries):
+    def _container(self, root_path, name, entries, groups=None):
         """A Node3D grouping one feature's nodes, matching what the Godot addon's feature
         modules build (UnrealLights, UnrealDecals, UnrealFoliage, UnrealNavigation). A
         level is mostly static meshes, so without these the handful of nodes a user goes
@@ -980,7 +1039,7 @@ class _TscnWriter(object):
         below moves; skipped entirely when the feature is empty."""
         if not entries:
             return root_path
-        return self._add_node(name, "Node3D", root_path)
+        return self._add_node(name, "Node3D", root_path, groups=groups)
 
     # --- actors ------------------------------------------------------------------------------
     def _resolve_folder_parent(self, root_path, folder_path, folder_cache):
@@ -1009,13 +1068,14 @@ class _TscnWriter(object):
         actors = [a for a in (self.layout.get("actors") or [])
                   if isinstance(a, dict) and (a.get("components") or [])]
         # Every mesh actor goes under one container -- see _container().
-        root_path = self._container(scene_root_path, STATIC_MESH_CONTAINER, actors)
+        root_path = self._container(scene_root_path, STATIC_MESH_CONTAINER, actors,
+                                    [NAV_SOURCE_GROUP])
         folder_cache = {}
         for actor in actors:
             components = actor.get("components") or []
             actor_name = actor.get("name") or "Actor"
             actor_mat = _transform_dict_to_mat(actor.get("godot_transform"))
-            actor_meta = self._actor_metadata_lines(actor) if emit_meta else []
+            actor_meta = self._actor_metadata_lines(actor)
             actor_parent = (self._resolve_folder_parent(root_path, actor.get("folder_path"), folder_cache)
                             if preserve_folders and actor.get("folder_path") else root_path)
 
@@ -1033,7 +1093,7 @@ class _TscnWriter(object):
                                       meshes_lib, actor, actor_meta, emit_meta):
         mesh_key = self._component_mesh_key(comp)
         world = _component_world_mat(comp, actor_mat)
-        res_path = self._mesh_res_path(mesh_key)
+        res_path = self._mesh_res_path(mesh_key, comp.get("mesh_name"))
 
         if res_path is None:
             # Missing mesh -> Marker3D placeholder at the component's world transform
@@ -1048,7 +1108,8 @@ class _TscnWriter(object):
         want_collision = comp.get("collision_enabled", True) is not False
         has_spline = isinstance(comp.get("spline_mesh"), dict) and bool(comp.get("spline_mesh"))
         collision = (meshes_lib.get(mesh_key) or {}).get("collision") if (want_collision and not has_spline) else None
-        extra_meta = self._mesh_extra_metadata_lines(mesh_key, meshes_lib)
+        extra_meta = self._mesh_extra_metadata_lines(mesh_key, meshes_lib,
+                                                     comp.get("mesh_name"))
         if has_spline:
             extra_meta.append("metadata/unreal_spline_mesh = true")
             _warn("actor '%s': spline mesh deformation cannot be baked into a static .tscn; "
@@ -1081,7 +1142,7 @@ class _TscnWriter(object):
             props = ["transform = " + _mat_to_transform3d(mesh_place)]
             if comp.get("visible") is False:
                 props.append("visible = false")
-            meta = (self._actor_metadata_lines(actor, extra_tags=comp.get("tags")) if emit_meta else []) + extra_meta
+            meta = self._actor_metadata_lines(actor, extra_tags=comp.get("tags")) + extra_meta
             self._add_node(actor_name, None, root_path, instance_id=ext_id,
                            props=props, metadata=meta)
 
@@ -1103,7 +1164,7 @@ class _TscnWriter(object):
             mesh_key = self._component_mesh_key(comp)
             comp_name = comp.get("name") or "Component"
             comp_mat = _mat_compose(actor_inverse, _component_world_mat(comp, actor_mat))
-            res_path = self._mesh_res_path(mesh_key)
+            res_path = self._mesh_res_path(mesh_key, comp.get("mesh_name"))
             comp_meta = self._component_metadata_lines(comp) if emit_meta else []
 
             if res_path is None:
@@ -1114,12 +1175,22 @@ class _TscnWriter(object):
                 continue
 
             ext_id = self._register_ext("PackedScene", res_path)
-            collision = (meshes_lib.get(mesh_key) or {}).get("collision")
+            want_collision = comp.get("collision_enabled", True) is not False
+            has_spline = isinstance(comp.get("spline_mesh"), dict) and bool(comp.get("spline_mesh"))
+            collision = (meshes_lib.get(mesh_key) or {}).get("collision") if (want_collision and not has_spline) else None
+            extra_meta = self._mesh_extra_metadata_lines(mesh_key, meshes_lib,
+                                                     comp.get("mesh_name"))
+            if has_spline:
+                extra_meta.append("metadata/unreal_spline_mesh = true")
+                _warn("actor '%s.%s': spline mesh deformation cannot be baked into a static .tscn; "
+                      "use the Godot addon importer for deformed spline geometry." % (actor_name, comp_name))
             # Re-seat the glTF mesh (and its collision) into the placement convention.
             mesh_place = _apply_mesh_axis_fix(comp_mat)
             if collision:
                 scale = _physics_body_scale(mesh_place)
                 body_props = ["transform = " + _mat_to_transform3d(_physics_body_mat(mesh_place))]
+                if comp.get("visible") is False:
+                    body_props.append("visible = false")
                 body_path = self._add_node(comp_name, "StaticBody3D", actor_path,
                                            props=body_props, metadata=comp_meta)
                 self._emit_collision(body_path, collision, scale)
@@ -1127,11 +1198,14 @@ class _TscnWriter(object):
                 # under it only takes the scale the body had to give up.
                 self._add_node(_mesh_node_name(comp, mesh_key), None, body_path,
                                instance_id=ext_id,
-                               props=["transform = " + _mat_to_transform3d(_scale_diag(scale))])
+                               props=["transform = " + _mat_to_transform3d(_scale_diag(scale))],
+                               metadata=extra_meta)
             else:
                 props = ["transform = " + _mat_to_transform3d(mesh_place)]
+                if comp.get("visible") is False:
+                    props.append("visible = false")
                 self._add_node(comp_name, None, actor_path, instance_id=ext_id,
-                               props=props, metadata=comp_meta)
+                               props=props, metadata=comp_meta + extra_meta)
 
     # --- lights ------------------------------------------------------------------------------
     def _build_lights(self, root_path):
@@ -1153,8 +1227,9 @@ class _TscnWriter(object):
             while len(color) < 3:
                 color.append(1.0)
             color = [_linear_to_srgb(_num(c, 1.0)) for c in color]
-            if light.get("use_temperature") and light.get("temperature_kelvin") is not None:
-                k = _kelvin_to_rgb(light.get("temperature_kelvin"))
+            kelvin = _num(light.get("temperature_kelvin"), 6500.0)
+            if light.get("use_temperature") and kelvin > 0.0:
+                k = _kelvin_to_rgb(kelvin)
                 color = [color[i] * k[i] for i in range(3)]
             props.append("light_color = " + _srgb_literal(color))
 
@@ -1259,17 +1334,22 @@ class _TscnWriter(object):
 
         sky_id = None
         gradient = sky_light.get("gradient") if isinstance(sky_light, dict) else None
+        if not isinstance(gradient, dict):
+            gradient = None
         if want_sky:
-            if gradient:
+            if gradient is not None:
                 shader_id = self._register_sub("Shader", ['code = "%s"' % SKY_SHADER])
-                tint = [_num(c) * _num(sky_light.get("intensity"), 1.0)
-                        for c in (sky_light.get("color") or [1.0, 1.0, 1.0])[:3]]
+                tint = sky_light.get("color")
+                tint = list(tint[:3]) if isinstance(tint, (list, tuple)) else []
+                tint = [_num(c, 1.0) * _num(sky_light.get("intensity"), 1.0)
+                        for c in tint + [1.0] * (3 - len(tint))]
                 psm_id = self._register_sub(
                     "ShaderMaterial",
                     ['shader = SubResource("%s")' % shader_id]
-                    + ["shader_parameter/%s = %s" % (key, _vec3_literal(gradient[key]))
+                    + ["shader_parameter/%s = %s" % (key, _vec3_literal(
+                        gradient.get(key) if isinstance(gradient.get(key), (list, tuple)) else []))
                        for key in ("top", "horizon", "ground")]
-                    + ["shader_parameter/falloff = " + _f(gradient["falloff"])]
+                    + ["shader_parameter/falloff = " + _f(gradient.get("falloff"), 6.67)]
                     + ["shader_parameter/light_scale = " + _vec3_literal(tint)])
             else:
                 psm_id = self._register_sub("ProceduralSkyMaterial", [
@@ -1280,7 +1360,7 @@ class _TscnWriter(object):
             env_lines.append("background_mode = 2")
             env_lines.append('sky = SubResource("%s")' % sky_id)
             env_lines.append("ambient_light_source = 3")
-            if isinstance(sky_light, dict) and not gradient:
+            if isinstance(sky_light, dict) and gradient is None:
                 if sky_light.get("color") is not None:
                     env_lines.append("ambient_light_color = " + _color_literal(sky_light.get("color")))
                 env_lines.append("ambient_light_energy = "
@@ -1302,6 +1382,10 @@ class _TscnWriter(object):
         # constants there for why each branch does what it does.
         cam_attr_id = None
         exposure, cam_attr_lines = _exposure_for_settings(settings)
+        white_temp = _num(settings.get("white_temp"), 6500.0)
+        if abs(white_temp - 6500.0) > 1.0:
+            _warn("post-process white balance (%d K) has no Godot setting and was not applied; "
+                  "use an adjustment color-correction LUT" % int(white_temp))
         if exposure is not None:
             env_lines.append("tonemap_exposure = " + _f(exposure))
         if cam_attr_lines:
@@ -1359,7 +1443,7 @@ class _TscnWriter(object):
             else:
                 env_lines.append("fog_light_color = " + _srgb_literal([0.62, 0.7, 0.8]))
             falloff = _num(height_fog.get("fog_height_falloff"), 0.2)
-            if gradient:
+            if gradient is not None:
                 env_lines.append("fog_sky_affect = 0.0")  # The captured sky has its fog in it.
             else:
                 env_lines.append("fog_sky_affect = " + _f(
@@ -1443,6 +1527,8 @@ class _TscnWriter(object):
                 "size = " + _vec3_literal(size),
                 "box_projection = %s" % ("true" if entry.get("box_projection", True) else "false"),
             ]
+            if entry.get("blend_distance_m") is not None:
+                props.append("blend_distance = " + _f(max(0.0, _num(entry.get("blend_distance_m"), 0.0))))
             if self._uses_lumen():
                 props.append("ambient_mode = 0")
             if entry.get("visible") is False:
@@ -1478,13 +1564,15 @@ class _TscnWriter(object):
             if not isinstance(entry, dict):
                 continue
             name = entry.get("name") or "Audio"
-            mat = _transform_dict_to_mat(entry.get("godot_transform"))
-            props = [
-                "transform = " + _mat_to_transform3d(mat),
-                "volume_db = " + _f(_clamp(_num(entry.get("volume_db"), 0.0), -80.0, 24.0)),
-                "pitch_scale = " + _f(_clamp(_num(entry.get("pitch_scale"), 1.0), 0.01, 4.0)),
-                "max_distance = " + _f(max(0.1, _num(entry.get("attenuation_radius_m"), 40.0))),
-            ]
+            is_spatial = entry.get("is_spatialized", True) is not False
+            props = []
+            if is_spatial:
+                mat = _transform_dict_to_mat(entry.get("godot_transform"))
+                props.append("transform = " + _mat_to_transform3d(mat))
+            props.append("volume_db = " + _f(_clamp(_num(entry.get("volume_db"), 0.0), -80.0, 24.0)))
+            props.append("pitch_scale = " + _f(_clamp(_num(entry.get("pitch_scale"), 1.0), 0.01, 4.0)))
+            if is_spatial:
+                props.append("max_distance = " + _f(max(0.1, _num(entry.get("attenuation_radius_m"), 40.0))))
             if entry.get("auto_play", True):
                 props.append("autoplay = true")
             sound_file = entry.get("sound_file")
@@ -1497,7 +1585,10 @@ class _TscnWriter(object):
             meta = []
             if entry.get("sound_name"):
                 meta.append('metadata/unreal_sound_name = "%s"' % _escape_string(entry.get("sound_name")))
-            self._add_node(name, "AudioStreamPlayer3D", root_path, props=props, metadata=meta)
+            if entry.get("looping") is True:
+                meta.append("metadata/unreal_looping = true")
+            gtype = "AudioStreamPlayer3D" if is_spatial else "AudioStreamPlayer"
+            self._add_node(name, gtype, root_path, props=props, metadata=meta)
 
     # --- foliage -----------------------------------------------------------------------------
     def _build_foliage(self, root_path):
@@ -1511,99 +1602,106 @@ class _TscnWriter(object):
             if entry.get("instance_count") is not None:
                 count = max(0, min(int(_num(entry.get("instance_count"), count)), len(flat) // 12))
 
-            buffer_vals = []
-            for i in range(count):
-                base = i * 12
-                raw_f = flat[base:base + 12]
-                if len(raw_f) < 12:
-                    break
-                f = [_num(v) for v in raw_f]
-                # schema stores basis COLUMNS then origin; MultiMesh wants 3x4 ROW-major.
-                # Post-multiply the basis by the glTF axis correction (_MESH_AXIS_FIX)
-                # so foliage meshes match the layout meshes: local X -> -Z, Y -> Y,
-                # Z -> X means new column X = -old column Z, new Y = old Y, new Z = old X.
-                bxx, bxy, bxz = -f[6], -f[7], -f[8]   # column X <- -column Z
-                byx, byy, byz = f[3], f[4], f[5]      # column Y (unchanged)
-                bzx, bzy, bzz = f[0], f[1], f[2]      # column Z <- column X
-                ox, oy, oz = f[9], f[10], f[11]
-                buffer_vals.extend((
-                    bxx, byx, bzx, ox,   # row 0 + origin.x
-                    bxy, byy, bzy, oy,   # row 1 + origin.y
-                    bxz, byz, bzz, oz,   # row 2 + origin.z
-                ))
-            actual_count = len(buffer_vals) // 12
+            vals = [_num(v) for v in flat[:count * 12]]
+            chunks = _cull_chunks(vals, count, _num(entry.get("cull_end_m"), 0.0)) or [[]]
+            for chunk_idx, members in enumerate(chunks):
+                chunk_name = name if chunk_idx == 0 else "%s_%d" % (name, chunk_idx + 1)
+                self._add_foliage_chunk(chunk_name, entry, mesh_key, vals, members, root_path)
 
-            mm_lines = [
-                "transform_format = 1",
-                "instance_count = %d" % actual_count,
-                "visible_instance_count = -1",
-                "buffer = PackedFloat32Array(%s)" % ", ".join(_f(v) for v in buffer_vals),
-            ]
-            mm_id = self._register_sub("MultiMesh", mm_lines)
+    def _add_foliage_chunk(self, name, entry, mesh_key, vals, members, root_path):
+        buffer_vals = []
+        for i in members:
+            f = vals[i * 12:i * 12 + 12]
+            # schema stores basis COLUMNS then origin; MultiMesh wants 3x4 ROW-major.
+            # Post-multiply the basis by the glTF axis correction (_MESH_AXIS_FIX)
+            # so foliage meshes match the layout meshes: local X -> -Z, Y -> Y,
+            # Z -> X means new column X = -old column Z, new Y = old Y, new Z = old X.
+            bxx, bxy, bxz = -f[6], -f[7], -f[8]   # column X <- -column Z
+            byx, byy, byz = f[3], f[4], f[5]      # column Y (unchanged)
+            bzx, bzy, bzz = f[0], f[1], f[2]      # column Z <- column X
+            ox, oy, oz = f[9], f[10], f[11]
+            buffer_vals.extend((
+                bxx, byx, bzx, ox,   # row 0 + origin.x
+                bxy, byy, bzy, oy,   # row 1 + origin.y
+                bxz, byz, bzz, oz,   # row 2 + origin.z
+            ))
+        actual_count = len(buffer_vals) // 12
 
-            props = ['multimesh = SubResource("%s")' % mm_id]
+        mm_lines = [
+            "transform_format = 1",
+            "instance_count = %d" % actual_count,
+            "visible_instance_count = -1",
+            "buffer = PackedFloat32Array(%s)" % ", ".join(_f(v) for v in buffer_vals),
+        ]
+        mm_id = self._register_sub("MultiMesh", mm_lines)
 
-            # Rendering state, mirroring import_foliage.gd::apply. Grass is
-            # routinely authored shadowless in Unreal, and UE's per-instance cull
-            # pair becomes Godot's visibility range (fade only when UE fades).
-            if entry.get("visible") is False:
-                props.append("visible = false")
-            if entry.get("cast_shadow") is False:
-                props.append("cast_shadow = %d" % _SHADOW_CASTING_OFF)
+        props = ['multimesh = SubResource("%s")' % mm_id]
 
-            cull_end = entry.get("cull_end_m")
-            if isinstance(cull_end, (int, float)) and float(cull_end) > 0.0:
-                props.append("visibility_range_end = " + _f(float(cull_end)))
-                cull_begin = entry.get("cull_begin_m")
-                if isinstance(cull_begin, (int, float)) and 0.0 < float(cull_begin) < float(cull_end):
-                    props.append("visibility_range_end_margin = "
-                                 + _f(float(cull_end) - float(cull_begin)))
-                    props.append("visibility_range_fade_mode = %d" % _VISIBILITY_RANGE_FADE_SELF)
+        # Rendering state, mirroring import_foliage.gd::apply. Grass is
+        # routinely authored shadowless in Unreal, and UE's per-instance cull
+        # pair becomes Godot's visibility range (fade only when UE fades).
+        if entry.get("visible") is False:
+            props.append("visible = false")
+        if entry.get("cast_shadow") is False:
+            props.append("cast_shadow = %d" % _SHADOW_CASTING_OFF)
 
-            metadata = ["metadata/unreal_foliage = true"]
-            # Point the dock's "bind foliage meshes" pass at the source glTF (verified if present).
-            res_path = self._mesh_res_path(mesh_key)
-            if res_path is None:
-                res_path = self.models_res + str(mesh_key) + ".gltf"  # best-effort hint
-            metadata.append('metadata/source_model = "%s"' % _escape_string(res_path))
-            metadata.append('metadata/unreal_mesh_key = "%s"' % _escape_string(mesh_key))
-            metadata.append('metadata/unreal_foliage_source = "%s"'
-                            % _escape_string(str(entry.get("source") or "foliage")))
-            self._add_node(name, "MultiMeshInstance3D", root_path,
-                           props=props, metadata=metadata)
+        cull_end = entry.get("cull_end_m")
+        if isinstance(cull_end, (int, float)) and float(cull_end) > 0.0:
+            # Godot measures to the MultiMesh's centre; see _cull_chunks.
+            radius = 0.0
+            if members:
+                axes = [[vals[i * 12 + a] for i in members] for a in (9, 10, 11)]
+                radius = 0.5 * math.sqrt(sum((max(a) - min(a)) ** 2 for a in axes))
+            props.append("visibility_range_end = " + _f(float(cull_end) + radius))
+            cull_begin = entry.get("cull_begin_m")
+            if isinstance(cull_begin, (int, float)) and 0.0 < float(cull_begin) < float(cull_end):
+                props.append("visibility_range_end_margin = "
+                             + _f(float(cull_end) - float(cull_begin)))
+                props.append("visibility_range_fade_mode = %d" % _VISIBILITY_RANGE_FADE_SELF)
+
+        metadata = ["metadata/unreal_foliage = true"]
+        # Point the dock's "bind foliage meshes" pass at the source glTF (verified if present).
+        res_path = self._mesh_res_path(mesh_key, entry.get("mesh_name"))
+        if res_path is None:
+            res_path = self.models_res + str(mesh_key) + ".gltf"  # best-effort hint
+        metadata.append('metadata/source_model = "%s"' % _escape_string(res_path))
+        metadata.append('metadata/unreal_mesh_key = "%s"' % _escape_string(mesh_key))
+        metadata.append('metadata/unreal_foliage_source = "%s"'
+                        % _escape_string(str(entry.get("source") or "foliage")))
+        self._add_node(name, "MultiMeshInstance3D", root_path,
+                       props=props, metadata=metadata)
 
     # --- navigation --------------------------------------------------------------------------
     def _build_navigation(self, root_path):
         nav = self.layout.get("navigation")
         if not isinstance(nav, dict):
             return
-        agent_radius = _num(nav.get("agent_radius_m"), 0.5)
-        agent_height = _num(nav.get("agent_height_m"), 1.8)
-        agent_climb = _num(nav.get("agent_max_step_height_m"), 0.25)
-        agent_slope = _num(nav.get("max_slope_deg"), 45.0)
-        cell_size = _num(nav.get("cell_size_m"), 0.25)
+        # Defaults and clamps mirror import_gameplay.gd.
+        agent_radius = max(0.05, _num(nav.get("agent_radius_m"), 0.35))
+        agent_height = max(0.1, _num(nav.get("agent_height_m"), 1.92))
+        agent_climb = max(0.0, _num(nav.get("agent_max_step_height_m"), 0.35))
+        agent_slope = _clamp(_num(nav.get("max_slope_deg"), 44.0), 0.1, 89.9)
+        cell_size = _clamp(_num(nav.get("cell_size_m"), 0.25), 0.01, 1.0)
 
-        volumes = nav.get("bounds_volumes") or []
-        if not volumes:
-            volumes = [{"name": "NavRegion", "godot_transform": None, "extent_m": [10.0, 10.0, 10.0]}]
-
-        for idx, vol in enumerate(volumes):
+        for idx, vol in enumerate(nav.get("bounds_volumes") or []):
             if not isinstance(vol, dict):
                 continue
-            extent = vol.get("extent_m") or [10.0, 10.0, 10.0]
-            ex = _num(extent[0], 10.0) if len(extent) > 0 else 10.0
-            ey = _num(extent[1], 10.0) if len(extent) > 1 else 10.0
-            ez = _num(extent[2], 10.0) if len(extent) > 2 else 10.0
-            aabb = "AABB(%s)" % ", ".join(_f(v) for v in
-                                          (-ex, -ey, -ez, 2.0 * ex, 2.0 * ey, 2.0 * ez))
+            raw = vol.get("extent_m")
+            raw = raw if isinstance(raw, (list, tuple)) else []
+            extent = [abs(_num(raw[i], 5.0)) if len(raw) > i else 5.0 for i in range(3)]
             nm_lines = [
                 "agent_radius = " + _f(agent_radius),
                 "agent_height = " + _f(agent_height),
                 "agent_max_climb = " + _f(agent_climb),
                 "agent_max_slope = " + _f(agent_slope),
                 "cell_size = " + _f(cell_size),
-                "filter_baking_aabb = " + aabb,
+                "geometry_parsed_geometry_type = %d" % _PARSED_GEOMETRY_BOTH,
+                "geometry_source_geometry_mode = %d" % _SOURCE_GEOMETRY_GROUPS_WITH_CHILDREN,
+                'geometry_source_group_name = &"%s"' % NAV_SOURCE_GROUP,
             ]
+            if _vec_length(extent) > 0.01:
+                nm_lines.append("filter_baking_aabb = AABB(%s)" % ", ".join(
+                    _f(v) for v in [-e for e in extent] + [2.0 * e for e in extent]))
             nm_id = self._register_sub("NavigationMesh", nm_lines)
             props = ['navigation_mesh = SubResource("%s")' % nm_id]
             gt = vol.get("godot_transform")
@@ -1630,6 +1728,8 @@ class _TscnWriter(object):
             gt = lscape.get("godot_transform")
             if isinstance(gt, dict):
                 props.append("transform = " + _mat_to_transform3d(_transform_dict_to_mat(gt)))
+            if lscape.get("visible") is False:
+                props.append("visible = false")
 
             metadata = ["metadata/unreal_landscape = true"]
             hm = lscape.get("heightmap_file")
@@ -1699,7 +1799,8 @@ class _TscnWriter(object):
                     metadata.append("metadata/weightmap_files = PackedStringArray(%s)"
                                     % ", ".join('"%s"' % _escape_string(p) for p in weight_files))
 
-            self._add_node(name, "Node3D", root_path, props=props, metadata=metadata)
+            self._add_node(name, "Node3D", root_path, props=props, metadata=metadata,
+                           groups=[NAV_SOURCE_GROUP])
 
     # =========================================================================================
     # Serialization

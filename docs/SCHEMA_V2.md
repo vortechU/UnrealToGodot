@@ -345,10 +345,11 @@ unit the artist happened to author it in — and since UE's default unit is
         "exposure_method": "auto" | "manual" | null,
         "exposure_min_brightness": 3.0 | null,   // cd/m^2 adaptation range; EV100
                                                  // values are converted on export
-        "exposure_max_brightness": 3.0 | null,   // min == max means LOCKED exposure
+        "exposure_max_brightness": 3.0 | null,   // min == max means LOCKED exposure; the
+                                                 // manual method is exported that way
         "exposure_speed_up": 3.0 | null,
         "exposure_speed_down": 3.0 | null,
-        "white_temp": 6500.0 | null,
+        "white_temp": 6500.0 | null,             // no Godot equivalent: consumers warn
         "saturation": [r,g,b,a] | null,
         "contrast": [r,g,b,a] | null,
         "gain": [r,g,b,a] | null,
@@ -590,6 +591,7 @@ decal's projection depth for its height. Guarded by `test_math.py` section 11 an
 ```json
 {
     "name": "Landscape_0",
+    "visible": true,                         // absent = visible
     "godot_transform": { ... },              // landscape actor transform
     "heightmap_file": "terrain/Landscape_0_height.exr",   // relative to JSON dir; float EXR (or PNG, see below)
     "heightmap_resolution": [513, 513],      // the size of the file that was ACTUALLY written
@@ -736,7 +738,9 @@ back at the foliage option, which rebuilds it as a single MultiMesh.
 ### Cull distances
 
 UE's per-instance cull pair maps onto `GeometryInstance3D`'s visibility range:
-`visibility_range_end = cull_end_m`, and when a start distance is set,
+`visibility_range_end = cull_end_m` plus the radius of the instances it holds (Godot
+measures to a MultiMesh's centre, so a culled group is split into grid cells of about half
+the cull distance, one node per cell), and when a start distance is set,
 `visibility_range_end_margin = cull_end_m - cull_begin_m` with
 `visibility_range_fade_mode = VISIBILITY_RANGE_FADE_SELF`. UE treats
 `InstanceEndCullDistance == 0` as "never cull" regardless of the start distance,

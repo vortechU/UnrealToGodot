@@ -66,6 +66,7 @@ class _Translator:
         self.material = material
         self.mel = unreal.MaterialEditingLibrary
         self.uniforms = {}      # name -> declaration
+        self.uniform_types = {} # name -> glsl_type
         self.textures = {}      # uniform name -> texture
         self.lines = []
         self.done = {}
@@ -93,6 +94,9 @@ class _Translator:
     def _uniform(self, node, glsl_type, value):
         name = "p_" + re.sub(r"\W+", "_", str(
             ue2g_common.safe_get_prop(node, "parameter_name", ""))).strip("_").lower()
+        if name in self.uniform_types and self.uniform_types[name] != glsl_type:
+            name = "%s_%s" % (name, glsl_type)
+        self.uniform_types[name] = glsl_type
         self.uniforms[name] = "uniform %s %s = %s;" % (glsl_type, name, value)
         return name
 
@@ -100,8 +104,6 @@ class _Translator:
 
     def value(self, node, out):
         """(GLSL expression, width) of one output pin."""
-        if out is None:
-            raise _Unsupported("an ambiguous connection to %s" % ue2g_common.node_kind(node))
         key = ue2g_common.safe_get_name(node)
         if key not in self.done:
             expr, width, pins = self._node(node)
@@ -112,6 +114,8 @@ class _Translator:
         name, width, pins = self.done[key]
         if not pins:
             return name, width
+        if out is None:
+            raise _Unsupported("an ambiguous connection to %s" % ue2g_common.node_kind(node))
         pin = out if out in _SWIZZLE else "RGB"
         if width == 3 and pin == "RGBA":
             pin = "RGB"
@@ -134,6 +138,12 @@ class _Translator:
         if not inputs:
             raise _Unsupported("an unconnected %s" % ue2g_common.node_kind(node))
         return self.value(inputs[0][1], inputs[0][2])
+
+    def _input_excluding(self, node, excluded):
+        for name, child, out in self.graph.inputs(node):
+            if name.lower() not in excluded:
+                return self.value(child, out)
+        raise _Unsupported("an unconnected %s" % ue2g_common.node_kind(node))
 
     def _uv(self, node):
         for name, child, out in self.graph.inputs(node):
@@ -186,20 +196,25 @@ class _Translator:
             a, wa = self._input(node, ("a",), "const_a", 0.0)
             b, wb = self._input(node, ("b",), "const_b", 1.0)
             t, wt = self._input(node, ("alpha",), "const_alpha", 0.5)
-            width = max(wa, wb, wt)
-            if 1 not in (wa, wb) and wa != wb:
-                width = min(wa, wb)
+            width = max(wa, wb) if 1 in (wa, wb) else min(wa, wb)
+            if width == 1 and wt > 1:
+                width = wt
             return "mix(%s, %s, %s)" % (_broadcast(a, wa, width), _broadcast(b, wb, width),
                                         _broadcast(t, wt, width)), width, False
         if kind == "Power":
             a, wa = self._input(node, ("base",))
             e, we = self._input(node, ("exp", "exponent"), "const_exponent", 2.0)
-            return "pow(max(%s, 0.0), %s)" % (a, _broadcast(e, we, wa)), wa, False
+            width = max(wa, we) if 1 in (wa, we) else min(wa, we)
+            return "pow(max(%s, 0.0), %s)" % (_broadcast(a, wa, width), _broadcast(e, we, width)), width, False
         if kind == "Clamp":
             a, wa = self._only(node)
             lo, wl = self._input(node, ("min",), "min_default", 0.0)
             hi, wh = self._input(node, ("max",), "max_default", 1.0)
-            return "clamp(%s, %s, %s)" % (a, _broadcast(lo, wl, wa), _broadcast(hi, wh, wa)), wa, False
+            width = wa
+            for w in (wl, wh):
+                width = max(width, w) if 1 in (width, w) else min(width, w)
+            return "clamp(%s, %s, %s)" % (_broadcast(a, wa, width), _broadcast(lo, wl, width),
+                                          _broadcast(hi, wh, width)), width, False
         if kind == "ComponentMask":
             a, wa = self._only(node)
             kept = [i for i, c in enumerate("rgba") if prop(c, False)]
@@ -213,13 +228,26 @@ class _Translator:
             b, wb = self._input(node, ("b",))
             return "vec%d(%s, %s)" % (wa + wb, a, b), wa + wb, False
         if kind == "Desaturation":
-            a, wa = self._only(node)
+            a, wa = self._input_excluding(node, ("fraction",))
             f, wf = self._input(node, ("fraction",), None, 1.0)
             return "mix(%s, vec3(dot(%s, vec3(0.3, 0.59, 0.11))), %s)" % (
-                _broadcast(a, wa, 3), _broadcast(a, wa, 3), f), 3, False
+                _broadcast(a, wa, 3), _broadcast(a, wa, 3), _broadcast(f, wf, 1)), 3, False
         if kind in ("StaticSwitch", "StaticSwitchParameter"):
-            on = (self._parameter("static_switch", node) if kind == "StaticSwitchParameter"
-                  else prop("default_value", True))
+            if kind == "StaticSwitchParameter":
+                on = self._parameter("static_switch", node)
+            else:
+                on = prop("default_value", True)
+                for name, child, _out in self.graph.inputs(node):
+                    if name.lower() == "value":
+                        ckind = ue2g_common.node_kind(child)
+                        if ckind == "StaticBoolParameter":
+                            val = self._parameter("static_switch", child)
+                            on = bool(val) if val is not None else bool(ue2g_common.safe_get_prop(child, "default_value", False))
+                        elif ckind == "StaticBool":
+                            on = bool(ue2g_common.safe_get_prop(child, "value", False))
+                        elif ckind == "Constant":
+                            on = bool(ue2g_common.safe_get_prop(child, "r", 0.0))
+                        break
             for name, child, out in self.graph.inputs(node):
                 if name == str(bool(on)):
                     expr, width = self.value(child, out)

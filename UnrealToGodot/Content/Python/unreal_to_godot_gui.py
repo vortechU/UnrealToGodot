@@ -41,7 +41,8 @@ def _positive_int(value, default):
     return parsed if parsed >= 0 else default
 
 
-def _run_diagnostic(export_dir, godot_project=None, strict=False):
+def _run_diagnostic(export_dir, godot_project=None, strict=False,
+                    layout_path=None, models_dir=None):
     """Audits an export and leaves a report beside it.
 
     Runs after every export so a problem is described in writing at the moment
@@ -53,8 +54,10 @@ def _run_diagnostic(export_dir, godot_project=None, strict=False):
     than no diagnostic at all.
     """
     try:
-        _text, rep = ue2g_diagnose.diagnose(export_dir, godot_project=godot_project,
-                                            strict=strict)
+        _text, rep = ue2g_diagnose.diagnose(
+            export_dir, godot_project=godot_project, strict=strict,
+            layout_path=layout_path, models_dir=models_dir,
+        )
     except Exception as e:
         unreal.log_warning("Unreal to Godot Exporter: diagnostic failed: %s" % str(e))
         return None
@@ -110,6 +113,7 @@ class UnrealToGodotApp:
 
         # Initialize UI layout
         self.init_ui()
+        self._last_auto_level_name = None
 
         # Load persisted settings and update UI
         self.load_settings()
@@ -118,7 +122,6 @@ class UnrealToGodotApp:
         # Bind close event
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.is_closed = False
-        self._last_auto_level_name = None
         
         # Start the GUI polling loop for editor state updates
         self.poll_state()
@@ -169,9 +172,9 @@ class UnrealToGodotApp:
                 "Ue2g.Vertical.TScrollbar",
                 background=[("active", "#52525b"), ("pressed", "#71717a")],
             )
-        except Exception as e:
-            unreal.log_warning("Unreal to Godot Exporter: could not style the "
-                               "scrollbar (%s); using the default look." % e)
+        except Exception:
+            # Runs on the background Tkinter thread, so never call unreal.log_* here.
+            pass
 
     def _build_scroll_area(self):
         """Puts every section inside a vertically scrollable canvas.
@@ -219,8 +222,9 @@ class UnrealToGodotApp:
         self.root.bind_all("<Button-5>", self._on_mousewheel)   # X11 wheel down
         self.root.bind("<Prior>", lambda e: self.canvas.yview_scroll(-1, "pages"))
         self.root.bind("<Next>", lambda e: self.canvas.yview_scroll(1, "pages"))
-        self.root.bind("<Home>", lambda e: self.canvas.yview_moveto(0.0))
-        self.root.bind("<End>", lambda e: self.canvas.yview_moveto(1.0))
+        # Don't hijack Home/End while the user is editing text inside an Entry.
+        self.root.bind("<Home>", lambda e: None if isinstance(e.widget, (tk.Entry, ttk.Entry, tk.Text)) else self.canvas.yview_moveto(0.0))
+        self.root.bind("<End>", lambda e: None if isinstance(e.widget, (tk.Entry, ttk.Entry, tk.Text)) else self.canvas.yview_moveto(1.0))
 
         return body
 
@@ -631,7 +635,8 @@ class UnrealToGodotApp:
             activebackground="#1e1e1e",
             activeforeground="#ffffff",
             selectcolor="#121212",
-            font=("Segoe UI", 9)
+            font=("Segoe UI", 9),
+            command=self.toggle_godot_path_state
         )
         self.write_tscn_cb.pack(anchor=tk.W, pady=(6, 0))
 
@@ -812,6 +817,10 @@ class UnrealToGodotApp:
                         parent_dir = os.path.dirname(current_path)
                         self.layout_path_entry.delete(0, tk.END)
                         self.layout_path_entry.insert(0, os.path.join(parent_dir, expected_filename))
+                    if self._last_auto_level_name and self._last_auto_level_name != latest_level_name:
+                        # A scene name belongs to its level: kept, the next level's
+                        # export would overwrite this one's .tscn.
+                        self.tscn_name_entry.delete(0, tk.END)
                     self._last_auto_level_name = latest_level_name
                         
         except Exception:
@@ -855,7 +864,8 @@ class UnrealToGodotApp:
             self.status_lbl.config(fg="#a3a3a3")
 
     def toggle_godot_path_state(self):
-        state = tk.NORMAL if self.auto_transfer_var.get() else tk.DISABLED
+        needs_path = self.auto_transfer_var.get() or self.write_tscn_var.get()
+        state = tk.NORMAL if needs_path else tk.DISABLED
         self.godot_path_entry.config(state=state)
         self.browse_godot_btn.config(state=state)
 
@@ -914,6 +924,8 @@ class UnrealToGodotApp:
                     if "layout_path" in settings:
                         self.layout_path_entry.delete(0, tk.END)
                         self.layout_path_entry.insert(0, settings["layout_path"])
+                    if settings.get("last_auto_level_name"):
+                        self._last_auto_level_name = str(settings["last_auto_level_name"])
                     # "max_texture_res" may still be in an older settings file.
                     # It is read by nothing now -- the control it fed never
                     # resized anything -- and is ignored rather than migrated.
@@ -954,6 +966,7 @@ class UnrealToGodotApp:
             "separate_textures": self.separate_textures_var.get(),
             "mesh_path": self.mesh_path_entry.get(),
             "layout_path": self.layout_path_entry.get(),
+            "last_auto_level_name": self._last_auto_level_name,
             "features": self.get_export_feature_options()
         }
         try:
@@ -962,8 +975,9 @@ class UnrealToGodotApp:
         except Exception:
             pass
 
-    def get_godot_project_dir_if_valid(self):
-        if not self.auto_transfer_var.get():
+    def get_godot_project_dir_if_valid(self, require_for_tscn=False):
+        needs_path = self.auto_transfer_var.get() or (require_for_tscn and self.write_tscn_var.get())
+        if not needs_path:
             return None
             
         godot_project = self.godot_path_entry.get()
@@ -1031,14 +1045,17 @@ class UnrealToGodotApp:
             self.show_status("Error: Please select a valid target JSON save path first.", "error")
             return
 
-        godot_project = self.get_godot_project_dir_if_valid()
-        if godot_project == -1:
+        validated_godot = self.get_godot_project_dir_if_valid(require_for_tscn=True)
+        if validated_godot == -1:
             return
+        godot_project = validated_godot if self.auto_transfer_var.get() else None
 
         export_anims = self.export_anims_var.get()
         export_lods = self.export_lods_var.get()
         separate_tex = self.separate_textures_var.get()
         feature_options = self.get_export_feature_options()
+        if feature_options.get("write_tscn") and validated_godot and not godot_project:
+            feature_options["tscn_godot_project_dir"] = validated_godot
 
         self.save_settings()
         self.show_status("Full export (meshes + layout) sent to Unreal...")
@@ -1053,17 +1070,17 @@ class UnrealToGodotApp:
             self.show_status("Error: Please select a valid target JSON save path first.", "error")
             return
             
-        godot_project = self.get_godot_project_dir_if_valid()
-        if godot_project == -1:
+        validated_godot = self.get_godot_project_dir_if_valid(require_for_tscn=True)
+        if validated_godot == -1:
             return
+        godot_project = validated_godot if self.auto_transfer_var.get() else None
             
         feature_options = self.get_export_feature_options()
+        if feature_options.get("write_tscn") and validated_godot and not godot_project:
+            feature_options["tscn_godot_project_dir"] = validated_godot
 
         self.save_settings()
-        if feature_options.get("write_tscn") and godot_project is None:
-            self.show_status("Exporting... (.tscn skipped: enable 'Auto-transfer to Godot Project')", "warning")
-        else:
-            self.show_status("Export command sent to Unreal...")
+        self.show_status("Export command sent to Unreal...")
         # Queue the export layout command to run on main thread
         _command_queue.put(("export_layout", [save_path, godot_project, feature_options]))
 
@@ -1147,6 +1164,8 @@ def check_editor_queues(delta_time):
                     )
                     if failed > 0:
                         _state_queue.put({"status": (f"Export completed: {exported} exported, {failed} failed.", "warning")})
+                    elif exported == 0:
+                        _state_queue.put({"status": ("Nothing was exported. Check the Output Log.", "warning")})
                     else:
                         _state_queue.put({"status": (f"Successfully exported {exported} meshes to glTF!", "success")})
                 except Exception as e:
@@ -1167,6 +1186,8 @@ def check_editor_queues(delta_time):
                     verdict = _diagnostic_status(rep)
                     if failed > 0:
                         _state_queue.put({"status": (f"Batch export completed: {exported} exported, {failed} failed.", "warning")})
+                    elif exported == 0:
+                        _state_queue.put({"status": ("No meshes were exported. Check the Output Log.", "warning")})
                     elif verdict:
                         _state_queue.put({"status": verdict})
                     else:
@@ -1189,26 +1210,41 @@ def check_editor_queues(delta_time):
                 unreal.log("Unreal to Godot Exporter: Starting full export (meshes + layout)...")
                 exported = failed = 0
                 layout_ok = False
+                freshly_exported_textures = set()
                 try:
                     exported, failed = export_static_meshes_to_gltf.export_all_level_meshes(
-                        export_dir=export_dir, export_animations=export_anims, export_lods=export_lods, separate_textures=separate_tex, show_dialogs=False, godot_project_dir=godot_project
+                        export_dir=export_dir, export_animations=export_anims, export_lods=export_lods,
+                        separate_textures=separate_tex, show_dialogs=False, godot_project_dir=godot_project,
+                        exported_textures_out=freshly_exported_textures,
                     )
                 except Exception as e:
                     _state_queue.put({"status": (f"Full Export Error (meshes): {str(e)}", "error")})
                     continue
 
                 try:
-                    # The mesh export just wrote these same textures, so reuse
-                    # them rather than re-encoding gigabytes of identical PNGs.
+                    # Only reuse textures that step 1 actually wrote into the exact
+                    # same textures/ directory -- never skip modified decals,
+                    # landscapes, or material overrides, and never reuse stale PNGs
+                    # when separate_textures=False.
+                    mesh_tex_dir = os.path.join(os.path.dirname(os.path.normpath(export_dir)), "textures")
+                    layout_tex_dir = os.path.join(os.path.dirname(os.path.normpath(save_path)), "textures")
+                    same_tex_dir = (
+                        separate_tex
+                        and os.path.normcase(os.path.abspath(mesh_tex_dir))
+                        == os.path.normcase(os.path.abspath(layout_tex_dir))
+                    )
+                    skip_arg = freshly_exported_textures if (same_tex_dir and freshly_exported_textures) else False
                     layout_ok = export_level_to_json.export_level_to_json(
                         save_path=save_path, show_dialogs=False, godot_project_dir=godot_project, options=feature_options,
-                        skip_existing_textures=True,
+                        skip_existing_textures=skip_arg,
                     )
                 except Exception as e:
                     _state_queue.put({"status": (f"Full Export Error (layout): {str(e)}", "error")})
                     continue
 
-                rep = _run_diagnostic(os.path.dirname(save_path), godot_project, strict=True)
+                diag_godot = godot_project or (feature_options or {}).get("tscn_godot_project_dir")
+                rep = _run_diagnostic(os.path.dirname(save_path), diag_godot, strict=True,
+                                      layout_path=save_path, models_dir=export_dir)
                 verdict = _diagnostic_status(rep)
                 if failed > 0:
                     _state_queue.put({"status": (f"Full export: {exported} meshes exported, {failed} failed.", "warning")})
@@ -1216,6 +1252,8 @@ def check_editor_queues(delta_time):
                     _state_queue.put({"status": ("Meshes exported, but the layout export failed. Check output log.", "error")})
                 elif verdict:
                     _state_queue.put({"status": verdict})
+                elif exported == 0:
+                    _state_queue.put({"status": ("Layout exported, but no meshes were. Check the Output Log.", "warning")})
                 else:
                     _state_queue.put({"status": (f"Full export complete: {exported} meshes + layout.", "success")})
 
@@ -1232,7 +1270,9 @@ def check_editor_queues(delta_time):
                         # The layout lands next to models/, so audit the whole
                         # export: this is the point where both halves exist and
                         # can be cross-checked against each other.
-                        rep = _run_diagnostic(os.path.dirname(save_path), godot_project)
+                        diag_godot = godot_project or (feature_options or {}).get("tscn_godot_project_dir")
+                        rep = _run_diagnostic(os.path.dirname(save_path), diag_godot,
+                                              layout_path=save_path)
                         verdict = _diagnostic_status(rep)
                         _state_queue.put({"status": verdict or ("Successfully exported level layout JSON!", "success")})
                     else:
@@ -1302,7 +1342,7 @@ def _do_register_menu():
             
         # Remove duplicate menu entry if already registered from previous import
         try:
-            window_menu.remove_menu_entry("UnrealToGodotExporter")
+            menus.remove_entry("LevelEditor.MainMenu.Window", "Default", "UnrealToGodotExporter")
         except Exception:
             pass
             

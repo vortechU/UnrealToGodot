@@ -611,7 +611,8 @@ grass = node_block("Foliage_SM_Grass")
 assert node_type("Foliage_SM_Grass") == "MultiMeshInstance3D", "foliage node class wrong"
 assert "cast_shadow = 0" in grass, "a shadowless foliage component must import shadowless: %s" % grass
 # 50 m cull end, fading over the 20 m from the 30 m start distance.
-assert "visibility_range_end = 50.0" in grass, "foliage cull distance missing: %s" % grass
+# 50 m plus the radius of the three instances: Godot measures to the MultiMesh centre.
+assert "visibility_range_end = 51.414" in grass, "foliage cull distance missing: %s" % grass
 assert "visibility_range_end_margin = 20.0" in grass, "foliage cull fade missing: %s" % grass
 assert "visibility_range_fade_mode = 1" in grass, "foliage fade mode missing: %s" % grass
 assert 'metadata/unreal_foliage_source = "foliage"' in grass, "foliage source metadata missing: %s" % grass
@@ -623,7 +624,7 @@ assert "cast_shadow" not in crate, "a shadow-casting component must keep Godot's
 assert "visibility_range" not in crate, "an unculled component must get no visibility range: %s" % crate
 assert 'metadata/unreal_foliage_source = "ism"' in crate, "ism source metadata missing: %s" % crate
 
-for gd_prop in ("mmi.cast_shadow =", "mmi.visible = bool", "mmi.visibility_range_end =",
+for gd_prop in ("mmi.cast_shadow =", "mmi.visible = bool", "mmi.visibility_range_end =", "_cull_chunks(",
                 "mmi.visibility_range_end_margin =", "mmi.visibility_range_fade_mode =",
                 'mmi.set_meta("unreal_foliage_source"', 'mmi.set_meta("unreal_mesh_key"',
                 "_apply_material_overrides("):

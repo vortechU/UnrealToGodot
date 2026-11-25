@@ -54,6 +54,9 @@ const TEXTURE_LIMIT_VALUES := [0, 512, 1024, 2048, 4096]
 const TEXTURE_LIMIT_DEFAULT_INDEX := 2
 
 func _enter_tree() -> void:
+	# Moving or floating the dock re-enters the tree with the UI already built.
+	if get_child_count() > 0:
+		return
 	# Root Container
 	var container := VBoxContainer.new()
 	container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -259,7 +262,7 @@ func _enter_tree() -> void:
 	shrink_files_check = CheckBox.new()
 	shrink_files_check.text = "Also shrink texture files on disk"
 	shrink_files_check.button_pressed = true
-	shrink_files_check.tooltip_text = "Rewrites exported PNGs larger than the limit at the capped size, which is usually the difference between a multi-gigabyte textures folder and a few hundred megabytes.\n\nDestructive: the full-resolution art only exists back in Unreal, so raising the limit later means exporting again. Only .png files the exporter writes are touched."
+	shrink_files_check.tooltip_text = "Rewrites exported PNGs larger than the limit at the capped size, which is usually the difference between a multi-gigabyte textures folder and a few hundred megabytes.\n\nDestructive: the full-resolution art only exists back in Unreal, so raising the limit later means exporting again. Only .png files named in the layout JSON are touched."
 	vbox.add_child(shrink_files_check)
 
 	import_btn = Button.new()
@@ -642,6 +645,8 @@ func _on_import_pressed() -> void:
 
 	var tex_limit := _selected_texture_limit()
 	var tex_folders := _texture_search_folders()
+	# These folders also hold the project's own art, which is none of our business.
+	var tex_names: Dictionary = TextureLimit.layout_texture_names(json_edit.text)
 
 	# Shrink the exported PNGs first, so the reimport below reads the small ones
 	# rather than importing 4K art and then throwing most of it away.
@@ -653,7 +658,7 @@ func _on_import_pressed() -> void:
 		var total_failed := 0
 		var saved_bytes := 0
 		for folder in tex_folders:
-			var shrunk: Dictionary = TextureLimit.shrink_source_files(folder, tex_limit)
+			var shrunk: Dictionary = TextureLimit.shrink_source_files(folder, tex_limit, tex_names)
 			total_shrunk += int(shrunk.get("shrunk", 0))
 			total_seen += int(shrunk.get("total", 0))
 			total_failed += int(shrunk.get("failed", 0))
@@ -673,7 +678,7 @@ func _on_import_pressed() -> void:
 	var total_capped := 0
 	var total_textures := 0
 	for folder in tex_folders:
-		var capped: Dictionary = TextureLimit.apply_to_folder(folder, tex_limit)
+		var capped: Dictionary = TextureLimit.apply_to_folder(folder, tex_limit, tex_names)
 		total_capped += int(capped.get("changed", 0))
 		total_textures += int(capped.get("total", 0))
 	if total_capped > 0:
@@ -744,7 +749,7 @@ func _on_import_pressed() -> void:
 			editor_undo_redo.create_action("Import Unreal Level Layout")
 			for n in added_nodes:
 				editor_undo_redo.add_do_method(scene_root, "add_child", n)
-				editor_undo_redo.add_do_property(n, "owner", scene_root)
+				editor_undo_redo.add_do_method(self, "_reown_subtree", n, scene_root)
 				editor_undo_redo.add_do_reference(n)
 				editor_undo_redo.add_undo_method(scene_root, "remove_child", n)
 			editor_undo_redo.commit_action(false)
@@ -757,3 +762,34 @@ func _on_import_pressed() -> void:
 	else:
 		status_label.text = "Status: Import Failed! Check console log for details."
 		status_label.add_theme_color_override("font_color", Color(0.9, 0.3, 0.3))
+
+
+func _reown_subtree(node: Node, scene_root: Node) -> void:
+	"""Restores recursive scene ownership (and editable-instance flags) on Redo,
+	since Node.remove_child() clears owner on all descendants during Undo."""
+	if node == null or scene_root == null:
+		return
+	node.owner = scene_root
+	# Terrain3D rebuilds its internal children itself; import_terrain.gd disowns them
+	# on purpose, because saved copies clash with the rebuilt ones.
+	if node.is_class("Terrain3D"):
+		return
+	if node != scene_root and node.scene_file_path != "":
+		scene_root.set_editable_instance(node, true)
+		node.set_display_folded(true)
+		_reown_instance_additions(node, scene_root)
+		return
+	for child in node.get_children():
+		_reown_subtree(child, scene_root)
+
+
+func _reown_instance_additions(instance: Node, scene_root: Node) -> void:
+	"""Restores ownership of what the importer added inside an instanced model (LODs,
+	skeletal physics). The model's own nodes still belong to it and are left alone."""
+	for child in instance.get_children():
+		if child.owner == null and (child.has_meta("unreal_lod_index")
+				or child.has_meta("unreal_skeletal_physics")
+				or child.name == &"UnrealPhysicalBoneSimulator"):
+			_reown_subtree(child, scene_root)
+		else:
+			_reown_instance_additions(child, scene_root)

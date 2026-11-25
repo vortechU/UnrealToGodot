@@ -152,6 +152,18 @@ def _log_actor_warning(actor, context, err):
     )
 
 
+def _actor_is_hidden(actor):
+    """True when the actor itself is hidden in editor or hidden in game."""
+    if actor is None:
+        return False
+    try:
+        if hasattr(actor, "is_hidden_ed") and bool(actor.is_hidden_ed()):
+            return True
+    except Exception:
+        pass
+    return _b(ue2g_common.safe_get_prop(actor, "hidden", False), False)
+
+
 # ---------------------------------------------------------------------------
 # Lights
 # ---------------------------------------------------------------------------
@@ -426,6 +438,7 @@ def _build_light_entry(actor, light_comp, name):
     # arrives lit.
     visible = (_b(ue2g_common.safe_get_prop(light_comp, "visible", True), True)
                and not _b(ue2g_common.safe_get_prop(light_comp, "hidden_in_game", False), False)
+               and not _actor_is_hidden(actor)
                and _b(ue2g_common.safe_get_prop(light_comp, "affects_world", True), True))
 
     return {
@@ -541,6 +554,31 @@ def _exposure_luminance(value):
     return value
 
 
+def _manual_exposure_luminance(settings):
+    """
+    What min == max brightness has to be to lock exposure where Unreal's manual
+    mode does: 1 / (L * 2^EV100), L being 1.2 (1.0 without the extended luminance
+    range). EV100 is the physical camera's, or 0 when the volume switches that off.
+    None unless the volume sets the manual method.
+    """
+    if _pp_field(settings, "override_auto_exposure_method", "auto_exposure_method",
+                 _map_exposure_method) != "manual":
+        return None
+    ev100 = 0.0
+    if _pp_field(settings, "override_auto_exposure_apply_physical_camera_exposure",
+                 "auto_exposure_apply_physical_camera_exposure", bool) is not False:
+        def _camera(name, default):
+            value = _pp_field(settings, "override_" + name, name)
+            return value if value and value > 0.0 else default
+        ev100 = math.log(_camera("depth_of_field_fstop", 4.0) ** 2
+                         * _camera("camera_shutter_speed", 60.0)
+                         * 100.0 / _camera("camera_iso", 100.0), 2)
+    get_cvar = getattr(getattr(unreal, "SystemLibrary", None),
+                       "get_console_variable_int_value", None)
+    extended = get_cvar is None or get_cvar("r.DefaultFeature.AutoExposure.ExtendDefaultLuminanceRange")
+    return 0.18 * (1.2 if extended else 1.0) * 2.0 ** ev100
+
+
 def _size_to_godot(v):
     """
     Converts an Unreal extent/size vector (cm, always non-negative
@@ -609,6 +647,10 @@ def _build_post_process_entry(actor):
         "vignette_intensity": _pp_field(settings, "override_vignette_intensity", "vignette_intensity"),
     }
 
+    manual = _manual_exposure_luminance(settings)
+    if manual is not None:
+        settings_out["exposure_min_brightness"] = settings_out["exposure_max_brightness"] = manual
+
     return {
         "name": _safe_label(actor),
         "unbound": _b(unbound, True),
@@ -632,7 +674,8 @@ def _build_height_fog(actor):
     if comp is None:
         return None
     if (not _b(ue2g_common.safe_get_prop(comp, "visible", True), True)
-            or _b(ue2g_common.safe_get_prop(comp, "hidden_in_game", False), False)):
+            or _b(ue2g_common.safe_get_prop(comp, "hidden_in_game", False), False)
+            or _actor_is_hidden(actor)):
         return None
 
     density = ue2g_common.safe_get_prop(comp, "fog_density", None)
@@ -682,6 +725,8 @@ def _fit_sky_gradient(samples):
                 s_tv[i] += weight * t * v
                 s_vv += weight * v * v
         det = s_hh * s_tt - s_ht * s_ht
+        if abs(det) <= 1e-12 or abs(s_tt) <= 1e-12:
+            continue
         horizon = [max(0.0, (s_tt * hv - s_ht * tv) / det) for hv, tv in zip(s_hv, s_tv)]
         top = [max(0.0, (tv - s_ht * h) / s_tt) for tv, h in zip(s_tv, horizon)]
         error = s_vv + sum(
@@ -689,6 +734,10 @@ def _fit_sky_gradient(samples):
             for h, t, hv, tv in zip(horizon, top, s_hv, s_tv))
         if best is None or error < best[0]:
             best = (error, horizon, top, falloff)
+    if best is None:
+        w_sum = sum(w for _, w, _ in samples) or 1.0
+        avg = [max(0.0, sum(w * rgb[i] for _, w, rgb in samples) / w_sum) for i in range(3)]
+        return avg, list(avg), _SKY_FALLOFFS[0]
     return best[1:]
 
 
@@ -748,7 +797,8 @@ def _capture_sky(actor, comp):
             ue2g_common.safe_get_prop(comp, "lower_hemisphere_color", None)
             or unreal.LinearColor(0.0, 0.0, 0.0))
     else:
-        ground = [sum(rgb[i] for rgb in below) / len(below) for i in range(3)]
+        ground = ([sum(rgb[i] for rgb in below) / len(below) for i in range(3)]
+                  if below else [0.0, 0.0, 0.0])
     return {"top": top, "horizon": horizon, "ground": ground, "falloff": falloff}
 
 
@@ -762,6 +812,7 @@ def _build_sky_light(actor):
         return None
     if (not _b(ue2g_common.safe_get_prop(comp, "visible", True), True)
             or _b(ue2g_common.safe_get_prop(comp, "hidden_in_game", False), False)
+            or _actor_is_hidden(actor)
             or not _b(ue2g_common.safe_get_prop(comp, "affects_world", True), True)):
         return None
 
@@ -1501,7 +1552,10 @@ def _build_decal_entry(actor, comp, name, collected_textures):
                 paths = params.get("texture_paths") or {}
                 textures["albedo"] = params.get("albedo_texture")
                 textures["normal"] = params.get("normal_texture")
-                for key, slot in (("albedo", "albedo_texture"), ("normal", "normal_texture")):
+                textures["emission"] = params.get("emissive_texture")
+                for key, slot in (("albedo", "albedo_texture"),
+                                  ("normal", "normal_texture"),
+                                  ("emission", "emissive_texture")):
                     if paths.get(slot):
                         textures["texture_paths"][key] = paths[slot]
 
@@ -1513,8 +1567,6 @@ def _build_decal_entry(actor, comp, name, collected_textures):
                 # as AO=roughness (backwards -- rougher gets less occlusion) and
                 # metallic=roughness (a 0.9-rough concrete decal renders as
                 # chrome). Binding nothing is strictly better than that.
-                # extract_material_parameters has no emissive extraction path at
-                # all, so "emission" is deliberately left null.
                 packed = params.get("packed_texture")
                 if packed and params.get("packed_channels") == _GODOT_DECAL_ORM_CHANNELS:
                     textures["orm"] = packed
@@ -1546,10 +1598,11 @@ def _build_decal_entry(actor, comp, name, collected_textures):
         comp, size_m, godot_transform.get("scale") or [1.0, 1.0, 1.0])
     size_m = _bake_decal_scale(size_m, godot_transform)
 
-    # A decal component hidden in game is content the level explicitly turned
-    # off; a Godot node that ignores that arrives visible.
+    # A decal component (or its owning actor) hidden in game is content the
+    # level explicitly turned off; a Godot node that ignores that arrives visible.
     visible = (_b(ue2g_common.safe_get_prop(comp, "visible", True), True)
-               and not _b(ue2g_common.safe_get_prop(comp, "hidden_in_game", False), False))
+               and not _b(ue2g_common.safe_get_prop(comp, "hidden_in_game", False), False)
+               and not _actor_is_hidden(actor))
 
     return {
         "name": name,
@@ -1612,34 +1665,37 @@ def _build_reflection_probe_entries(actor):
         name = label if len(comps) == 1 else "{}_{}".format(label, ue2g_common.safe_get_name(comp))
         try:
             godot_transform = ue2g_common.unreal_to_godot_transform(_component_world_transform(actor, comp))
+            sc = godot_transform.get("scale") or [1.0, 1.0, 1.0]
             if shape == "box":
-                # UE BoxTransitionDistance (cm) + actor/component extents; BoxReflectionCaptureComponent
-                # has a default 1000cm (10m) box scaled by component scale, or box_extent if exposed.
+                # UE BoxTransitionDistance (cm) + component scale, or box_extent if exposed.
+                # Godot ReflectionProbe does not support non-unit node scale cleanly, so fold scale into size_m.
                 box_ext = ue2g_common.safe_get_prop(comp, "box_extent", None)
                 if box_ext is not None:
                     size_m = [
-                        max(0.1, abs(_f(box_ext.y, 100.0)) * 2.0 * ue2g_common.CM_TO_M),
-                        max(0.1, abs(_f(box_ext.z, 100.0)) * 2.0 * ue2g_common.CM_TO_M),
-                        max(0.1, abs(_f(box_ext.x, 100.0)) * 2.0 * ue2g_common.CM_TO_M),
+                        max(0.1, abs(_f(box_ext.y, 100.0)) * 2.0 * ue2g_common.CM_TO_M * abs(_f(sc[0], 1.0))),
+                        max(0.1, abs(_f(box_ext.z, 100.0)) * 2.0 * ue2g_common.CM_TO_M * abs(_f(sc[1], 1.0))),
+                        max(0.1, abs(_f(box_ext.x, 100.0)) * 2.0 * ue2g_common.CM_TO_M * abs(_f(sc[2], 1.0))),
                     ]
                 else:
-                    # UE's UBoxReflectionCaptureComponent box is a 2000cm cube (half-extent 1000cm)
-                    # scaled by component world scale; fold scale into size_m and reset scale to 1.
-                    sc = godot_transform.get("scale") or [1.0, 1.0, 1.0]
-                    size_m = [max(0.1, abs(_f(sc[i], 1.0)) * 20.0) for i in range(3)]
-                    godot_transform["scale"] = [1.0, 1.0, 1.0]
+                    # UE's UBoxReflectionCaptureComponent has no extent of its own: its world
+                    # scale IS the half-extent in cm (1000, 1000, 400 on a fresh actor).
+                    size_m = [max(0.1, abs(_f(sc[i], 1.0)) * 2.0 * ue2g_common.CM_TO_M) for i in range(3)]
+                godot_transform["scale"] = [1.0, 1.0, 1.0]
                 blend_m = max(0.0, _f(ue2g_common.safe_get_prop(comp, "box_transition_distance", 100.0), 100.0) * ue2g_common.CM_TO_M)
                 box_proj = True
             else:
                 radius_cm = _f(ue2g_common.safe_get_prop(comp, "influence_radius", 3000.0), 3000.0)
-                diam_m = max(0.2, abs(radius_cm) * 2.0 * ue2g_common.CM_TO_M)
+                max_sc = max(abs(_f(sc[0], 1.0)), abs(_f(sc[1], 1.0)), abs(_f(sc[2], 1.0)))
+                diam_m = max(0.2, abs(radius_cm) * 2.0 * ue2g_common.CM_TO_M * max_sc)
                 size_m = [diam_m, diam_m, diam_m]
+                godot_transform["scale"] = [1.0, 1.0, 1.0]
                 blend_m = 0.0
                 box_proj = False
 
             brightness = max(0.0, _f(ue2g_common.safe_get_prop(comp, "brightness", 1.0), 1.0))
             visible = (_b(ue2g_common.safe_get_prop(comp, "visible", True), True)
-                       and not _b(ue2g_common.safe_get_prop(comp, "hidden_in_game", False), False))
+                       and not _b(ue2g_common.safe_get_prop(comp, "hidden_in_game", False), False)
+                       and not _actor_is_hidden(actor))
             entries.append({
                 "name": name,
                 "shape": shape,
@@ -1722,7 +1778,7 @@ def _volume_linear_to_db(mult):
     return round(20.0 * math.log10(m), 3)
 
 
-def _build_audio_entries(actor, collected_sounds=None):
+def _build_audio_entries(actor, collected_sounds=None, sound_refs=None):
     """Collects AudioComponent (AmbientSound actors + Blueprint audio components)."""
     aud_cls = getattr(unreal, "AudioComponent", None)
     if aud_cls is None:
@@ -1743,9 +1799,11 @@ def _build_audio_entries(actor, collected_sounds=None):
             sound_name = None
             sound_file = None
             looping = False
+            sound_wave_obj = None
             if sound is not None:
                 sound_name = ue2g_common.sanitize_name(ue2g_common.safe_get_name(sound))
                 if sound_wave_cls is not None and isinstance(sound, sound_wave_cls):
+                    sound_wave_obj = sound
                     sound_file = "%s.wav" % sound_name
                     looping = _b(ue2g_common.safe_get_prop(sound, "looping", False), False)
                     if collected_sounds is not None:
@@ -1780,7 +1838,7 @@ def _build_audio_entries(actor, collected_sounds=None):
                 if not _b(ue2g_common.safe_get_prop(att_settings, "spatialize", True), True):
                     is_spatial = False
 
-            entries.append({
+            entry = {
                 "name": name,
                 "godot_transform": ue2g_common.unreal_to_godot_transform(_component_world_transform(actor, comp)),
                 "sound_name": sound_name,
@@ -1791,22 +1849,29 @@ def _build_audio_entries(actor, collected_sounds=None):
                 "is_spatialized": is_spatial,
                 "auto_play": auto_play,
                 "looping": looping,
-            })
+            }
+            entries.append(entry)
+            if sound_refs is not None and sound_wave_obj is not None:
+                sound_refs.append((entry, sound_wave_obj))
         except Exception as e:
             _log_actor_warning(actor, "failed to build audio entry", e)
     return entries
 
 
-def export_sound_waves(sounds, audio_dir):
+def export_sound_waves(sounds, audio_dir, name_map=None):
     """Exports collected Unreal SoundWave assets to <audio_dir>/<name>.wav."""
     if not sounds:
         return {"exported": [], "failed": []}
     os.makedirs(audio_dir, exist_ok=True)
+    if name_map is None:
+        name_map = ue2g_common.build_export_name_map(sounds, kind="audio")
     tasks = []
+    seen = set()
     for snd in sounds:
-        if snd is None:
+        if snd is None or snd in seen:
             continue
-        name = ue2g_common.sanitize_name(ue2g_common.safe_get_name(snd))
+        seen.add(snd)
+        name = name_map.get(snd) or ue2g_common.sanitize_name(ue2g_common.safe_get_name(snd))
         filename = os.path.join(audio_dir, "%s.wav" % name)
         task = unreal.AssetExportTask()
         task.object = snd
@@ -1862,6 +1927,7 @@ def collect_environment(all_actors, collected_textures,
     try:
         if collected_textures is None:
             collected_textures = set()
+        audio_sound_refs = []
 
         for actor in (all_actors or []):
             try:
@@ -1878,7 +1944,7 @@ def collect_environment(all_actors, collected_textures,
                 if include_cameras:
                     result["cameras"].extend(_build_camera_entries(actor))
                 if include_audio:
-                    result["audio"].extend(_build_audio_entries(actor, collected_sounds))
+                    result["audio"].extend(_build_audio_entries(actor, collected_sounds, audio_sound_refs))
                 if not include_lights:
                     continue
                 result["lights"].extend(_build_light_entries(actor))
@@ -1902,11 +1968,33 @@ def collect_environment(all_actors, collected_textures,
                     continue
 
                 if _SKY_ATMOSPHERE_CLASS is not None and isinstance(actor, _SKY_ATMOSPHERE_CLASS):
-                    result["has_sky_atmosphere"] = True
+                    if not _actor_is_hidden(actor):
+                        sky_comp = None
+                        sky_comp_cls = getattr(unreal, "SkyAtmosphereComponent", None)
+                        if sky_comp_cls is not None and hasattr(actor, "get_component_by_class"):
+                            try:
+                                sky_comp = actor.get_component_by_class(sky_comp_cls)
+                            except Exception:
+                                sky_comp = None
+                        if sky_comp is None or (
+                                _b(ue2g_common.safe_get_prop(sky_comp, "visible", True), True)
+                                and not _b(ue2g_common.safe_get_prop(sky_comp, "hidden_in_game", False), False)):
+                            result["has_sky_atmosphere"] = True
                     continue
 
             except Exception as actor_err:
                 _log_actor_warning(actor, "failed to process actor", actor_err)
+
+        # Disambiguate colliding SoundWave export filenames to match export_sound_waves.
+        if audio_sound_refs:
+            all_sounds = set(collected_sounds or ())
+            for _entry, snd in audio_sound_refs:
+                all_sounds.add(snd)
+            sound_name_map = ue2g_common.build_export_name_map(all_sounds, kind="audio")
+            for entry, snd in audio_sound_refs:
+                final_name = sound_name_map.get(snd)
+                if final_name:
+                    entry["sound_file"] = "%s.wav" % final_name
 
     except Exception as outer_err:
         unreal.log_warning(
