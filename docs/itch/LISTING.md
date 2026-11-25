@@ -1,4 +1,4 @@
-# itch.io listing (v1.0.0)
+# itch.io listing (v1.0.1)
 
 Create the page at https://itch.io/game/new and leave it as Draft until you have previewed it.
 
@@ -11,7 +11,7 @@ Create the page at https://itch.io/game/new and leave it as Draft until you have
 | Kind of project | Downloadable |
 | Release status | Released |
 | Pricing | No payments (fully free). "$0 or donate" keeps it free and adds a tip prompt. |
-| Upload | `UnrealToGodot-v1.0.0.zip`; display name "Unreal plugin + Godot addon v1.0.0"; platform: Windows |
+| Upload | `UnrealToGodot-v1.0.1.zip`; display name "Unreal plugin + Godot addon v1.0.1"; platform: Windows |
 | Description | Paste `description.html` into the editor's HTML (`<>`) view |
 | Tags | `godot`, `unreal-engine`, `exporter`, `importer`, `level-design`, `3d`, `gltf`, `game-development`, `open-source`, `addon` |
 | Code license | MIT |
@@ -30,10 +30,10 @@ Create the page at https://itch.io/game/new and leave it as Draft until you have
 ## Before publishing
 
 - [x] Run the tests with `--godot` and a real Unreal export.
-- [x] Set 1.0.0 in `UnrealToGodot.uplugin` and `addons/unreal_importer/plugin.cfg`.
-- [x] Tag and push `v1.0.0` (the docs link needs the tag). Build the zip from it:
-      `git archive --format=zip -o UnrealToGodot-v1.0.0.zip v1.0.0 UnrealToGodot addons LICENSE`
-- [ ] Retake the Godot and dock screenshots, and rebuild the cover from the new Godot shot.
+- [x] Set 1.0.1 in `UnrealToGodot.uplugin` and `addons/unreal_importer/plugin.cfg`.
+- [x] Tag and push `v1.0.1` (the docs link needs the tag). Build the zip from it:
+      `git archive --format=zip -o UnrealToGodot-v1.0.1.zip v1.0.1 UnrealToGodot addons LICENSE`
+- [x] Retake the Godot and dock screenshots, and rebuild the cover from the new Godot shot.
 
 ## Page theme
 

@@ -1,12 +1,12 @@
 <p><strong>Move 3D asset packs and levels from Unreal Engine to Godot 4, with meshes, materials, collision, lighting and layout.</strong> Free and open source (MIT).</p>
 <p>It comes in two parts: an Unreal plugin that exports your level, and a Godot addon that rebuilds it. Click <em>Export Everything</em> in Unreal, then <em>Import Unreal Level Layout</em> in Godot.</p>
-<p><em>Version 1.0.0. Read "What doesn't transfer" below before you start.</em></p>
+<p><em>Version 1.0.1. Read "What doesn't transfer" below before you start.</em></p>
 
 <h2>What transfers</h2>
 <ul>
 <li><strong>Level layout:</strong> positions, rotations, non-uniform scale and Blueprint actor hierarchies, converted to Godot's axes and metres. Outliner folders can be kept, and repeated Blueprints can be saved as shared <code>.tscn</code> prefabs.</li>
 <li><strong>Meshes:</strong> batch export of static and skeletal meshes to glTF. Animation sequences and LOD chains are optional.</li>
-<li><strong>Spline meshes:</strong> roads, pipes and fences arrive bent along their spline.</li>
+<li><strong>Spline meshes and cables:</strong> roads, pipes and fences arrive bent along their spline, and overhead wires as meshes.</li>
 <li><strong>Collision:</strong> boxes, spheres, capsules and convex hulls become <code>CollisionShape3D</code> nodes, with non-uniform scale baked in so Jolt doesn't complain. Skeletal physics assets can become ragdoll bodies.</li>
 <li><strong>Materials:</strong> PBR and emissive parameters, textures, blend modes, alpha cutout and two-sided settings are bound to Godot materials. DirectX normal maps are flipped for Godot, and materials can be saved as reusable <code>.tres</code> files.</li>
 <li><strong>Lights and atmosphere:</strong> directional, point, spot and rect lights, plus post-process, fog and sky as a <code>WorldEnvironment</code>. Reflection captures become <code>ReflectionProbe</code> nodes.</li>
@@ -51,7 +51,7 @@
 
 <h2>Help and source</h2>
 <ul>
-<li><a href="https://github.com/vortechU/UnrealToGodot/tree/v1.0.0#readme">Full documentation and source</a></li>
+<li><a href="https://github.com/vortechU/UnrealToGodot/tree/v1.0.1#readme">Full documentation and source</a></li>
 <li><a href="https://discord.com/invite/HGwkYW2h6Y">Discord</a> for help and questions</li>
 <li><a href="https://github.com/vortechU/UnrealToGodot/issues">Report a bug</a>. Please attach both report files: <code>ue2g_report.txt</code> and <code>ue2g_import_report.txt</code>.</li>
 </ul>
