@@ -131,6 +131,27 @@ _MIDDLE_GREY = 0.18
 _ISO_REFERENCE = 100.0
 _EXPOSURE_SPEED_SCALE = 0.5 / 3.0
 
+# Mirrors import_environment.gd, which explains these.
+FOG_DENSITY_SCALE = 0.0480453
+FOG_DEPTH_RANGE = 1.2
+SKY_SHADER = """shader_type sky;
+
+uniform vec3 top;
+uniform vec3 horizon;
+uniform vec3 ground;
+uniform float falloff;
+uniform vec3 light_scale;
+
+void sky() {
+	float elevation = asin(clamp(EYEDIR.y, 0.0, 1.0)) / (0.5 * PI);
+	COLOR = mix(top, horizon, pow(1.0 - elevation, falloff));
+	// Lighting only: Unreal scales the sky light and replaces its lower half, not the sky you see.
+	if (AT_CUBEMAP_PASS) {
+		COLOR = (EYEDIR.y >= 0.0 ? COLOR : ground) * light_scale;
+	}
+}
+"""
+
 # UE's own default AttenuationRadius (1000 cm), used when the field is missing.
 DEFAULT_ATTENUATION_M = 10.0
 # Godot rejects spot_angle >= 90; UE's OuterConeAngle clamps at 89.9.
@@ -145,6 +166,27 @@ _SHADOW_CASTING_OFF = 0            # SHADOW_CASTING_SETTING_OFF
 _VISIBILITY_RANGE_FADE_SELF = 1    # VISIBILITY_RANGE_FADE_SELF
 
 
+def _spot_softness(inner_deg, outer_deg):
+    """Twin of import_environment.gd::_spot_softness."""
+    outer = math.cos(math.radians(_clamp(outer_deg, 0.5, MAX_SPOT_ANGLE_DEG)))
+    inner = max(math.cos(math.radians(max(inner_deg, 0.0))), outer)
+    rim = (1.0 - (outer + math.sqrt(0.5) * (inner - outer))) / (1.0 - outer)
+    return _clamp(math.log(rim) / math.log(0.5), 0.05, 8.0)
+
+
+def _grade_scale(settings):
+    """Twin of import_environment.gd::_grade_scale."""
+    gain = settings.get("gain")
+    gamma = settings.get("gamma")
+    scale = 1.0
+    if isinstance(gain, (list, tuple)):
+        scale *= max(_avg3(gain) * (_num(gain[3], 1.0) if len(gain) > 3 else 1.0), 0.0)
+    if isinstance(gamma, (list, tuple)):
+        power = _avg3(gamma) * (_num(gamma[3], 1.0) if len(gamma) > 3 else 1.0)
+        scale *= _MIDDLE_GREY ** (1.0 / max(power, 0.01) - 1.0)
+    return scale
+
+
 def _exposure_for_settings(settings):
     """Maps a volume's exposure settings to (tonemap_exposure | None, camera-attr lines).
 
@@ -155,12 +197,15 @@ def _exposure_for_settings(settings):
     """
     has_bias = settings.get("exposure_bias") is not None
     bias = _num(settings.get("exposure_bias"), _UE_DEFAULT_EXPOSURE_BIAS)
-    bias_scale = 2.0 ** bias
+    grade = _grade_scale(settings)
+    bias_scale = 2.0 ** bias * grade
 
     min_raw = settings.get("exposure_min_brightness")
     max_raw = settings.get("exposure_max_brightness")
     if min_raw is None or max_raw is None:
-        return (bias_scale if has_bias else None), []
+        if has_bias:
+            return bias_scale, []
+        return (grade if grade != 1.0 else None), []
 
     min_lum = max(_num(min_raw, 1.0), 0.0001)
     max_lum = max(_num(max_raw, 1.0), 0.0001)
@@ -516,7 +561,18 @@ def _sanitize_meta_key(key):
     return result
 
 
+def _linear_to_srgb(v):
+    return v * 12.92 if v < 0.0031308 else 1.055 * v ** (1.0 / 2.4) - 0.055
+
+
 def _color_literal(rgb, alpha=1.0):
+    """Linear [r,g,b(,a)] -> 'Color(r, g, b, a)', in the sRGB Godot's properties use."""
+    if not isinstance(rgb, (list, tuple)):
+        rgb = [1.0, 1.0, 1.0]
+    return _srgb_literal([_linear_to_srgb(_num(v, 1.0)) for v in rgb[:3]] + list(rgb[3:4]), alpha)
+
+
+def _srgb_literal(rgb, alpha=1.0):
     """[r,g,b(,a)] -> 'Color(r, g, b, a)'."""
     if not isinstance(rgb, (list, tuple)):
         rgb = [1.0, 1.0, 1.0]
@@ -541,7 +597,7 @@ def _vec2_literal(vec):
 
 
 def _kelvin_to_rgb(kelvin):
-    """Tanner Helland blackbody approximation -> linear-ish RGB multiplier (0..1)."""
+    """Tanner Helland blackbody approximation -> sRGB multiplier (0..1)."""
     t = max(1000.0, min(15000.0, _num(kelvin, 6500.0))) / 100.0
 
     def clamp(v):
@@ -1096,10 +1152,11 @@ class _TscnWriter(object):
             color = list(light.get("color") or [1.0, 1.0, 1.0])[:3] or [1.0, 1.0, 1.0]
             while len(color) < 3:
                 color.append(1.0)
+            color = [_linear_to_srgb(_num(c, 1.0)) for c in color]
             if light.get("use_temperature") and light.get("temperature_kelvin") is not None:
                 k = _kelvin_to_rgb(light.get("temperature_kelvin"))
                 color = [color[i] * k[i] for i in range(3)]
-            props.append("light_color = " + _color_literal(color))
+            props.append("light_color = " + _srgb_literal(color))
 
             energy = _num(light.get("godot_energy"), 1.0) * self.light_energy_scale
             props.append("light_energy = " + _f(max(0.0, energy)))
@@ -1110,6 +1167,7 @@ class _TscnWriter(object):
                          + _f(_num(light.get("volumetric_scattering"), 1.0)))
 
             radius = _num(light.get("attenuation_radius_m"), DEFAULT_ATTENUATION_M)
+            inverse_square = light.get("inverse_squared_falloff", True)
             source_radius = max(0.0, _num(light.get("source_radius_m"), 0.0))
             specular = max(0.0, _num(light.get("specular_scale"), 1.0))
 
@@ -1129,15 +1187,17 @@ class _TscnWriter(object):
                 if ltype == "spot":
                     gtype = "SpotLight3D"
                     props.append("spot_range = " + _f(max(0.01, radius)))
+                    if inverse_square:
+                        props.append("spot_attenuation = 2.0")
                     outer = _num(light.get("outer_cone_angle_deg"), 44.0)
                     inner = _num(light.get("inner_cone_angle_deg"), 0.0)
                     props.append("spot_angle = " + _f(_clamp(outer, 0.5, MAX_SPOT_ANGLE_DEG)))
-                    if outer > 0.0 and inner > 0.0 and inner < outer:
-                        props.append("spot_angle_attenuation = "
-                                     + _f(_clamp(outer / max(outer - inner, 0.5), 0.5, 8.0)))
+                    props.append("spot_angle_attenuation = " + _f(_spot_softness(inner, outer)))
                 else:  # point, rect (approximated by an omni) and unknown
                     gtype = "OmniLight3D"
                     props.append("omni_range = " + _f(max(0.01, radius)))
+                    if inverse_square:
+                        props.append("omni_attenuation = 2.0")
                     if ltype == "rect":
                         metadata.append("metadata/unreal_rect_light = true")
                         rect_size = light.get("rect_size_m")
@@ -1165,22 +1225,29 @@ class _TscnWriter(object):
 
             self._add_node(name, gtype, root_path, props=props, metadata=metadata)
 
-    # --- environment (post_process + height_fog + sky) ---------------------------------------
-    def _build_environment(self, root_path):
-        post_list = self.layout.get("post_process") or []
-        height_fog = self.layout.get("height_fog")
-        sky_light = self.layout.get("sky_light")
-        has_atmosphere = bool(self.layout.get("has_sky_atmosphere"))
-
-        # Highest-priority unbound post-process volume drives the WorldEnvironment.
+    def _main_post_process(self):
+        """The highest-priority unbound post-process volume drives the WorldEnvironment."""
         chosen = None
-        for pv in post_list:
+        for pv in self.layout.get("post_process") or []:
             if not isinstance(pv, dict):
                 continue
             if not pv.get("unbound", False):
                 continue
             if chosen is None or _num(pv.get("priority")) > _num(chosen.get("priority")):
                 chosen = pv
+        return chosen
+
+    def _uses_lumen(self):
+        settings = (self._main_post_process() or {}).get("settings") or {}
+        return (settings.get("gi_method") or self.layout.get("gi_method")) == "lumen"
+
+    # --- environment (post_process + height_fog + sky) ---------------------------------------
+    def _build_environment(self, root_path):
+        height_fog = self.layout.get("height_fog")
+        sky_light = self.layout.get("sky_light")
+        has_atmosphere = bool(self.layout.get("has_sky_atmosphere"))
+
+        chosen = self._main_post_process()
         settings = (chosen or {}).get("settings") or {}
 
         want_sky = bool(sky_light) or has_atmosphere
@@ -1191,16 +1258,29 @@ class _TscnWriter(object):
         env_lines = []
 
         sky_id = None
+        gradient = sky_light.get("gradient") if isinstance(sky_light, dict) else None
         if want_sky:
-            psm_id = self._register_sub("ProceduralSkyMaterial", [
-                "sky_horizon_color = Color(0.64625, 0.65575, 0.67075, 1)",
-                "ground_horizon_color = Color(0.64625, 0.65575, 0.67075, 1)",
-            ])
+            if gradient:
+                shader_id = self._register_sub("Shader", ['code = "%s"' % SKY_SHADER])
+                tint = [_num(c) * _num(sky_light.get("intensity"), 1.0)
+                        for c in (sky_light.get("color") or [1.0, 1.0, 1.0])[:3]]
+                psm_id = self._register_sub(
+                    "ShaderMaterial",
+                    ['shader = SubResource("%s")' % shader_id]
+                    + ["shader_parameter/%s = %s" % (key, _vec3_literal(gradient[key]))
+                       for key in ("top", "horizon", "ground")]
+                    + ["shader_parameter/falloff = " + _f(gradient["falloff"])]
+                    + ["shader_parameter/light_scale = " + _vec3_literal(tint)])
+            else:
+                psm_id = self._register_sub("ProceduralSkyMaterial", [
+                    "sky_horizon_color = Color(0.64625, 0.65575, 0.67075, 1)",
+                    "ground_horizon_color = Color(0.64625, 0.65575, 0.67075, 1)",
+                ])
             sky_id = self._register_sub("Sky", ['sky_material = SubResource("%s")' % psm_id])
             env_lines.append("background_mode = 2")
             env_lines.append('sky = SubResource("%s")' % sky_id)
             env_lines.append("ambient_light_source = 3")
-            if isinstance(sky_light, dict):
+            if isinstance(sky_light, dict) and not gradient:
                 if sky_light.get("color") is not None:
                     env_lines.append("ambient_light_color = " + _color_literal(sky_light.get("color")))
                 env_lines.append("ambient_light_energy = "
@@ -1208,6 +1288,11 @@ class _TscnWriter(object):
         else:
             env_lines.append("background_mode = 1")
             env_lines.append("background_color = Color(0, 0, 0, 1)")
+
+        if self._uses_lumen():
+            env_lines.append("sdfgi_enabled = true")
+            env_lines.append("ssr_enabled = true")
+            env_lines.append("ssr_fade_out = 0.0")
 
         # Tonemapper: unconditional, because Unreal never renders linear. Mirrors
         # import_environment.gd's UNREAL_TONEMAP (Environment.TONE_MAPPER_ACES == 3).
@@ -1251,18 +1336,34 @@ class _TscnWriter(object):
             if isinstance(con, (list, tuple)) and con:
                 env_lines.append("adjustment_contrast = " + _f(_clamp(_avg3(con), 0.01, 8.0)))
 
-        # Height fog -> Godot depth fog. The heuristic is `fog_density * 0.5`, so
-        # UE's default 0.02 lands on Godot's default 0.01 (SCHEMA_V2.md). This
-        # path had *5.0, making every .tscn export TEN TIMES foggier than the
-        # same layout imported through the addon.
+        # Height fog -> Godot depth fog; mirrors import_environment.gd.
         if isinstance(height_fog, dict):
             env_lines.append("fog_enabled = true")
-            env_lines.append("fog_density = "
-                             + _f(_clamp(_num(height_fog.get("fog_density"), 0.02) * 0.5, 0.0, 1.0)))
-            if height_fog.get("color") is not None:
-                env_lines.append("fog_light_color = " + _color_literal(height_fog.get("color")))
-            env_lines.append("fog_height_density = "
-                             + _f(_clamp(_num(height_fog.get("fog_height_falloff"), 0.2), 0.0, 1.0)))
+            density = max(0.0, _num(height_fog.get("fog_density"), 0.02))
+            rate = density * FOG_DENSITY_SCALE
+            start = _num(height_fog.get("start_distance_m"), 0.0)
+            if start > 0.0 and rate > 0.0:
+                env_lines.append("fog_mode = 1")
+                env_lines.append("fog_density = " + _f(1.0 - math.exp(-FOG_DEPTH_RANGE)))
+                env_lines.append("fog_depth_curve = 0.5")
+                env_lines.append("fog_depth_begin = " + _f(start))
+                env_lines.append("fog_depth_end = " + _f(start + FOG_DEPTH_RANGE / rate))
+            else:
+                env_lines.append("fog_density = " + _f(_clamp(rate, 0.0, 1.0)))
+            color = height_fog.get("color")
+            if isinstance(color, (list, tuple)) and len(color) >= 3:
+                peak = max([1.0] + [_num(c) for c in color[:3]])
+                env_lines.append("fog_light_energy = " + _f(peak))
+                env_lines.append("fog_light_color = "
+                                 + _color_literal([_num(c) / peak for c in color[:3]]))
+            else:
+                env_lines.append("fog_light_color = " + _srgb_literal([0.62, 0.7, 0.8]))
+            falloff = _num(height_fog.get("fog_height_falloff"), 0.2)
+            if gradient:
+                env_lines.append("fog_sky_affect = 0.0")  # The captured sky has its fog in it.
+            else:
+                env_lines.append("fog_sky_affect = " + _f(
+                    1.0 - math.exp(-2.0 * density / falloff) if falloff > 0.0 else 1.0))
 
         env_id = self._register_sub("Environment", env_lines)
         env_props = ['environment = SubResource("%s")' % env_id]
@@ -1342,6 +1443,8 @@ class _TscnWriter(object):
                 "size = " + _vec3_literal(size),
                 "box_projection = %s" % ("true" if entry.get("box_projection", True) else "false"),
             ]
+            if self._uses_lumen():
+                props.append("ambient_mode = 0")
             if entry.get("visible") is False:
                 props.append("visible = false")
             meta = ['metadata/unreal_probe_shape = "%s"' % _escape_string(entry.get("shape") or "box")]

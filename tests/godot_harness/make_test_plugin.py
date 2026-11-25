@@ -255,7 +255,7 @@ func _run_tests() -> void:
 		# Material tint / DecalColor / opacity all land in modulate, and UE's
 		# screen-size fade arrives as a distance fade. These used to be dropped.
 		check("Decal modulate carries the UE tint and opacity",
-			d.modulate.is_equal_approx(Color(0.8, 0.2, 0.2, 0.5)), str(d.modulate))
+			d.modulate.is_equal_approx(Color(0.8, 0.2, 0.2, 0.5).linear_to_srgb()), str(d.modulate))
 		check("Decal distance fade comes from UE FadeScreenSize",
 			d.distance_fade_enabled and absf(d.distance_fade_begin - 9.0) < 0.001
 			and absf(d.distance_fade_length - 3.0) < 0.001,
@@ -277,6 +277,7 @@ func _run_tests() -> void:
 	_test_materials(root)
 	await _test_lods_and_skeletal_physics(root)
 	_test_phase3_scene_parity(root)
+	_test_survives_save(root)
 	await _test_phase4_workflow(root)
 	_test_terrain(root)
 
@@ -373,7 +374,7 @@ func _test_terrain(root: Node) -> void:
 		check("splatmap texture assigned", sm.get_shader_parameter("splatmap") is Texture2D)
 		var tint: Color = sm.get_shader_parameter("layer0_tint")
 		check("layer0 tint is the exported Unreal debug colour",
-			absf(tint.g - 0.8) < 0.01 and absf(tint.r - 0.2) < 0.01, str(tint))
+			tint.is_equal_approx(Color(0.2, 0.8, 0.3).linear_to_srgb()), str(tint))
 
 	var col := find_node(ls, "TerrainCollision")
 	check("terrain collision body built", col is StaticBody3D)
@@ -462,10 +463,12 @@ func _test_lights(root: Node) -> void:
 		var spot := spot_node as SpotLight3D
 		check("spot range comes from the UE attenuation radius",
 			absf(spot.spot_range - 12.0) < 0.001, str(spot.spot_range))
+		check("an inverse-square UE light gets Godot's inverse-square decay",
+			absf(spot.spot_attenuation - 2.0) < 0.001, str(spot.spot_attenuation))
 		check("spot angle comes from the UE outer cone",
 			absf(spot.spot_angle - 40.0) < 0.001, str(spot.spot_angle))
-		check("the UE inner cone sharpens the falloff",
-			absf(spot.spot_angle_attenuation - 2.0) < 0.001, str(spot.spot_angle_attenuation))
+		check("the spot reaches half brightness at UE's angle (20/40 degree cones)",
+			absf(spot.spot_angle_attenuation - 1.0734) < 0.001, str(spot.spot_angle_attenuation))
 		check("UE IndirectLightingIntensity becomes light_indirect_energy",
 			absf(spot.light_indirect_energy - 0.25) < 0.001, str(spot.light_indirect_energy))
 		check("UE VolumetricScatteringIntensity becomes light_volumetric_fog_energy",
@@ -668,6 +671,54 @@ func _test_lods_and_skeletal_physics(root: Node) -> void:
 	check("external .tres material file created on disk",
 		FileAccess.file_exists("res://materials/MI_Test.tres"))
 	ext_root.queue_free()
+
+
+func _test_survives_save(root: Node) -> void:
+	# Godot drops changes to the children of an instanced model on save unless
+	# the instance is editable; everything checked above lives on such children.
+	print("\\n--- save & reload ---")
+	var packed := PackedScene.new()
+	check("imported scene packs", packed.pack(root) == OK)
+	var again := packed.instantiate()
+	var textured := find_node(again, "Textured_1")
+	var meshes := textured.find_children("*", "MeshInstance3D", true, false) if textured else []
+	if textured is MeshInstance3D:
+		meshes.append(textured)
+	check("material overrides survive save and reload",
+		not meshes.is_empty() and meshes[0].get_surface_override_material(0) is BaseMaterial3D)
+	var crate := find_node(again, "Crate_1")
+	var lod := find_node(crate, "TriNode") as MeshInstance3D if crate else null
+	check("LOD ranges survive save and reload",
+		lod != null and absf(lod.visibility_range_end - 12.0) < 0.001)
+	var decor := find_node(again, "Decor_Hidden")
+	var dmi := find_node(decor, "TriNode") as MeshInstance3D if decor else null
+	check("shadow flags survive save and reload",
+		dmi != null and dmi.cast_shadow == GeometryInstance3D.SHADOW_CASTING_SETTING_OFF)
+	var pipe := find_node(again, "Pipe_Spline")
+	var pmi := find_node(pipe, "TriNode") as MeshInstance3D if pipe else null
+	check("spline deformation survives save and reload",
+		pmi != null and pmi.mesh != null and pmi.mesh.get_aabb().end.x > 3.5)
+	var painted := find_node(again, "Painted_1")
+	var paint_mi: MeshInstance3D = find_node(painted, "TriNode") as MeshInstance3D if painted else null
+	var colors := PackedColorArray()
+	if paint_mi and paint_mi.mesh is ArrayMesh:
+		var arrays := (paint_mi.mesh as ArrayMesh).surface_get_arrays(0)
+		if arrays[Mesh.ARRAY_COLOR] != null:
+			for v in [Vector3(0, 0, 0), Vector3(1, 0, 0), Vector3(0, 1, 0)]:
+				colors.append(arrays[Mesh.ARRAY_COLOR][(arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array).find(v)])
+	check("vertex paint lands on its own vertices and survives save and reload",
+		colors == PackedColorArray([Color.RED, Color.GREEN, Color.BLUE]), str(colors))
+	var puddle := paint_mi.get_surface_override_material(0) as ShaderMaterial if paint_mi else null
+	check("a translated shader survives with its textures", puddle != null
+		and puddle.shader.code.contains("COLOR.g")
+		and puddle.get_shader_parameter("tex_0") is Texture2D
+		and puddle.get_shader_parameter("tex_1") is Texture2D)
+	check("other placements of the mesh stay unpainted",
+		not meshes.is_empty() and meshes[0].mesh.surface_get_arrays(0)[Mesh.ARRAY_COLOR] == null)
+	var hero := find_node(again, "Hero_1")
+	check("skeletal physics survives save and reload",
+		hero != null and find_node(hero, "PhysicalBone_spine") != null)
+	again.free()
 
 
 func _test_phase3_scene_parity(root: Node) -> void:

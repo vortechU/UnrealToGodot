@@ -71,10 +71,13 @@ var USE_GDSCRIPT_TRANSFORM_CONVERSION: bool = false
 const ImportReport = preload("res://addons/unreal_importer/import_report.gd")
 const TextureLimit = preload("res://addons/unreal_importer/texture_import_limit.gd")
 const SplineMeshHelper = preload("res://addons/unreal_importer/import_spline_mesh.gd")
+const VertexPaintHelper = preload("res://addons/unreal_importer/import_vertex_paint.gd")
 
 # Material sharing cache
 var material_cache: Dictionary = {}
 var _normal_map_targets: Dictionary = {}
+var _override_cache: Dictionary = {}
+var _vertex_paint = VertexPaintHelper.new()
 var _alpha_merged_cache: Dictionary = {}
 var _external_normal_cache: Dictionary = {}
 var _external_mat_paths: Dictionary = {}
@@ -159,6 +162,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 	print("Starting import of ", actors.size(), " actors from Unreal...")
 	material_cache.clear()
 	_normal_map_targets = _collect_normal_map_targets(data)
+	_override_cache.clear()
 	_alpha_merged_cache.clear()
 	_external_normal_cache.clear()
 	_external_mat_paths.clear()
@@ -310,6 +314,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 				var overrides_raw = comp_data.get("material_overrides", [])
 				var overrides: Array = overrides_raw if overrides_raw is Array else []
 				apply_materials_to_instance(instanced_mesh, mesh_key, overrides, meshes_lib)
+				_apply_vertex_paint(instanced_mesh, mesh_key, comp_data, meshes_lib)
 				if has_spline:
 					SplineMeshHelper.deform_instance(instanced_mesh, spline_raw as Dictionary)
 
@@ -337,7 +342,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 				if bool(import_options.get("apply_lods", true)) and not has_spline:
 					var lod_parent: Node = physics_body if physics_body else instanced_mesh
 					var lod_xform: Transform3D = instanced_mesh.transform if physics_body else Transform3D.IDENTITY
-					if _apply_lod_chain(instanced_mesh, lod_parent, lod_xform, mesh_key, mesh_name, overrides, meshes_lib) > 0:
+					if _apply_lod_chain(instanced_mesh, lod_parent, lod_xform, mesh_key, mesh_name, overrides, meshes_lib, comp_data) > 0:
 						lod_chains_wired += 1
 				_apply_component_render_flags(target_node, instanced_mesh, comp_data)
 				if bool(import_options.get("apply_skeletal_physics", true)) and skel_physics_helper:
@@ -418,6 +423,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					var overrides_raw = comp_data.get("material_overrides", [])
 					var overrides: Array = overrides_raw if overrides_raw is Array else []
 					apply_materials_to_instance(instanced_mesh, mesh_key, overrides, meshes_lib)
+					_apply_vertex_paint(instanced_mesh, mesh_key, comp_data, meshes_lib)
 					if has_spline:
 						SplineMeshHelper.deform_instance(instanced_mesh, spline_raw as Dictionary)
 					
@@ -440,7 +446,7 @@ func do_import(json_path: String, models_folder: String, textures_folder: String
 					if bool(import_options.get("apply_lods", true)) and not has_spline:
 						var lod_parent: Node = physics_body if physics_body else instanced_mesh
 						var lod_xform: Transform3D = instanced_mesh.transform if physics_body else Transform3D.IDENTITY
-						if _apply_lod_chain(instanced_mesh, lod_parent, lod_xform, mesh_key, mesh_name, overrides, meshes_lib) > 0:
+						if _apply_lod_chain(instanced_mesh, lod_parent, lod_xform, mesh_key, mesh_name, overrides, meshes_lib, comp_data) > 0:
 							lod_chains_wired += 1
 					_apply_component_render_flags(comp_target, instanced_mesh, comp_data)
 					if bool(import_options.get("apply_skeletal_physics", true)) and skel_physics_helper:
@@ -678,9 +684,11 @@ func create_placeholder(parent: Node, name_str: String, local_transform: Transfo
 
 func _set_owner_recursive(node: Node, owner: Node) -> void:
 	"""Recursively sets the owner on all descendants so they persist in the saved scene."""
-	# If this node is a scene instance, we do not traverse into its children!
-	# Godot will serialize it as an instance of the sub-scene.
+	# A scene instance keeps owning its children, but Godot drops every change made
+	# to them (materials, LOD ranges, shadows) on save unless they are editable.
 	if node != owner and node.scene_file_path != "":
+		owner.set_editable_instance(node, true)
+		node.set_display_folded(true)
 		return
 		
 	for child in node.get_children():
@@ -924,7 +932,7 @@ func apply_materials_to_instance(instanced_mesh: Node3D, mesh_name: String, over
 	"""
 	Compiles and applies default and overridden materials to all child MeshInstance3D nodes
 	found inside the instanced scene root, matching by material name and slot.
-	Override materials (per-instance) always create fresh materials to support unique colors.
+	Override materials (per-instance) are shared only between identical parameters.
 	Default materials (shared base) use the material cache for efficiency.
 	"""
 	var mesh_data_raw = meshes_lib.get(mesh_name)
@@ -986,8 +994,13 @@ func apply_materials_to_instance(instanced_mesh: Node3D, mesh_name: String, over
 					# Only duplicate existing_mat if the override is the same material;
 					# otherwise duplicating leaks the default slot's textures onto the override.
 					var base_mat: Material = existing_mat if (override_name != "" and override_name.to_lower() == mat_name.to_lower()) else null
-					var godot_mat = create_godot_material(params, base_mat)
-					godot_mat.resource_name = override_name if override_name != "" else mat_name
+					var key := "%s|%d|%s" % [override_name,
+						base_mat.get_instance_id() if base_mat else 0, JSON.stringify(params)]
+					if not _override_cache.has(key):
+						var new_mat := create_godot_material(params, base_mat)
+						new_mat.resource_name = override_name if override_name != "" else mat_name
+						_override_cache[key] = new_mat
+					var godot_mat: Material = _override_cache[key]
 					mesh_inst.set_surface_override_material(slot_idx, godot_mat)
 				continue
 			
@@ -999,6 +1012,12 @@ func apply_materials_to_instance(instanced_mesh: Node3D, mesh_name: String, over
 				if params is Dictionary and not params.is_empty():
 					var godot_mat = get_or_create_material(resolved_name, mat_path, params, existing_mat)
 					mesh_inst.set_surface_override_material(slot_idx, godot_mat)
+
+func _apply_vertex_paint(instanced_mesh: Node, mesh_key: String, comp_data: Dictionary, meshes_lib: Dictionary) -> void:
+	var mesh_entry = meshes_lib.get(mesh_key)
+	if comp_data.has("vertex_paint") and mesh_entry is Dictionary:
+		_vertex_paint.apply(instanced_mesh, mesh_key, mesh_entry.get("paint_points"), comp_data["vertex_paint"])
+
 
 func _find_mesh_instances_recursive(node: Node, list: Array[MeshInstance3D]) -> void:
 	"""Recursively finds all MeshInstance3D nodes in a node tree."""
@@ -1324,7 +1343,7 @@ func _estimate_mesh_radius(node: Node) -> float:
 
 
 func _apply_lod_chain(lod0_node: Node3D, lod_parent: Node, lod_transform: Transform3D,
-		mesh_key: String, mesh_name: String, overrides: Array, meshes_lib: Dictionary) -> int:
+		mesh_key: String, mesh_name: String, overrides: Array, meshes_lib: Dictionary, comp_data: Dictionary) -> int:
 	"""Instances exported <mesh_key>_LOD1.gltf .. _LODn.gltf files and configures
 	non-overlapping visibility_range bands on LOD0 and every LOD sibling.
 	Returns the number of additional LOD levels wired (0 when no LOD1+ exists)."""
@@ -1390,6 +1409,7 @@ func _apply_lod_chain(lod0_node: Node3D, lod_parent: Node, lod_transform: Transf
 		if lod_inst == null:
 			continue
 		apply_materials_to_instance(lod_inst, mesh_key, overrides, meshes_lib)
+		_apply_vertex_paint(lod_inst, mesh_key, comp_data, meshes_lib)
 		var r_begin := float(entry["switch_distance_m"])
 		var r_end := float(candidates[i + 1]["switch_distance_m"]) if (i + 1 < candidates.size()) else 0.0
 		_set_visibility_range_recursive(lod_inst, r_begin, r_end)
@@ -1403,7 +1423,7 @@ func _apply_lod_chain(lod0_node: Node3D, lod_parent: Node, lod_transform: Transf
 
 	return wired
 
-func get_or_create_material(mat_name: String, mat_path: String, params: Dictionary, existing_mat: Material = null) -> BaseMaterial3D:
+func get_or_create_material(mat_name: String, mat_path: String, params: Dictionary, existing_mat: Material = null) -> Material:
 	"""
 	Material instantiation cache manager. Reuses existing StandardMaterial3D/ORMMaterial3D instances
 	by path or name to preserve shared materials across mesh instances.
@@ -1422,14 +1442,14 @@ func get_or_create_material(mat_name: String, mat_path: String, params: Dictiona
 		tres_path = _external_material_res_path(mat_name, mat_path)
 		if tres_path != "" and ResourceLoader.exists(tres_path):
 			var existing_res = ResourceLoader.load(tres_path)
-			if existing_res is BaseMaterial3D:
+			if existing_res is Material:
 				if has_path:
 					material_cache[mat_path] = existing_res
 				elif has_name:
 					material_cache[mat_name] = existing_res
-				return existing_res as BaseMaterial3D
+				return existing_res as Material
 
-	var mat = create_godot_material(params, existing_mat)
+	var mat := create_godot_material(params, existing_mat)
 	mat.resource_name = mat_name
 
 	if tres_path != "":
@@ -1439,8 +1459,8 @@ func get_or_create_material(mat_name: String, mat_path: String, params: Dictiona
 		var save_err := ResourceSaver.save(mat, tres_path)
 		if save_err == OK:
 			var reloaded = ResourceLoader.load(tres_path)
-			if reloaded is BaseMaterial3D:
-				mat = reloaded as BaseMaterial3D
+			if reloaded is Material:
+				mat = reloaded as Material
 		else:
 			push_warning("Unreal Importer: could not save external material %s (%s)"
 				% [tres_path, error_string(save_err)])
@@ -1574,16 +1594,38 @@ func _combine_albedo_and_opacity(albedo_path: String, opacity_path: String,
 			var rgb := alb_img.get_pixel(x, y) if alb_img != null else Color.WHITE
 			var a: float = op_img.get_pixel(x, y)[channel]
 			out.set_pixel(x, y, Color(rgb.r, rgb.g, rgb.b, a))
-	var merged := ImageTexture.create_from_image(out)
+	out.generate_mipmaps()
+	var merged := Common.save_generated_texture(out, opacity_path, cache_key)
 	_alpha_merged_cache[cache_key] = merged
 	return merged
 
 
-func create_godot_material(params: Dictionary, existing_mat: Material = null) -> BaseMaterial3D:
+func _create_shader_material(shader_data: Dictionary) -> ShaderMaterial:
+	"""A material whose layers are blended by vertex paint; the exporter wrote the shader."""
+	var shader := Shader.new()
+	shader.code = Common.get_str(shader_data, "code", "")
+	var mat := ShaderMaterial.new()
+	mat.shader = shader
+	for uniform in shader_data.get("texture_paths", {}):
+		var tex_name := _safe_str(shader_data.get(uniform))
+		var tex_path := find_texture_path(active_textures_folder, tex_name)
+		if tex_path == "":
+			_note_missing_texture(tex_name)
+		elif shader.code.contains("sampler2D %s : hint_normal" % uniform):
+			mat.set_shader_parameter(uniform, _load_normal_texture(tex_path, tex_name))
+		else:
+			mat.set_shader_parameter(uniform, load_texture(tex_path))
+	return mat
+
+
+func create_godot_material(params: Dictionary, existing_mat: Material = null) -> Material:
 	"""
 	Creates a new StandardMaterial3D (or duplicates existing_mat if it is a BaseMaterial3D),
 	maps Unreal scalar/vector/surface settings to Godot, and binds exported textures.
 	"""
+	if params.get("shader") is Dictionary:
+		return _create_shader_material(params["shader"])
+
 	var mat: BaseMaterial3D
 	if existing_mat and existing_mat is BaseMaterial3D:
 		mat = existing_mat.duplicate()
@@ -1705,7 +1747,8 @@ func create_godot_material(params: Dictionary, existing_mat: Material = null) ->
 		has_emissive_color = maxf(emissive_col.r, maxf(emissive_col.g, emissive_col.b)) > 0.0
 	var emissive_energy := maxf(0.0, Common.get_num(params, "emissive_energy", 1.0))
 
-	if emissive_tex != "":
+	# A color multiplies the map, so an explicit black one switches it off.
+	if emissive_tex != "" and (has_emissive_color or not (emissive_raw is Array)):
 		var tex_path := find_texture_path(active_textures_folder, emissive_tex)
 		if tex_path != "":
 			var tex := load_texture(tex_path)

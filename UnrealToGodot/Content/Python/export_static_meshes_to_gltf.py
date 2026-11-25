@@ -16,6 +16,7 @@ import json
 import shutil
 import unreal
 
+import material_shader
 import ue2g_common
 
 
@@ -1035,6 +1036,7 @@ def export_all_level_meshes(export_dir=None, export_animations=False, export_lod
 
     # 2. Scan level for all unique meshes
     ue2g_common.clear_material_trace_cache()
+    material_shader.clear_cache()
     try:
         actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
         all_actors = actor_subsystem.get_all_level_actors()

@@ -489,10 +489,15 @@ assert gd_const("UNREAL_TONEMAP") == "Environment.TONE_MAPPER_ACES",     "addon 
 for gd_name, py_value in (("UE_DEFAULT_EXPOSURE_BIAS", tscn_writer._UE_DEFAULT_EXPOSURE_BIAS),
                           ("MIDDLE_GREY", tscn_writer._MIDDLE_GREY),
                           ("ISO_REFERENCE", tscn_writer._ISO_REFERENCE),
+                          ("FOG_DENSITY_SCALE", tscn_writer.FOG_DENSITY_SCALE),
+                          ("FOG_DEPTH_RANGE", tscn_writer.FOG_DEPTH_RANGE),
                           ("EXPOSURE_SPEED_SCALE", tscn_writer._EXPOSURE_SPEED_SCALE)):
     assert abs(gd_num(gd_name) - py_value) < 1e-9,         "%s: addon says %s, tscn_writer says %s" % (gd_name, gd_num(gd_name), py_value)
 # The two scalar heuristics that actually diverged, read straight out of the addon.
-assert 'Common.get_num(fog, "fog_density", 0.02) * 0.5' in gd,     "addon fog density heuristic changed; tscn_writer's *0.5 no longer matches"
+for gd_prop in ("env.fog_density = ", "env.fog_light_energy = ", "env.fog_light_color = ", "env.fog_sky_affect = "):
+    assert gd_prop in gd, "addon no longer sets %r; tscn_writer would drift" % gd_prop
+assert tscn_writer.SKY_SHADER in gd.replace("\r\n", "\n"), "the two sky shaders differ"
+assert "fog_height_density" not in gd, "Godot's height fog ignores distance; tscn_writer does not write it"
 assert 'Common.get_num(settings, "ao_intensity", 0.5) * 2.0' in gd,     "addon ssao intensity heuristic changed; tscn_writer's *2.0 no longer matches"
 print("environment constants agree with import_environment.gd")
 
@@ -501,7 +506,7 @@ print("environment constants agree with import_environment.gd")
 blood = node_block("Blood_1")
 assert "size = Vector3(2.0, 0.5, 2.0)" in blood, "decal size missing: %s" % blood
 assert "sorting_offset = 3.0" in blood, "decal sort_order missing: %s" % blood
-assert "modulate = Color(0.8, 0.2, 0.2, 0.5)" in blood, "decal modulate missing: %s" % blood
+assert "modulate = %s" % tscn_writer._color_literal([0.8, 0.2, 0.2, 0.5]) in blood, "decal modulate missing: %s" % blood
 assert "distance_fade_enabled = true" in blood and "distance_fade_begin = 9.0" in blood \
     and "distance_fade_length = 3.0" in blood, "decal distance fade missing: %s" % blood
 assert "texture_albedo = ExtResource(" in blood, "decal albedo not bound: %s" % blood
@@ -565,9 +570,13 @@ assert "distance_fade" not in sun, "a light UE never culls must not fade: %s" % 
 
 spot = node_block("Spot_1")
 assert node_type("Spot_1") == "SpotLight3D", "spot light class wrong: %s" % node_type("Spot_1")
+assert "spot_attenuation = 2.0" in spot, "inverse-square decay missing: %s" % spot
 assert "spot_range = 12.0" in spot and "spot_angle = 40.0" in spot, "spot cone missing: %s" % spot
-# outer 40 / (40 - 20) = 2.0
-assert "spot_angle_attenuation = 2.0" in spot, "spot inner-cone falloff missing: %s" % spot
+# 1 - rim^(1/a) = 0.5 where UE's ((cos - cos40) / (cos20 - cos40))^2 = 0.5
+assert abs(float(re.search(r"spot_angle_attenuation = ([0-9.]+)", spot).group(1)) - 1.0734) < 1e-3, spot
+# A sharper cone (inner near outer) is a SMALLER exponent in Godot, never a larger one.
+assert tscn_writer._spot_softness(60, 80) < tscn_writer._spot_softness(0, 80)
+assert tscn_writer._spot_softness(44, 44) == 0.05
 assert "light_indirect_energy = 0.25" in spot, "indirect energy missing: %s" % spot
 assert "light_volumetric_fog_energy = 2.0" in spot, "volumetric scattering missing: %s" % spot
 assert "light_specular = 0.25" in spot, "local specular must scale Godot's 0.5 default: %s" % spot
@@ -585,7 +594,7 @@ assert "visible = false" in rect, "an invisible light must import invisible: %s"
 
 for gd_prop in ("light.light_indirect_energy =", "light.light_volumetric_fog_energy =",
                 "light.light_specular *=", "light.distance_fade_enabled = true",
-                "spot.spot_angle_attenuation =", "sun.light_angular_distance =",
+                "spot.spot_angle_attenuation =", "spot_attenuation = 2.0", "omni_attenuation = 2.0", "sun.light_angular_distance =",
                 "sun.directional_shadow_max_distance =", "light.light_size ="):
     assert gd_prop in gd, "addon no longer sets %r; tscn_writer would drift" % gd_prop
 print("light properties agree with import_environment.gd")
@@ -689,16 +698,41 @@ assert "auto_exposure_min_sensitivity = 25.0" in joined, f"100/max_lum expected,
 assert "auto_exposure_max_sensitivity = 200.0" in joined, f"100/min_lum expected, got {joined}"
 assert "auto_exposure_speed = 0.5" in joined, f"UE default speed must land on Godot's, got {joined}"
 assert abs(exp - 1.0) < 1e-9, f"ranged exposure keeps 2^bias, got {exp}"
+exp, attrs = exposure(exposure_min_brightness=0.432, exposure_max_brightness=0.432,
+                  exposure_bias=0.0, gain=[1.2, 1.2, 1.2, 1.0], gamma=[1.15, 1.15, 1.15, 1.0])
+assert abs(exp - 0.18 / 0.432 * 1.2 * 0.18 ** (1.0 / 1.15 - 1.0)) < 1e-9, f"grade not applied: {exp}"
+assert exposure(gain=[2.0, 2.0, 2.0, 1.0])[0] == 2.0, "gain alone must set the exposure"
 print("exposure mapping OK: bias-only, locked, and ranged all map distinctly")
 
 # And the values actually reach the written scene.
 env_blk = re.search(r'\[sub_resource type="Environment"[^\]]*\](.*?)(?=\n\[)', text, re.S).group(1)
 assert "tonemap_mode = 3" in env_blk, "ACES tonemapper must always be written:\n" + env_blk
 fog_written = float(re.search(r"fog_density = ([0-9.eE+-]+)", env_blk).group(1))
-assert abs(fog_written - 0.01) < 1e-9,     f"UE default fog 0.02 must land on Godot's default 0.01, got {fog_written}"
+assert abs(fog_written - 0.02 * 0.1 * math.log(2.0) ** 2) < 1e-8, f"fog must match UE's transmittance, got {fog_written}"
+assert "fog_height_density" not in env_blk and "fog_light_energy = 1.0" in env_blk, env_blk
+# 0.2140 linear is sRGB mid-grey; the schema is linear, Godot's properties are sRGB.
+assert abs(tscn_writer._linear_to_srgb(0.21404114) - 0.5) < 1e-6
 ssao_written = float(re.search(r"ssao_intensity = ([0-9.eE+-]+)", env_blk).group(1))
 assert abs(ssao_written - 1.0) < 1e-9, f"ao_intensity 0.5 must double to 1.0, got {ssao_written}"
-print("environment block OK: tonemap ACES, fog 0.02->0.01, ssao 0.5->1.0")
+print("environment block OK: tonemap ACES, fog 0.02->0.000961, ssao 0.5->1.0")
+
+# Lumen, a captured sky and a fog start distance (Downtown_Alley).
+assert "sdfgi_enabled" not in text and "ambient_mode" not in text, "SDFGI is for Lumen levels only"
+lumen_writer = tscn_writer._TscnWriter({
+    "gi_method": "lumen",
+    "height_fog": {"fog_density": 0.17, "fog_height_falloff": 2.0, "color": [1, 1, 1],
+                   "start_distance_m": 5.0},
+    "sky_light": {"intensity": 6.0, "color": [1.0, 0.5, 1.0], "gradient": {
+        "top": [0.06, 0.085, 0.1], "horizon": [0.45, 0.55, 0.62], "ground": [0.0, 0.0, 0.0], "falloff": 10.0}},
+}, res_paths, options)
+lumen_writer._build_environment(".")
+lumen_subs = {kind: body for _, kind, body in lumen_writer._sub_resources}
+for line in ("sdfgi_enabled = true", "ssr_enabled = true", "ssr_fade_out = 0.0", "fog_mode = 1", "fog_depth_begin = 5.0", "fog_sky_affect = 0.0"):
+    assert line in lumen_subs["Environment"], (line, lumen_subs["Environment"])
+assert "shader_parameter/light_scale = Vector3(6.0, 3.0, 6.0)" in lumen_subs["ShaderMaterial"], \
+    lumen_subs["ShaderMaterial"]
+assert not any(line.startswith("ambient_light_energy") for line in lumen_subs["Environment"])
+print("ambient OK: captured sky, SDFGI for Lumen, fog start distance")
 
 # Pin Phase 1 addon material/normal-flip/external-.tres contracts so nothing drifts.
 LAYOUT_GD_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

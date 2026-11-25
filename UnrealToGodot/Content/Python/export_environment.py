@@ -45,19 +45,16 @@ imported up to 625x brighter or 12x dimmer purely depending on which unit the
 artist happened to author it in, because each unit had its own unrelated
 divisor. They now agree with each other by construction.
 
-**Step 2 -- anchor to Godot's defaults.** A single scale maps candelas to
-light_energy, chosen so an untouched Unreal light lands on an untouched Godot
-light (further tunable at import time via options.light_energy_scale):
+**Step 2 -- map to light_energy** (further tunable at import time via
+options.light_energy_scale):
 
-    local (point/spot/rect) -> candelas / 8.0
+    local (point/spot/rect) -> candelas / pi
     lux (directional)       -> intensity / 10.0
 
-Both anchors are the engine defaults: UE 5.7 ships local lights at 5000
-unitless, which is exactly 8 cd, and directional lights at 10 lux; Godot ships
-every Light3D at light_energy 1.0. This is a calibration, not a photometric
-identity -- two tonemapped renderers cannot be matched by a constant -- but it
-makes the common case land right instead of 625x hot, which is what the old
-"unitless -> intensity / 8.0" curve did to every default-authored UE light.
+Local lights match exactly: a white surface 1 m away reflects cd/pi in Unreal, and
+`light_energy` in Godot with the attenuation exponent at 2. Directional lights keep
+the engine-default anchor (UE ships 10 lux, Godot energy 1.0), because a sunlit
+Unreal level usually relies on auto exposure that the Godot scene does not have.
 
 The raw `intensity` + `intensity_units` are always stored too, alongside the
 normalised `intensity_candelas`, so the value can be re-derived or hand-tuned
@@ -109,10 +106,8 @@ _SKY_ATMOSPHERE_CLASS = getattr(unreal, "SkyAtmosphere", None)
 # ULocalLightComponent::GetUnitsConversionFactor uses for Unitless -> Candelas.
 _UNITLESS_TO_CANDELA = 16.0 / (100.0 * 100.0)
 
-# Anchors mapping Unreal's physical units onto Godot's unitless light_energy.
-# Both are the engines' own defaults: UE ships local lights at 5000 unitless
-# (= 8 cd) and directional lights at 10 lux, Godot ships Light3D at energy 1.0.
-_CANDELA_PER_GODOT_ENERGY = 8.0
+# Unreal's physical units per Godot light_energy; see the module docstring.
+_CANDELA_PER_GODOT_ENERGY = math.pi
 _LUX_PER_GODOT_ENERGY = 10.0
 
 
@@ -409,6 +404,11 @@ def _build_light_entry(actor, light_comp, name):
 
         intensity_candelas = _intensity_in_candelas(
             light_comp, light_type, intensity, units_for_conversion, outer_cone_angle_deg)
+        # shortcut: an IES profile keeps only its peak, and only on spots, where the cone
+        # bounds it; carry the profile's shape if a pack relies on it.
+        ies = ue2g_common.safe_get_prop(light_comp, "ies_texture", None)
+        if light_type == "spot" and ies is not None:
+            intensity_candelas *= _f(ue2g_common.safe_get_prop(ies, "texture_multiplier", 1.0), 1.0)
         godot_energy = _compute_godot_energy(intensity_candelas)
 
         if intensity > 0.0 and intensity_candelas <= 0.0 and units_for_conversion == "nits":
@@ -514,6 +514,33 @@ def _map_exposure_method(value):
     return "auto"
 
 
+def _map_gi_method(value):
+    """unreal.DynamicGlobalIlluminationMethod, or its console variable, to a schema string."""
+    return "lumen" if value == 1 or "LUMEN" in str(value).upper() else "other"
+
+
+def _project_gi_method():
+    get_cvar = getattr(getattr(unreal, "SystemLibrary", None),
+                       "get_console_variable_int_value", None)
+    return _map_gi_method(get_cvar("r.DynamicGlobalIlluminationMethod")) if get_cvar else None
+
+
+def _exposure_luminance(value):
+    """
+    Min/max exposure brightness in cd/m^2. Projects with the extended luminance
+    range (the UE 5 default) author it as EV100, where Unreal's exposure is
+    1 / (1.2 * 2^EV); consumers compute 0.18 / luminance, hence the 0.18.
+    """
+    value = _f(value, None)
+    system = getattr(unreal, "SystemLibrary", None)
+    get_cvar = getattr(system, "get_console_variable_int_value", None)
+    if value is None or get_cvar is None:
+        return value
+    if get_cvar("r.DefaultFeature.AutoExposure.ExtendDefaultLuminanceRange"):
+        return 0.18 * 1.2 * 2.0 ** value
+    return value
+
+
 def _size_to_godot(v):
     """
     Converts an Unreal extent/size vector (cm, always non-negative
@@ -556,16 +583,18 @@ def _build_post_process_entry(actor):
         "exposure_method": _pp_field(
             settings, "override_auto_exposure_method", "auto_exposure_method", _map_exposure_method
         ),
-        # The auto-exposure adaptation range, in UE's cd/m^2. Shipping only the
+        # The auto-exposure adaptation range, in cd/m^2. Shipping only the
         # BIAS was not enough: a volume that locks exposure by setting
         # min_brightness == max_brightness (the standard "manual exposure"
         # idiom, and the single most visually dominant setting a grade can
         # carry) overrides NEITHER the bias nor the method, so the whole grade
         # exported as null and Godot fell back to a linear tonemapper.
         "exposure_min_brightness": _pp_field(
-            settings, "override_auto_exposure_min_brightness", "auto_exposure_min_brightness"),
+            settings, "override_auto_exposure_min_brightness", "auto_exposure_min_brightness",
+            _exposure_luminance),
         "exposure_max_brightness": _pp_field(
-            settings, "override_auto_exposure_max_brightness", "auto_exposure_max_brightness"),
+            settings, "override_auto_exposure_max_brightness", "auto_exposure_max_brightness",
+            _exposure_luminance),
         "exposure_speed_up": _pp_field(
             settings, "override_auto_exposure_speed_up", "auto_exposure_speed_up"),
         "exposure_speed_down": _pp_field(
@@ -573,6 +602,10 @@ def _build_post_process_entry(actor):
         "white_temp": _pp_field(settings, "override_white_temp", "white_temp"),
         "saturation": _pp_field(settings, "override_color_saturation", "color_saturation", _vec4_to_list),
         "contrast": _pp_field(settings, "override_color_contrast", "color_contrast", _vec4_to_list),
+        "gain": _pp_field(settings, "override_color_gain", "color_gain", _vec4_to_list),
+        "gamma": _pp_field(settings, "override_color_gamma", "color_gamma", _vec4_to_list),
+        "gi_method": _pp_field(settings, "override_dynamic_global_illumination_method",
+                               "dynamic_global_illumination_method", _map_gi_method),
         "vignette_intensity": _pp_field(settings, "override_vignette_intensity", "vignette_intensity"),
     }
 
@@ -604,7 +637,10 @@ def _build_height_fog(actor):
 
     density = ue2g_common.safe_get_prop(comp, "fog_density", None)
     falloff = ue2g_common.safe_get_prop(comp, "fog_height_falloff", None)
-    color_raw = ue2g_common.safe_get_prop(comp, "fog_inscattering_color", None)
+    # Renamed in UE 5; the old name reads as None there.
+    color_raw = ue2g_common.safe_get_prop(comp, "fog_inscattering_luminance", None)
+    if color_raw is None:
+        color_raw = ue2g_common.safe_get_prop(comp, "fog_inscattering_color", None)
     color = ue2g_common.linear_color_to_list(color_raw) if color_raw is not None else [1.0, 1.0, 1.0]
     start_distance = ue2g_common.safe_get_prop(comp, "start_distance", None)
 
@@ -614,6 +650,106 @@ def _build_height_fog(actor):
         "color": color,
         "start_distance_m": _f(start_distance, 0.0) * ue2g_common.CM_TO_M,
     }
+
+
+# How fast the horizon color gives way to the zenith's; 6.67 is Godot's procedural sky.
+_SKY_FALLOFFS = (1.5, 3.0, 6.67, 10.0, 14.0, 20.0, 30.0)
+_SKY_CAPTURE_SIZE = 32
+
+
+def _fit_sky_gradient(samples):
+    """
+    Horizon color, zenith color and falloff of the two-color sky that best matches the
+    samples, (sine of elevation, weight, (r, g, b)) above the horizon. Least squares, so
+    the total light is the samples'.
+    """
+    cap = sorted(sum(rgb) for _, _, rgb in samples)[int(len(samples) * 0.98)]
+    best = None
+    for falloff in _SKY_FALLOFFS:
+        s_hh = s_ht = s_tt = 0.0
+        s_hv, s_tv, s_vv = [0.0] * 3, [0.0] * 3, 0.0
+        for sine, weight, rgb in samples:
+            h = (1.0 - math.asin(min(sine, 1.0)) / (0.5 * math.pi)) ** falloff
+            t = 1.0 - h
+            # A sun disc would count twice: its light is a directional light.
+            scale = min(1.0, cap / max(sum(rgb), 1e-9))
+            s_hh += weight * h * h
+            s_ht += weight * h * t
+            s_tt += weight * t * t
+            for i in range(3):
+                v = rgb[i] * scale
+                s_hv[i] += weight * h * v
+                s_tv[i] += weight * t * v
+                s_vv += weight * v * v
+        det = s_hh * s_tt - s_ht * s_ht
+        horizon = [max(0.0, (s_tt * hv - s_ht * tv) / det) for hv, tv in zip(s_hv, s_tv)]
+        top = [max(0.0, (tv - s_ht * h) / s_tt) for tv, h in zip(s_tv, horizon)]
+        error = s_vv + sum(
+            h * h * s_hh + t * t * s_tt + 2.0 * (h * t * s_ht - h * hv - t * tv)
+            for h, t, hv, tv in zip(horizon, top, s_hv, s_tv))
+        if best is None or error < best[0]:
+            best = (error, horizon, top, falloff)
+    return best[1:]
+
+
+def _capture_sky(actor, comp):
+    """
+    Renders what the sky light sees (everything past its sky distance threshold) and
+    returns {"top", "horizon", "ground"}, linear cd/m^2, and "falloff", or None when nothing can be
+    rendered (a commandlet).
+
+    shortcut: a sky light with its own cubemap gets the visible sky; read the cubemap
+    if a level lights itself with a different one.
+    """
+    world = actor.get_world()
+    actors = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    selection = actors.get_selected_level_actors()
+    capture = actors.spawn_actor_from_class(
+        unreal.SceneCapture2D, comp.get_world_location(), unreal.Rotator(), transient=True)
+    try:
+        size = _SKY_CAPTURE_SIZE
+        target = unreal.RenderingLibrary.create_render_target2d(
+            world, size, size, unreal.TextureRenderTargetFormat.RTF_RGBA32F)
+        cc = capture.capture_component2d
+        for prop, value in (("texture_target", target), ("fov_angle", 90.0),
+                            ("capture_every_frame", False), ("capture_on_movement", False),
+                            ("capture_source", unreal.SceneCaptureSource.SCS_SCENE_COLOR_HDR),
+                            ("override_custom_near_clipping_plane", True),
+                            ("custom_near_clipping_plane", _f(ue2g_common.safe_get_prop(
+                                comp, "sky_distance_threshold", 150000.0), 150000.0))):
+            cc.set_editor_property(prop, value)
+
+        sky, below = [], []
+        for pitch, yaw in ((90, 0), (0, 0), (0, 90), (0, 180), (0, 270)):
+            capture.set_actor_rotation(unreal.Rotator(roll=0, pitch=pitch, yaw=yaw), False)
+            cc.capture_scene()
+            pixels = unreal.RenderingLibrary.read_render_target_raw(world, target, False)
+            for index, px in enumerate(pixels):
+                row, col = divmod(index, size)
+                x = (col + 0.5) / size * 2.0 - 1.0
+                y = 1.0 - (row + 0.5) / size * 2.0
+                inv = 1.0 / math.sqrt(1.0 + x * x + y * y)
+                sine = (1.0 if pitch else y) * inv
+                rgb = (px.r, px.g, px.b)
+                if sine > 0.0:
+                    # Solid angle times cosine: what the pixel adds to the ground's light.
+                    sky.append((sine, inv ** 3 * sine, rgb))
+                else:
+                    below.append(rgb)
+    finally:
+        actors.destroy_actor(capture)
+        actors.set_selected_level_actors(selection)
+
+    if not any(sum(rgb) > 0.0 for _, _, rgb in sky):
+        return None
+    horizon, top, falloff = _fit_sky_gradient(sky)
+    if _b(ue2g_common.safe_get_prop(comp, "lower_hemisphere_is_black", True), True):
+        ground = ue2g_common.linear_color_to_list(
+            ue2g_common.safe_get_prop(comp, "lower_hemisphere_color", None)
+            or unreal.LinearColor(0.0, 0.0, 0.0))
+    else:
+        ground = [sum(rgb[i] for rgb in below) / len(below) for i in range(3)]
+    return {"top": top, "horizon": horizon, "ground": ground, "falloff": falloff}
 
 
 def _build_sky_light(actor):
@@ -633,9 +769,16 @@ def _build_sky_light(actor):
     color_raw = ue2g_common.safe_get_prop(comp, "light_color", None)
     color = ue2g_common.linear_color_to_list(color_raw) if color_raw is not None else [1.0, 1.0, 1.0]
 
+    gradient = None
+    try:
+        gradient = _capture_sky(actor, comp)
+    except Exception as e:
+        _log_actor_warning(actor, "could not capture the sky; Godot's default sky is used", e)
+
     return {
         "intensity": _f(intensity, 1.0),
         "color": color,
+        "gradient": gradient,
     }
 
 
@@ -1696,7 +1839,8 @@ def collect_environment(all_actors, collected_textures,
     """
     Scans all_actors and returns:
         {"lights": [...], "post_process": [...], "height_fog": {...} | None,
-         "sky_light": {...} | None, "has_sky_atmosphere": bool, "decals": [...],
+         "sky_light": {...} | None, "has_sky_atmosphere": bool,
+         "gi_method": str | None, "decals": [...],
          "reflection_probes": [...], "cameras": [...], "audio": [...]}
 
     Never raises and never shows dialogs: failures are logged via
@@ -1708,6 +1852,7 @@ def collect_environment(all_actors, collected_textures,
         "height_fog": None,
         "sky_light": None,
         "has_sky_atmosphere": False,
+        "gi_method": _project_gi_method() if include_lights else None,
         "decals": [],
         "reflection_probes": [],
         "cameras": [],

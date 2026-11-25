@@ -11,7 +11,7 @@ extends RefCounted
 # - light_energy = godot_energy (pre-converted by the exporter) * light_energy_scale
 # - light_specular = UE SpecularScale * Godot's per-class default (1.0 directional,
 #   0.5 omni/spot), so a default UE light keeps Godot's stock look
-# - UE exponential height fog density (~0.02 default) -> Godot fog_density * 0.5
+# - UE FogDensity -> Godot fog_density * FOG_DENSITY_SCALE
 # - UE AO radius is exported in cm -> * 0.01 m; UE AO intensity (0..1) -> ssao_intensity * 2.0
 # - Exposure: see _apply_exposure below.
 #
@@ -23,6 +23,35 @@ extends RefCounted
 # ==============================================================================
 
 const Common = preload("res://addons/unreal_importer/import_common.gd")
+
+# Godot's fog is e^-(density per m). Unreal's, measured on UE 5.8, is e^-(ln 2 * ln 2 *
+# FogDensity / 1000 per cm): one ln 2 from its base-2 exponential, one from its line
+# integral. 0.1 * ln 2 * ln 2.
+const FOG_DENSITY_SCALE := 0.0480453
+
+# Fog with a start distance uses Godot's depth fog, whose curve (0.5) follows Unreal's
+# exponential within a few percent up to this optical depth, where it stops growing.
+const FOG_DEPTH_RANGE := 1.2
+
+# Twin of tscn_writer.py's SKY_SHADER: the sky measured in Unreal. A shader because
+# ProceduralSkyMaterial cannot light the scene differently from how it looks.
+const SKY_SHADER := """shader_type sky;
+
+uniform vec3 top;
+uniform vec3 horizon;
+uniform vec3 ground;
+uniform float falloff;
+uniform vec3 light_scale;
+
+void sky() {
+	float elevation = asin(clamp(EYEDIR.y, 0.0, 1.0)) / (0.5 * PI);
+	COLOR = mix(top, horizon, pow(1.0 - elevation, falloff));
+	// Lighting only: Unreal scales the sky light and replaces its lower half, not the sky you see.
+	if (AT_CUBEMAP_PASS) {
+		COLOR = (EYEDIR.y >= 0.0 ? COLOR : ground) * light_scale;
+	}
+}
+"""
 
 # Fallback attenuation radius (m) for a light whose AttenuationRadius could not
 # be read. UE's own default is 1000 cm, so that is the honest stand-in.
@@ -99,7 +128,7 @@ func apply(data: Dictionary, root: Node, scene_owner: Node, options: Dictionary)
 	if options.get("apply_decals", true):
 		created += _apply_decals(data.get("decals", []), root, scene_owner, options, warnings)
 	if options.get("apply_reflection_probes", true):
-		created += _apply_reflection_probes(data.get("reflection_probes", []), root, scene_owner)
+		created += _apply_reflection_probes(data.get("reflection_probes", []), root, scene_owner, _uses_lumen(data))
 	if options.get("apply_cameras", true):
 		created += _apply_cameras(data.get("cameras", []), root, scene_owner)
 	if options.get("apply_audio", true):
@@ -164,22 +193,26 @@ func _apply_lights(lights, root: Node, scene_owner: Node, energy_scale: float) -
 			light.distance_fade_length = maxf(float(fade_length), 0.01)
 
 		var radius := Common.get_num(entry, "attenuation_radius_m", DEFAULT_ATTENUATION_M)
+		# Godot's decay 2 is UE's inverse-square falloff, window included.
+		var inverse_square := bool(entry.get("inverse_squared_falloff", true))
 		# UE SourceRadius -> Godot light_size, which is what drives soft shadows;
 		# it was exported but dropped on the floor before.
 		var source_radius := maxf(0.0, Common.get_num(entry, "source_radius_m", 0.0))
 		if light is OmniLight3D:
 			(light as OmniLight3D).omni_range = maxf(0.01, radius)
+			if inverse_square:
+				(light as OmniLight3D).omni_attenuation = 2.0
 			light.light_size = source_radius
 		elif light is SpotLight3D:
 			var spot := light as SpotLight3D
 			spot.spot_range = maxf(0.01, radius)
+			if inverse_square:
+				spot.spot_attenuation = 2.0
 			spot.light_size = source_radius
 			var outer := Common.get_num(entry, "outer_cone_angle_deg", 44.0)
 			var inner := Common.get_num(entry, "inner_cone_angle_deg", 0.0)
 			spot.spot_angle = clampf(outer, 0.5, MAX_SPOT_ANGLE_DEG)
-			# Sharper falloff the closer the inner cone is to the outer cone
-			if outer > 0.0 and inner > 0.0 and inner < outer:
-				spot.spot_angle_attenuation = clampf(outer / maxf(outer - inner, 0.5), 0.5, 8.0)
+			spot.spot_angle_attenuation = _spot_softness(inner, outer)
 		elif light is DirectionalLight3D:
 			var sun := light as DirectionalLight3D
 			# UE LightSourceAngle and Godot light_angular_distance are the same
@@ -208,13 +241,10 @@ func _apply_lights(lights, root: Node, scene_owner: Node, energy_scale: float) -
 	return count
 
 
-func _apply_environment(data: Dictionary, root: Node, scene_owner: Node, warnings: PackedStringArray) -> int:
-	var volumes = data.get("post_process", [])
-	var fog = data.get("height_fog")
-	var sky_light = data.get("sky_light")
-	var has_atmosphere := bool(data.get("has_sky_atmosphere", false))
-
+func _main_post_process(data: Dictionary) -> Dictionary:
+	"""The highest-priority unbound volume drives the WorldEnvironment."""
 	var best: Dictionary = {}
+	var volumes = data.get("post_process", [])
 	if volumes is Array:
 		for vol in volumes:
 			if not (vol is Dictionary):
@@ -223,6 +253,21 @@ func _apply_environment(data: Dictionary, root: Node, scene_owner: Node, warning
 				continue
 			if best.is_empty() or Common.get_num(vol, "priority", 0.0) > Common.get_num(best, "priority", 0.0):
 				best = vol
+	return best
+
+
+func _uses_lumen(data: Dictionary) -> bool:
+	var settings = _main_post_process(data).get("settings")
+	var method = settings.get("gi_method") if settings is Dictionary else null
+	return str(method if method != null else data.get("gi_method")) == "lumen"
+
+
+func _apply_environment(data: Dictionary, root: Node, scene_owner: Node, warnings: PackedStringArray) -> int:
+	var fog = data.get("height_fog")
+	var sky_light = data.get("sky_light")
+	var has_atmosphere := bool(data.get("has_sky_atmosphere", false))
+
+	var best := _main_post_process(data)
 
 	var has_any: bool = (not best.is_empty()) or (fog is Dictionary) or (sky_light is Dictionary) or has_atmosphere
 	if not has_any:
@@ -239,13 +284,14 @@ func _apply_environment(data: Dictionary, root: Node, scene_owner: Node, warning
 	var camera_attributes: CameraAttributes = null
 
 	# Sky / ambient
+	var gradient = sky_light.get("gradient") if sky_light is Dictionary else null
 	if (sky_light is Dictionary) or has_atmosphere:
 		env.background_mode = Environment.BG_SKY
 		var sky := Sky.new()
-		sky.sky_material = ProceduralSkyMaterial.new()
+		sky.sky_material = _sky_material(sky_light, gradient) if gradient is Dictionary else ProceduralSkyMaterial.new()
 		env.sky = sky
 		env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
-		if sky_light is Dictionary:
+		if sky_light is Dictionary and not (gradient is Dictionary):
 			if sky_light.get("color") != null:
 				env.ambient_light_color = Common.color_from_array(sky_light.get("color"), Color.WHITE)
 			env.ambient_light_energy = clampf(Common.get_num(sky_light, "intensity", 1.0), 0.0, 16.0)
@@ -254,6 +300,13 @@ func _apply_environment(data: Dictionary, root: Node, scene_owner: Node, warning
 		# project happens to carry. Matches tscn_writer.py's else-branch.
 		env.background_mode = Environment.BG_COLOR
 		env.background_color = Color(0, 0, 0, 1)
+
+	# Lumen keeps sky light out of enclosed places; SDFGI is Godot's closest match.
+	env.sdfgi_enabled = _uses_lumen(data)
+	# Lumen also reflects the scene in wet ground; the default fade stops a few meters out.
+	env.ssr_enabled = env.sdfgi_enabled
+	if env.ssr_enabled:
+		env.ssr_fade_out = 0.0
 
 	# Post-process settings from the winning unbound volume
 	if not best.is_empty():
@@ -284,9 +337,30 @@ func _apply_environment(data: Dictionary, root: Node, scene_owner: Node, warning
 	# Height fog
 	if fog is Dictionary:
 		env.fog_enabled = true
-		env.fog_density = clampf(Common.get_num(fog, "fog_density", 0.02) * 0.5, 0.0, 1.0)
-		env.fog_light_color = Common.color_from_array(fog.get("color"), Color(0.62, 0.7, 0.8))
-		env.fog_height_density = clampf(Common.get_num(fog, "fog_height_falloff", 0.2), 0.0, 1.0)
+		var density := maxf(0.0, Common.get_num(fog, "fog_density", 0.02))
+		var rate := density * FOG_DENSITY_SCALE
+		var start := Common.get_num(fog, "start_distance_m", 0.0)
+		if start > 0.0 and rate > 0.0:
+			env.fog_mode = Environment.FOG_MODE_DEPTH
+			env.fog_density = 1.0 - exp(-FOG_DEPTH_RANGE)
+			env.fog_depth_curve = 0.5
+			env.fog_depth_begin = start
+			env.fog_depth_end = start + FOG_DEPTH_RANGE / rate
+		else:
+			env.fog_density = clampf(rate, 0.0, 1.0)
+		# An inscattering color above 1 is a brightness, which Godot keeps apart.
+		var fog_color = fog.get("color")
+		if fog_color is Array and fog_color.size() >= 3:
+			var peak := maxf(1.0, maxf(float(fog_color[0]), maxf(float(fog_color[1]), float(fog_color[2]))))
+			env.fog_light_energy = peak
+			fog_color = [float(fog_color[0]) / peak, float(fog_color[1]) / peak, float(fog_color[2]) / peak]
+		env.fog_light_color = Common.color_from_array(fog_color, Color(0.62, 0.7, 0.8))
+		# Godot's height fog ignores distance, so UE's falloff cannot map onto it;
+		# what it does decide is how much fog lies between the ground and the sky.
+		var falloff := Common.get_num(fog, "fog_height_falloff", 0.2)
+		env.fog_sky_affect = 1.0 - exp(-2.0 * density / falloff) if falloff > 0.0 else 1.0
+		if gradient is Dictionary:
+			env.fog_sky_affect = 0.0  # The captured sky has its fog in it.
 
 	var world_env := WorldEnvironment.new()
 	world_env.name = "UnrealEnvironment"
@@ -295,6 +369,19 @@ func _apply_environment(data: Dictionary, root: Node, scene_owner: Node, warning
 		world_env.camera_attributes = camera_attributes
 	Common.add_owned_child(root, world_env, scene_owner)
 	return 1
+
+
+func _sky_material(sky_light: Dictionary, gradient: Dictionary) -> ShaderMaterial:
+	var shader := Shader.new()
+	shader.code = SKY_SHADER
+	var material := ShaderMaterial.new()
+	material.shader = shader
+	for key in ["top", "horizon", "ground"]:
+		material.set_shader_parameter(key, Common.vec3_from_array(gradient.get(key), Vector3.ZERO))
+	material.set_shader_parameter("falloff", Common.get_num(gradient, "falloff", 6.67))
+	var tint := Common.vec3_from_array(sky_light.get("color"), Vector3.ONE)
+	material.set_shader_parameter("light_scale", tint * Common.get_num(sky_light, "intensity", 1.0))
+	return material
 
 
 func _apply_exposure(settings: Dictionary, env: Environment) -> CameraAttributes:
@@ -308,14 +395,15 @@ func _apply_exposure(settings: Dictionary, env: Environment) -> CameraAttributes
 	# unspecified UE exposure means.
 	var has_bias: bool = settings.get("exposure_bias") != null
 	var bias := Common.get_num(settings, "exposure_bias", UE_DEFAULT_EXPOSURE_BIAS)
-	var bias_scale := pow(2.0, bias)
+	var grade := _grade_scale(settings)
+	var bias_scale := pow(2.0, bias) * grade
 
 	var min_raw = settings.get("exposure_min_brightness")
 	var max_raw = settings.get("exposure_max_brightness")
 	if min_raw == null or max_raw == null:
 		# Bias-only (or nothing): the pre-existing behaviour, deliberately kept.
-		if has_bias:
-			env.tonemap_exposure = bias_scale
+		if has_bias or grade != 1.0:
+			env.tonemap_exposure = bias_scale if has_bias else grade
 		return null
 
 	var min_lum := maxf(Common.get_num(settings, "exposure_min_brightness", 1.0), 0.0001)
@@ -471,12 +559,12 @@ func _crop_decal_texture(
 	if img.has_mipmaps():
 		out.generate_mipmaps()
 
-	var result := ImageTexture.create_from_image(out)
+	var result := Common.save_generated_texture(out, path, cache_key)
 	_decal_crop_cache[cache_key] = result
 	return result
 
 
-func _apply_reflection_probes(probes, root: Node, scene_owner: Node) -> int:
+func _apply_reflection_probes(probes, root: Node, scene_owner: Node, uses_lumen: bool) -> int:
 	if probes == null or not (probes is Array) or probes.is_empty():
 		return 0
 	var container := Node3D.new()
@@ -495,6 +583,9 @@ func _apply_reflection_probes(probes, root: Node, scene_owner: Node) -> int:
 		probe.intensity = clampf(Common.get_num(entry, "intensity", 1.0), 0.0, 16.0)
 		probe.box_projection = bool(entry.get("box_projection", true))
 		probe.update_mode = ReflectionProbe.UPDATE_ONCE
+		# Unreal's captures only reflect; a probe's own ambient would replace SDFGI's.
+		if uses_lumen:
+			probe.ambient_mode = ReflectionProbe.AMBIENT_DISABLED
 		probe.visible = bool(entry.get("visible", true))
 		probe.set_meta("unreal_probe_shape", Common.get_str(entry, "shape", "box"))
 		Common.add_owned_child(container, probe, scene_owner)
@@ -589,6 +680,29 @@ func _find_world_environment(root: Node) -> WorldEnvironment:
 		if found != null:
 			return found
 	return null
+
+
+func _spot_softness(inner_deg: float, outer_deg: float) -> float:
+	"""Godot fades a spot by 1 - rim^(1/attenuation), Unreal by the squared fraction
+	between its cones; this makes both reach half brightness at the same angle."""
+	var outer := cos(deg_to_rad(clampf(outer_deg, 0.5, MAX_SPOT_ANGLE_DEG)))
+	var inner := maxf(cos(deg_to_rad(maxf(inner_deg, 0.0))), outer)
+	var rim := (1.0 - (outer + sqrt(0.5) * (inner - outer))) / (1.0 - outer)
+	return clampf(log(rim) / log(0.5), 0.05, 8.0)
+
+
+func _grade_scale(settings: Dictionary) -> float:
+	"""Unreal's color gain and gamma as an exposure factor. Godot has neither; gamma
+	is matched at middle grey, where it is a plain multiplier."""
+	var scale := 1.0
+	var gain = settings.get("gain")
+	if gain is Array:
+		scale *= maxf(_avg3(gain) * (float(gain[3]) if gain.size() > 3 else 1.0), 0.0)
+	var gamma = settings.get("gamma")
+	if gamma is Array:
+		var power := _avg3(gamma) * (float(gamma[3]) if gamma.size() > 3 else 1.0)
+		scale *= pow(MIDDLE_GREY, 1.0 / maxf(power, 0.01) - 1.0)
+	return scale
 
 
 func _avg3(arr: Array) -> float:

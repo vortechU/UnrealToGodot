@@ -1162,6 +1162,27 @@ check("an inverted (gloss) map is not bound as roughness",
       _inverted["packed_texture"] is None and _inverted["roughness_texture"] is None, _inverted)
 
 
+# --- emission: only what the graph wires in counts ---
+_glow = _Node("VectorParameter", parameter_name="Emissive Color")
+_win_d, _win_e = _sample(_Tex("T_Window_d"), "Color Map"), _sample(_Tex("T_Window_e"))
+_window = _GraphMat({
+    "MP_BASE_COLOR": (_win_d, "RGB"),
+    "MP_EMISSIVE_COLOR": (_bin("Multiply", (_bin("Multiply", (_win_d, "RGB"),
+                                                 (_win_e, "RGB")), ""), (_glow, "")), "")},
+    vectors={"Emissive Color": _RGBA(0.0, 0.0, 0.0, 1.0)},
+    textures={"Color Map": _Tex("T_Window_d")})
+_p = EL.extract_material_parameters(_graph_mi(_window, vector_parameter_values=[
+    _value_param("Emissive Color", _RGBA(1.0, 0.9, 0.8, 1.0))]))
+check("the glow mask, not the color map it is multiplied with, is the emissive texture",
+      (_p["emissive_texture"], _p["albedo_texture"]) == ("T_Window_e", "T_Window_d"), _p)
+check("a color that reaches emission is exported", _p["emissive_color"] == [1.0, 0.9, 0.8], _p)
+_p = EL.extract_material_parameters(_graph_mi(_GraphMat({
+    "MP_BASE_COLOR": (_sample(_Tex("T_Post_d"), "Base Map"), "RGB")}),
+    vector_parameter_values=[_value_param("Emissive Color", _RGBA(1.0, 0.9, 0.4, 1.0))],
+    scalar_parameter_values=[_value_param("Emissive Strength", 4.0)]))
+check("a color a Blueprint sets on a material without emission does not make it glow",
+      _p["emissive_color"] is None and _p["emissive_energy"] == 1.0, _p)
+
 # --- decal: MaterialInstanceDynamic, tint alpha unused, cropped by scalars ---
 def _decal_graph_mat():
     def scalar(name, mask):
@@ -1210,6 +1231,91 @@ check("a crop running past the edge keeps its full size", _close(rect, [0.875, 0
 check("an uncropped decal records none",
       EE._decal_uv_rect(_decal_mid(0.0, 0.0, 1.0, 1.0)) == (None, False, False))
 check("a tiled decal is refused", EE._decal_uv_rect(_decal_mid(0.0, 0.0, 3.0, 1.0))[0] is None)
+
+# --- layers blended by vertex paint become a shader (Downtown_Alley's puddles) ---
+import base64
+import material_shader as MS
+
+_vc = _Node("VertexColor")
+
+
+def _by_paint(dry, wet):
+    return _Node("LinearInterpolate", [("A",) + dry, ("B",) + wet, ("Alpha", _vc, "G")])
+
+
+def _asphalt(**nodes):
+    dry = _sample(_Tex("T_Asphalt_d"), "Asphalt")
+    water = _Node("VectorParameter", parameter_name="Water Color",
+                  default_value=_RGBA(0.1, 0.2, 0.3, 1.0))
+    rough = _Node("ScalarParameter", parameter_name="Dry Roughness", default_value=0.5)
+    outputs = {"MP_BASE_COLOR": (_by_paint((dry, "RGB"), (water, "RGB")), ""),
+               "MP_ROUGHNESS": (_by_paint((rough, ""), (_Node("Constant", r=0.02), "")), "")}
+    outputs.update(nodes)
+    return _GraphMat(outputs)
+
+
+_road = EL.extract_material_parameters(_asphalt())["shader"]
+check("a vertex-painted material exports a shader, its texture named like any other slot",
+      _road["tex_0"] == "T_Asphalt_d" and list(_road["texture_paths"]) == ["tex_0"], _road)
+_lines = [line.strip() for line in _road["code"].splitlines()]
+check("...that blends by the painted channel",
+      sum(line.endswith(", COLOR.g);") or ".g" in line and "mix(" in line for line in _lines) == 2
+      and "uniform float p_dry_roughness = 0.5;" in _lines
+      and "uniform vec4 p_water_color = vec4(0.1, 0.2, 0.3, 1.0);" in _lines, _road["code"])
+_collected = set()
+EL.extract_material_parameters(_asphalt(), _collected)
+check("...whose textures are exported", "T_Asphalt_d" in {t.get_name() for t in _collected})
+_renamed = {"shader": dict(_road, texture_paths=dict(_road["texture_paths"]))}
+EL.apply_texture_export_names(_renamed, {_road["texture_paths"]["tex_0"]: "T_Asphalt_d_1234"})
+check("...and follow a renamed file", _renamed["shader"]["tex_0"] == "T_Asphalt_d_1234", _renamed)
+check("a material that reads no vertex paint has no shader", "shader" not in _fence and "shader" not in _p)
+_warnings, _prev_warn = [], u.log_warning
+u.log_warning = _warnings.append
+_custom = EL.extract_material_parameters(_asphalt(MP_METALLIC=(_Node("Custom"), "")))
+u.log_warning = _prev_warn
+check("a node with no translation keeps the single-layer material, and says so",
+      "shader" not in _custom and any("Custom" in w for w in _warnings), _warnings)
+
+# --- the paint: read per placement, positions as glTF has them ---
+_unset = object()
+_painted = types.SimpleNamespace(colors=[], points=[types.SimpleNamespace(x=100.0, y=200.0, z=300.0)])
+_geo = {
+    "GeometryScript_SceneUtils": types.SimpleNamespace(copy_mesh_from_component=lambda *a: None),
+    "GeometryScriptCopyMeshFromComponentOptions":
+        lambda: types.SimpleNamespace(set_editor_property=lambda k, v: None),
+    "GeometryScriptMeshReadLOD": types.SimpleNamespace,
+    "GeometryScriptLODType": types.SimpleNamespace(RENDER_DATA=0),
+    "DynamicMesh": lambda: None,
+    "GeometryScript_VertexColors": types.SimpleNamespace(
+        get_mesh_per_vertex_colors=lambda m: (m, _painted.colors)),
+    "GeometryScript_MeshQueries": types.SimpleNamespace(
+        get_all_vertex_positions=lambda m, skip: (m, _painted.points)),
+    "GeometryScript_List": types.SimpleNamespace(
+        convert_color_list_to_array=lambda l: l, convert_vector_list_to_array=lambda l: l),
+}
+_prev = {k: getattr(u, k, _unset) for k in _geo}
+for _k, _v in _geo.items():
+    setattr(u, _k, _v)
+_comp = types.SimpleNamespace(get_materials=lambda m=_asphalt(): [None, m])
+_painted.colors = [_RGBA(0.0, 1.0, 0.5, 1.0)]
+_result = MS.extract_vertex_paint(_comp)
+check("paint is exported as bytes, at glTF's positions",
+      _result and _result[0] == [1.0, 3.0, 2.0]
+      and base64.b64decode(_result[1]) == bytes([0, 255, 128, 255]), _result)
+_painted.colors = [_RGBA(1.0, 1.0, 1.0, 1.0)]
+check("an unpainted placement exports none", MS.extract_vertex_paint(_comp) is None)
+del u.GeometryScript_SceneUtils
+_warnings = []
+u.log_warning = _warnings.append
+check("without the Geometry Script plugin: no paint, one warning",
+      [MS.extract_vertex_paint(_comp), MS.extract_vertex_paint(_comp)] == [None, None]
+      and len(_warnings) == 1, _warnings)
+u.log_warning = _prev_warn
+for _k, _v in _prev.items():
+    if _v is not _unset:
+        setattr(u, _k, _v)
+    elif hasattr(u, _k):
+        delattr(u, _k)
 
 for _name in _GRAPH_API:
     delattr(_FakeMEL, _name)
@@ -1408,8 +1514,8 @@ def _near(a, b, tol=1e-6):
 
 # --- the headline bug: default lights were 625x too bright ------------------
 default_point = _light("point")
-check("UE's default local light (5000 unitless) lands on Godot's default energy",
-      _near(default_point["godot_energy"], 1.0, 1e-6), default_point["godot_energy"])
+check("UE's default local light (8 cd) reflects as much light in Godot: 8 / pi",
+      _near(default_point["godot_energy"], 8.0 / math.pi, 1e-6), default_point["godot_energy"])
 check("UE's default directional light (10 lux) lands on Godot's default energy",
       _near(_light("directional")["godot_energy"], 1.0, 1e-6),
       _light("directional")["godot_energy"])
@@ -1427,7 +1533,7 @@ same = {
 }
 energies = {k: v["godot_energy"] for k, v in same.items()}
 check("the same light authored in any unit imports at the same energy",
-      all(_near(e, 1.0, 1e-6) for e in energies.values()), energies)
+      all(_near(e, 8.0 / math.pi, 1e-6) for e in energies.values()), energies)
 
 # A spot light's lumen->candela factor depends on its cone, per UE's
 # SpotLightComponent::ComputeLightBrightness.
@@ -1436,6 +1542,10 @@ expected_cd = 100.0 / (2.0 * math.pi * (1.0 - math.cos(math.radians(44.0))))
 check("spot lumens are divided by the cone's solid angle, not 4pi",
       _near(spot_lm["intensity_candelas"], expected_cd, 1e-6),
       (spot_lm["intensity_candelas"], expected_cd))
+
+check("a spot's IES profile scales it by its peak, as UE does",
+      _near(_light("spot", intensity=8.0, intensity_units="CANDELAS", ies_texture=types.SimpleNamespace(
+          get_editor_property=lambda k: 4.0))["intensity_candelas"], 32.0, 1e-6))
 
 rect_lm = _light("rect", intensity=100.0, intensity_units="LUMENS")
 check("rect lumens use the panel's cosine distribution (/pi)",
@@ -1450,7 +1560,7 @@ check("nits are scaled by the emissive area instead of falling back to unitless"
 no_isf = _light("point", intensity=5000.0, intensity_units="CANDELAS",
                 use_inverse_squared_falloff=False)
 check("units are ignored when inverse-square falloff is off, as UE ignores them",
-      _near(no_isf["godot_energy"], 1.0, 1e-6) and no_isf["intensity_units"] == "candela",
+      _near(no_isf["godot_energy"], 8.0 / math.pi, 1e-6) and no_isf["intensity_units"] == "candela",
       no_isf["godot_energy"])
 
 # --- component-level collection ---------------------------------------------
@@ -1838,6 +1948,112 @@ survivors = EF.collect_foliage(
     lambda m: m.get_name(), set())
 check("an unreadable instanced component is skipped, not fatal",
       len(survivors) == 1 and survivors[0]["mesh_name"] == "SM_Fern", survivors)
+
+class _FogComp:
+    visible = True
+    hidden_in_game = False
+    fog_density = 0.17
+    fog_height_falloff = 2.0
+    fog_inscattering_luminance = u.LinearColor(0.5, 0.75, 1.0)
+
+    def get_editor_property(self, name):
+        return getattr(self, name)
+
+
+u.ExponentialHeightFogComponent = type("ExponentialHeightFogComponent", (), {})
+_fog_actor = type("Fog", (), {"get_component_by_class": lambda self, cls: _FogComp()})()
+check("fog color is read under its UE 5 name",
+      EE._build_height_fog(_fog_actor)["color"][:3] == [0.5, 0.75, 1.0],
+      EE._build_height_fog(_fog_actor))
+
+# --- sky capture: the fit, and the render it is made from ---
+def _gradient(sine):
+    t = 1.0 - (1.0 - math.asin(sine) / (0.5 * math.pi)) ** 14.0
+    return tuple(h + (z - h) * t for h, z in zip((0.6, 0.7, 0.8), (0.06, 0.08, 0.1)))
+
+
+_sky = [(s / 100.0, 1.0, _gradient(s / 100.0)) for s in range(1, 100)]
+_h, _z, _falloff = EE._fit_sky_gradient(_sky)
+check("a two-color sky is recovered",
+      _falloff == 14.0 and all(_near(a, b, 0.02) for a, b in zip(_h + _z, (0.6, 0.7, 0.8, 0.06, 0.08, 0.1))), (_h, _z, _falloff))
+_h, _z, _ = EE._fit_sky_gradient(_sky + [(0.9, 1.0, (9000.0, 9000.0, 9000.0))])
+check("a sun disc does not brighten the sky", _z[1] < 0.12, _z)
+
+
+class _SkyWorld:
+    """Fog below the horizon, 0.2 above it, as one capture after another would show."""
+    def __init__(self, value=0.2):
+        self.value, self.destroyed, self.selected, self.props, self.pitch = value, 0, None, {}, None
+        self.capture_component2d = self
+
+    get_world = get_world_location = lambda self: None
+    get_selected_level_actors = lambda self: ["keep me selected"]
+    set_editor_property = lambda self, k, v: self.props.__setitem__(k, v)
+    capture_scene = lambda self: None
+
+    def get_editor_property(self, name):
+        return {"sky_distance_threshold": 1234.0, "lower_hemisphere_is_black": False}[name]
+
+    def set_selected_level_actors(self, actors):
+        self.selected = actors
+
+    def spawn_actor_from_class(self, cls, loc, rot, transient=False):
+        assert transient, "a saved capture actor would end up in the user's level"
+        return self
+
+    def destroy_actor(self, actor):
+        self.destroyed += 1
+
+    def set_actor_rotation(self, rot, teleport):
+        self.pitch = rot.pitch
+
+    def read(self, world, target, normalize):
+        assert normalize is False, "normalizing clamps a bright sky to 1"
+        return [types.SimpleNamespace(r=v, g=v, b=v) for row in range(32) for col in range(32)
+                for v in [self.value if self.pitch or row < 16 else self.value * 4]]
+
+
+_unset = object()
+_fake = {"EditorActorSubsystem": None, "SceneCapture2D": None,
+         "TextureRenderTargetFormat": types.SimpleNamespace(RTF_RGBA32F=0),
+         "SceneCaptureSource": types.SimpleNamespace(SCS_SCENE_COLOR_HDR=0),
+         "Rotator": lambda roll=0, pitch=0, yaw=0: types.SimpleNamespace(pitch=pitch)}
+_fake_keys = list(_fake) + ["get_editor_subsystem", "RenderingLibrary"]
+_prev = {k: getattr(u, k, _unset) for k in _fake_keys}
+for _value in (0.2, 0.0):
+    _w = _SkyWorld(_value)
+    _fake.update(get_editor_subsystem=lambda cls, w=_w: w, RenderingLibrary=types.SimpleNamespace(
+        create_render_target2d=lambda *a: None, read_render_target_raw=_w.read))
+    for _k, _v in _fake.items():
+        setattr(u, _k, _v)
+    _sky_result = EE._capture_sky(_w, _w)
+    if _value:
+        check("a uniform sky is captured as one color, its lower half apart",
+              _sky_result and all(_near(v, 0.2, 1e-6) for k in ("top", "horizon") for v in _sky_result[k])
+              and all(_near(v, 0.8, 1e-6) for v in _sky_result["ground"]), _sky_result)
+        check("only what is past the sky distance is captured",
+              _w.props["custom_near_clipping_plane"] == 1234.0, _w.props)
+    else:
+        check("a render that comes back black is no sky at all", _sky_result is None, _sky_result)
+    check("the capture actor is removed and the selection restored",
+          _w.destroyed == 1 and _w.selected == ["keep me selected"])
+for _k, _v in _prev.items():
+    if _v is _unset:
+        delattr(u, _k)
+    else:
+        setattr(u, _k, _v)
+
+check("Lumen is recognised from the enum and the console variable",
+      [EE._map_gi_method(v) for v in ("DynamicGlobalIlluminationMethod.LUMEN", 1, 0, "SCREEN_SPACE")]
+      == ["lumen", "lumen", "other", "other"])
+
+_prev_sys = getattr(u, "SystemLibrary", None)
+for _ext, _want in ((0, 1.0), (1, 0.18 * 1.2 * 2.0)):
+    u.SystemLibrary = type("SystemLibrary", (), {
+        "get_console_variable_int_value": staticmethod(lambda name, v=_ext: v)})
+    check("exposure brightness %s is exported in cd/m^2" % ("EV100" if _ext else "luminance"),
+          _near(EE._exposure_luminance(1.0), _want, 1e-9), EE._exposure_luminance(1.0))
+u.SystemLibrary = _prev_sys
 
 print("\n=== 10. Instanced-component fallback when foliage export is off ===")
 

@@ -194,13 +194,14 @@ static func vec3_from_array(arr, def := Vector3.ZERO) -> Vector3:
 
 
 static func color_from_array(arr, def := Color.WHITE) -> Color:
+	"""Schema colors are linear; Godot's color properties are sRGB."""
 	if arr == null or not (arr is Array):
 		return def
 	var r: float = float(arr[0]) if (arr.size() > 0 and (arr[0] is float or arr[0] is int)) else def.r
 	var g: float = float(arr[1]) if (arr.size() > 1 and (arr[1] is float or arr[1] is int)) else def.g
 	var b: float = float(arr[2]) if (arr.size() > 2 and (arr[2] is float or arr[2] is int)) else def.b
 	var a: float = float(arr[3]) if (arr.size() > 3 and (arr[3] is float or arr[3] is int)) else def.a
-	return Color(r, g, b, a)
+	return Color(r, g, b, a).linear_to_srgb()
 
 
 static func get_num(d: Dictionary, key: String, def: float = 0.0) -> float:
@@ -247,6 +248,24 @@ static func find_file_case_insensitive(folder: String, base_name: String, extens
 		fname = dir.get_next()
 	dir.list_dir_end()
 	return ""
+
+
+static func save_generated_texture(image: Image, source_path: String, key: String) -> Texture2D:
+	"""Image as a texture stored in its own file beside `source_path`, so scenes
+	reference it instead of embedding the pixels in every material that uses it."""
+	var tex := ImageTexture.create_from_image(image)
+	if not source_path.begins_with("res://"):
+		return tex
+	var folder := source_path.get_base_dir().path_join("generated")
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(folder))
+	var path := folder.path_join("%s_%s.res" % [
+		source_path.get_file().get_basename(), key.md5_text().substr(0, 8)])
+	var err := ResourceSaver.save(tex, path, ResourceSaver.FLAG_COMPRESS)
+	if err == OK:
+		tex.take_over_path(path)
+	else:
+		push_warning("Unreal Importer: could not save %s (%s)" % [path, error_string(err)])
+	return tex
 
 
 static func find_texture_path(folders: Array, tex_name: String) -> String:
@@ -440,7 +459,7 @@ static func add_owned_child(parent: Node, child: Node, scene_owner: Node) -> voi
 
 
 static func kelvin_to_color(kelvin: float) -> Color:
-	"""Approximate blackbody color temperature (Kelvin) to linear RGB (Tanner Helland fit)."""
+	"""Approximate blackbody color temperature (Kelvin) to sRGB (Tanner Helland fit)."""
 	var t := clampf(kelvin, 1000.0, 15000.0) / 100.0
 	var r: float
 	var g: float

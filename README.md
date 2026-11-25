@@ -81,6 +81,7 @@ Both plugins stamp and verify a schema `format_version`. A mismatched plugin/add
 │       ├── import_gameplay.gd                # Navigation regions + node metadata
 │       ├── import_skeletal_physics.gd        # Physics asset -> PhysicalBone3D ragdolls
 │       ├── import_spline_mesh.gd             # Spline mesh deformation
+│       ├── import_vertex_paint.gd            # Per-placement vertex paint
 │       ├── import_report.gd                  # Import audit report writer
 │       ├── texture_import_limit.gd           # Texture resolution cap & disk shrinking
 │       ├── importer_dock.gd                  # Editor dock GUI & feature toggles
@@ -97,6 +98,7 @@ Both plugins stamp and verify a schema `format_version`. A mismatched plugin/add
 │   │       ├── export_gameplay.py            # Nav volumes, tags, Blueprint variables
 │   │       ├── tscn_writer.py                # Direct Godot .tscn scene generation
 │   │       ├── ue2g_common.py                # Shared conversion math
+│   │       ├── material_shader.py            # Vertex-painted materials to Godot shaders
 │   │       ├── ue2g_diagnose.py              # Post-export self-audit module
 │   │       ├── init_unreal.py                # Startup script (registers Window menu entry)
 │   │       └── unreal_to_godot_gui.py        # Thread-safe Tkinter GUI
@@ -197,8 +199,8 @@ This tool migrates **art**, not **behavior**. Typical environment, prop, and mod
 
 ### Transfers Approximately (Expect Some Manual Work)
 
-- **Materials (parameter-level, not shader-graph-level):** Albedo, normal, and packed maps along with scalar, vector, and tiling parameters rebuild as Godot `StandardMaterial3D` / `ORMMaterial3D`. On UE 5.8 the exporter reads the material graph to see which texture channel drives which output; older engines go by parameter and texture names. Custom shader graph logic—HLSL nodes, hue shifts, blends of several textures, world-position offset, vertex-paint blending, or parallax—has no automatic equivalent and must be reauthored.
-- **Lighting (calibrated, not identical):** Unreal (lumens/candela/lux, Lumen) and Godot (energy, SDFGI/VoxelGI) use fundamentally different lighting and tonemapping pipelines. Intensities are normalized to candelas via Unreal's unit conversion and anchored so a default Unreal light imports as a default Godot light. Use **Light energy scale** for a quick global pass; raw Unreal intensities, units, and normalized candela values are also stored in the JSON if you want to build a custom mapping.
+- **Materials (parameter-level, not shader-graph-level):** Albedo, normal, and packed maps along with scalar, vector, and tiling parameters rebuild as Godot `StandardMaterial3D` / `ORMMaterial3D`. On UE 5.8 the exporter reads the material graph to see which texture channel drives which output; older engines go by parameter and texture names. Custom shader graph logic—HLSL nodes, hue shifts, blends of several textures, world-position offset, or parallax—has no automatic equivalent and must be reauthored. The exception is materials that blend layers by vertex paint (puddles, moss): on UE 5.8 their graph is translated to a Godot shader and the paint comes along, as long as the graph uses common nodes and Unreal's Geometry Script plugin is enabled. Paint on instanced meshes and Blueprint prefabs is not carried.
+- **Lighting (calibrated, not identical):** Unreal (lumens/candela/lux, Lumen) and Godot (energy, SDFGI/VoxelGI) use fundamentally different lighting and tonemapping pipelines. Local lights are matched photometrically in candelas. The sky is captured from the open level on export, and levels that use Lumen import with SDFGI and screen-space reflections on (Forward+ only; turn them off on the `WorldEnvironment` if they cost too much). Use **Light energy scale** for a quick global pass; raw Unreal intensities, units, and normalized candela values are also stored in the JSON if you want to build a custom mapping.
 - **Nanite meshes:** Godot has no Nanite equivalent. Nanite assets export as standard triangle meshes at their available LODs; packs authored assuming Nanite polygon budgets may need decimation.
 
 ### Out of Scope by Design

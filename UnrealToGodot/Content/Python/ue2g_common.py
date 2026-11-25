@@ -317,6 +317,7 @@ _TRACED_OUTPUTS = (
     ("roughness", "MP_ROUGHNESS"), ("metallic", "MP_METALLIC"),
     ("ao", "MP_AMBIENT_OCCLUSION"),
     ("opacity", "MP_OPACITY"), ("opacity_mask", "MP_OPACITY_MASK"),
+    ("emissive", "MP_EMISSIVE_COLOR"),
 )
 
 # Inputs that shape or place a value instead of carrying it.
@@ -484,6 +485,7 @@ def trace_material_graph(material):
         "scalars":   {"roughness"/"metallic": its multiplier parameter names}
         "constants": {"roughness"/"metallic": value wired in as a constant}
         "alpha":     vector parameters that reach opacity, or None
+        "emissive":  vector and scalar parameters that reach emission, or None
     """
     mel = getattr(unreal, "MaterialEditingLibrary", None)
     props = getattr(unreal, "MaterialProperty", None)
@@ -516,8 +518,10 @@ def _sample_source(graph, sample):
 def _trace_base(base, mel, props):
     graph = MaterialGraph(base)
     result = {"samples": {}, "tints": None, "not_tints": set(), "hidden": False,
-              "scalars": {}, "constants": {}, "alpha": None}
+              "scalars": {}, "constants": {}, "alpha": None, "emissive": None}
     alpha = set()
+    emissive = set()
+    albedo_sources = set()
     has_base_color = False
     for role, prop_name in _TRACED_OUTPUTS:
         prop = getattr(props, prop_name)
@@ -532,6 +536,11 @@ def _trace_base(base, mel, props):
             param, texture = _sample_source(graph, sample)
             sources[(param or safe_get_name(texture), pin)] = {
                 "node": sample, "param": param, "texture": texture, "output": pin}
+        if role == "albedo":
+            albedo_sources = set(sources)
+        elif role == "emissive" and len(sources) > 1:
+            # A glow mask times the color map: the mask decides where it glows.
+            sources = {k: v for k, v in sources.items() if k not in albedo_sources}
         if len(sources) == 1:
             source = next(iter(sources.values()))
             if source["texture"] is not None and source["output"] is not None:
@@ -559,8 +568,15 @@ def _trace_base(base, mel, props):
                     node, "ScalarParameter", set()) if single else set()
         elif role in ("opacity", "opacity_mask"):
             alpha |= graph.names_under(node, "VectorParameter")
+        elif role == "emissive":
+            if graph.names_under(node, "MaterialFunctionCall"):
+                emissive = None
+            else:
+                emissive |= (graph.names_under(node, "VectorParameter")
+                             | graph.names_under(node, "ScalarParameter"))
     if has_base_color:
         result["alpha"] = alpha
+        result["emissive"] = emissive
     return result
 
 

@@ -298,6 +298,7 @@ layout = {
         # match Godot's BaseMaterial3D.TextureChannel (0=RED, 1=GREEN, 2=BLUE).
         "SM_Textured": {
             "path": "/Game/SM_Textured", "export_name": "SM_Textured", "collision": None,
+            "paint_points": [0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             "materials": [{
                 "slot_index": 0,
                 "material_name": "MI_Test",
@@ -407,6 +408,30 @@ layout = {
                             "godot_relative_transform": t(0, 5, 0),
                             "godot_world_transform": t(0, 5, 0),
                             "material_overrides": []}],
+        },
+        {
+            # Vertex paint on one placement of a shared mesh, read by a translated shader.
+            # The points are in another order than the glTF's vertices.
+            "name": "Painted_1", "class": "StaticMeshActor",
+            "godot_transform": t(0, 5, 9),
+            "components": [{"name": "SM0", "mesh_key": "SM_Textured", "mesh_name": "SM_Textured",
+                            "godot_relative_transform": t(0, 5, 9),
+                            "godot_world_transform": t(0, 5, 9),
+                            "vertex_paint": base64.b64encode(
+                                bytes([0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255])).decode(),
+                            "material_overrides": [{
+                                "slot_index": 0, "material_name": "MI_Puddle",
+                                "material_path": "/Game/MI_Puddle",
+                                "parameters": {"shader": {
+                                    "code": "shader_type spatial;\n"
+                                            "uniform sampler2D tex_0 : source_color;\n"
+                                            "uniform sampler2D tex_1 : hint_normal;\n"
+                                            "void fragment() {\n"
+                                            "\tALBEDO = texture(tex_0, UV).rgb * COLOR.g;\n"
+                                            "\tNORMAL_MAP = texture(tex_1, UV).rgb;\n}\n",
+                                    "tex_0": "TX_Test_ALB", "tex_1": "TX_Test_NRM",
+                                    "texture_paths": {"tex_0": "/Game/TX_Test_ALB",
+                                                      "tex_1": "/Game/TX_Test_NRM"}}}}]}],
         },
         {
             # Skeletal mesh with companion SK_Dummy_physics.json.

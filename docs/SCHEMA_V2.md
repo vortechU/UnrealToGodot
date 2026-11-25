@@ -33,7 +33,8 @@ read and write exactly these structures.
   - `textures/` — exported PNG textures
   - `terrain/`  — heightmaps / weightmaps
 
-- All colors are linear `[r, g, b]` or `[r, g, b, a]` floats 0..1.
+- All colors are linear `[r, g, b]` or `[r, g, b, a]` floats 0..1. Godot's color properties
+  are sRGB, so consumers convert.
 - Fields that could not be read are `null` (Python `None`), never missing keys where the
   schema shows them. Consumers must still be defensive (`dict.get`).
 
@@ -54,6 +55,7 @@ read and write exactly these structures.
     "height_fog": { ... } | null,
     "sky_light": { ... } | null,
     "has_sky_atmosphere": false,
+    "gi_method": "lumen" | "other" | null,   // the project's; a volume's settings override it
     "decals": [ ... ],
     "reflection_probes": [ ... ],
     "cameras": [ ... ],
@@ -111,9 +113,26 @@ for v1 files).
     "emissive_color": [r, g, b] | null,
     "emissive_texture": null,
     "emissive_energy": 1.0,
-    "texture_paths": { "albedo_texture": "/Game/Pack/T_Foo.T_Foo", ... }
+    "texture_paths": { "albedo_texture": "/Game/Pack/T_Foo.T_Foo", ... },
+    "shader": {                        // optional; only materials that read vertex colors
+        "code": "shader_type spatial;\n...",
+        "tex_0": "T_Foo", ...,         // one slot per sampler uniform, same rules as above
+        "texture_paths": { "tex_0": "/Game/Pack/T_Foo.T_Foo", ... }
+    }
 }
 ```
+
+**`shader`** is the material's graph written out as a Godot spatial shader, for materials
+that blend layers by vertex paint (puddles, moss, broken plaster): `StandardMaterial3D` holds
+one layer. Opaque and masked materials only. Parallax is dropped and so is world position
+offset; a graph using any node `material_shader.py` does not know gets a warning and no
+`shader`. Godot: a `ShaderMaterial`, which replaces every other parameter. The paint itself is
+`paint_points` on the mesh entry and `vertex_paint` on each component: the positions of the
+painted vertices in glTF mesh space (`[x, y, z, x, ...]`, meters), and one RGBA byte quadruple
+per point, base64. Importers match vertices by position (LODs take the closest point) and copy
+the mesh per distinct paint. Read through Unreal's Geometry Script plugin; without it, a
+warning and no paint. Not carried by instanced meshes, Blueprint prefabs or `tscn_writer.py`
+(which writes no materials).
 
 **Normal map green-channel convention (`texture_metadata`).** Unreal exports raw
 source art, which uses DirectX tangent-space normals (`-Y` green) unless the
@@ -182,6 +201,7 @@ only ever resolves as a sibling of the `.gltf`. Verified: Godot loads a
                       "visible": true, "cast_shadow": true,
                       "collision_enabled": true, "max_draw_distance_m": null,
                       "spline_mesh": { ... },      // optional; present on SplineMeshComponent
+                      "vertex_paint": "<base64>",  // optional; colors for the mesh's paint_points
                       "tags": [...] } ]
 }
 ```
@@ -234,9 +254,10 @@ not caught by this scan — it stays in `sky_light`.
     "intensity_units": "lux" | "lumens" | "candela" | "ev" | "nits" | "unitless" | "unknown",
                                          // "lux" is always used for directional lights,
                                          // which have no IntensityUnits property in UE
-    "intensity_candelas": 8.0 | null,    // local lights only; null for directional (lux)
+    "intensity_candelas": 8.0 | null,    // local lights only; null for directional (lux);
+                                         // spots include their IES profile's peak
     "inverse_squared_falloff": true,     // when false UE ignores intensity_units
-    "godot_energy": 1.0,                 // pre-converted suggested Godot light_energy
+    "godot_energy": 2.546,               // pre-converted suggested Godot light_energy
     "temperature_kelvin": 6500.0 | null,
     "use_temperature": false,
     "cast_shadows": true,
@@ -259,7 +280,8 @@ not caught by this scan — it stays in `sky_light`.
 
 Godot mapping: directional→`DirectionalLight3D`; point→`OmniLight3D`
 (`omni_range = attenuation_radius_m`); spot→`SpotLight3D` (`spot_range`,
-`spot_angle = clamp(outer_cone_angle_deg, 0.5, 89.9)`); rect→`OmniLight3D`
+`spot_angle = clamp(outer_cone_angle_deg, 0.5, 89.9)`, `spot_angle_attenuation` chosen so
+both engines reach half brightness at the same angle); rect→`OmniLight3D`
 approximation with `set_meta("unreal_rect_light", true)` and
 `set_meta("unreal_rect_size_m", Vector2)`. `light_energy = godot_energy *
 options.light_energy_scale`. If `use_temperature`, apply Kelvin→RGB approximation
@@ -291,13 +313,13 @@ Two steps, both documented at length in export_environment.py.
 When `inverse_squared_falloff` is false, Unreal ignores `intensity_units`
 entirely and the unitless curve is used regardless of what the field says.
 
-**2. Anchor to Godot's defaults**: local lights `candelas / 8.0`, directional
-`lux / 10.0`. Both are the engines' shipped defaults — UE places local lights at
-5000 unitless (exactly 8 cd) and directional lights at 10 lux, Godot places every
-`Light3D` at `light_energy` 1.0 — so an untouched Unreal light imports as an
-untouched Godot light. It is a calibration, not a photometric identity: two
-tonemapped renderers cannot be matched by a constant, which is why
-`options.light_energy_scale` exists. Raw `intensity` + `intensity_units` +
+**2. Map to `light_energy`**: local lights `candelas / π`, directional `lux / 10.0`.
+Local lights match photometrically: with `omni_attenuation` / `spot_attenuation` at 2
+(set when `inverse_squared_falloff` is true) Godot's falloff is Unreal's, window
+included, and a white surface reflects `cd/π` per square metre in Unreal and
+`light_energy` in Godot. Directional lights keep the engine defaults as an anchor (UE
+10 lux, Godot energy 1.0), since sunlit Unreal levels usually rely on auto exposure
+that Godot does not apply; `options.light_energy_scale` is there to tune both. Raw `intensity` + `intensity_units` +
 `intensity_candelas` are all stored so any of it can be re-derived.
 
 Before this normalisation each unit had its own unrelated divisor, so the *same*
@@ -321,13 +343,17 @@ unit the artist happened to author it in — and since UE's default unit is
         "ao_radius": 200.0 | null,          // UE cm
         "exposure_bias": 1.0 | null,
         "exposure_method": "auto" | "manual" | null,
-        "exposure_min_brightness": 3.0 | null,   // UE cd/m^2 adaptation range
+        "exposure_min_brightness": 3.0 | null,   // cd/m^2 adaptation range; EV100
+                                                 // values are converted on export
         "exposure_max_brightness": 3.0 | null,   // min == max means LOCKED exposure
         "exposure_speed_up": 3.0 | null,
         "exposure_speed_down": 3.0 | null,
         "white_temp": 6500.0 | null,
         "saturation": [r,g,b,a] | null,
         "contrast": [r,g,b,a] | null,
+        "gain": [r,g,b,a] | null,
+        "gamma": [r,g,b,a] | null,
+        "gi_method": "lumen" | "other" | null,
         "vignette_intensity": 0.4 | null
     }
 }
@@ -356,6 +382,9 @@ drives towards. In the range case sensitivity is **inverse** to target luminance
 so UE's *min* brightness becomes Godot's *max* sensitivity (`100.0 / L`), and
 `speed_up` is scaled by `0.5/3.0` to line the two engines' defaults up.
 
+All three are multiplied by the grade: average `gain`, times `0.18^(1/gamma - 1)`. Godot
+has no gain or gamma, so gamma is matched at middle grey.
+
 Both consumers -- `addons/unreal_importer/import_environment.gd` and
 `tscn_writer.py::_build_environment` -- must produce the same environment from the
 same layout. They are separate implementations, so the constants are pinned
@@ -368,14 +397,33 @@ against each other by `tests/test_tscn_writer.py`.
     "fog_density": 0.02, "fog_height_falloff": 0.2,
     "color": [r, g, b], "start_distance_m": 0.0
 },
-"sky_light": { "intensity": 1.0, "color": [r, g, b] },
+"sky_light": {
+    "intensity": 1.0, "color": [r, g, b],
+    "gradient": { "top": [r, g, b], "horizon": [r, g, b], "ground": [r, g, b],
+                  "falloff": 10.0 } | null
+},
 "has_sky_atmosphere": true
 ```
 
-Godot: fog → `Environment.fog_enabled` (+density heuristic `fog_density * 0.5`, so UE's
-default 0.02 lands on Godot's default 0.01);
-sky_light/atmosphere → `Environment.background = Sky` with `ProceduralSkyMaterial` and
-ambient light energy.
+Godot: fog → `Environment.fog_enabled`, `fog_density * 0.1 * (ln 2)^2`, measured
+against UE 5.8: Unreal's line integral and its base-2 exponential each add a ln 2. With a
+`start_distance_m` it becomes depth fog from that distance on: curve 0.5, `fog_density`
+`1 - e^-1.2`, ending where Unreal's optical depth is 1.2. A color above 1 becomes
+`fog_light_energy` times a normalised `fog_light_color`. `fog_height_density` is left at 0:
+Godot's height fog ignores distance. The falloff sets `fog_sky_affect` to
+`1 - e^(-2 * fog_density / fog_height_falloff)` instead, or 0 when the sky has a `gradient`.
+
+`gradient` is the sky the sky light sees, rendered on export (five 90 degree captures past
+its sky distance threshold, height fog included) and reduced to two colors in cd/m²,
+`mix(top, horizon, (1 - elevation / 90°)^falloff)`; `ground` is the sky light's lower hemisphere. It is null where nothing can be rendered, such
+as a commandlet. Godot: a sky shader (identical in both consumers) that shows the gradient
+and lights the scene with `gradient * intensity * color`. Without a gradient:
+`ProceduralSkyMaterial` and ambient light energy.
+
+`gi_method` `"lumen"` turns on `Environment.sdfgi_enabled` and screen-space reflections
+(`ssr_fade_out` 0: the default stops a few meters out, Lumen does not), and sets reflection probes to
+`AMBIENT_DISABLED`: in Unreal a capture only reflects, while Godot's probes would replace
+SDFGI's ambient. SDFGI needs the Forward+ renderer.
 
 ## decals
 
@@ -734,9 +782,10 @@ empty structures on failure.
 
 | Module | Entry point | Returns |
 |---|---|---|
-| `export_environment.py` | `collect_environment(all_actors, collected_textures)` | `{"lights": [...], "post_process": [...], "height_fog": ... , "sky_light": ..., "has_sky_atmosphere": bool, "decals": [...]}` |
+| `export_environment.py` | `collect_environment(all_actors, collected_textures)` | `{"lights": [...], "post_process": [...], "height_fog": ... , "sky_light": ..., "has_sky_atmosphere": bool, "gi_method": ..., "decals": [...]}` |
 | `export_landscape.py` | `collect_landscapes(all_actors, json_dir)` | `[landscape, ...]` (writes files under `json_dir/terrain/`) |
 | `export_foliage.py` | `collect_foliage(all_actors, register_mesh)` | `[foliage_entry, ...]`; `register_mesh(static_mesh) -> mesh_key` registers the mesh in the library and returns its key. Also exposes `get_instanced_component_classes()` so the orchestrator can exclude ISM components from regular actor export. |
+| `material_shader.py` | `build_shader(material, blend_mode, two_sided, clip_value)` / `extract_vertex_paint(component)` | `(shader dict or None, [textures])` / `(paint_points, vertex_paint)` or `None` |
 | `export_gameplay.py` | `collect_navigation(all_actors)` / `extract_actor_metadata(actor)` / `extract_component_tags(component)` | navigation dict or `None` / `{"tags": [...], "properties": {...}}` / `[str]` |
 | `tscn_writer.py` | `write_tscn(layout_data, output_path, res_paths, options)` | `True/False`; `res_paths = {"models": "res://models/", "textures": "res://textures/", "terrain": "res://terrain/"}` |
 
@@ -755,7 +804,7 @@ func apply(data: Dictionary, root: Node, scene_owner: Node, options: Dictionary)
 
 | Module | Consumes |
 |---|---|
-| `import_environment.gd` | `lights`, `post_process`, `height_fog`, `sky_light`, `has_sky_atmosphere`, `decals` |
+| `import_environment.gd` | `lights`, `post_process`, `height_fog`, `sky_light`, `has_sky_atmosphere`, `gi_method`, `decals` |
 | `import_terrain.gd` | `landscapes` |
 | `import_foliage.gd` | `foliage` (+ `meshes` for material data) |
 | `import_gameplay.gd` | `navigation` + per-actor metadata helper `apply_actor_metadata(node, actor_data, options)` |

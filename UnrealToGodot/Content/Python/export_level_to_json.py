@@ -17,6 +17,7 @@ import math
 import re
 import unreal
 
+import material_shader
 import ue2g_common
 
 # Default vertical FOV (75 deg, Godot Camera3D default) used to convert Unreal's
@@ -611,6 +612,7 @@ def apply_texture_export_names(slots, name_by_path):
     """
     if not isinstance(slots, dict):
         return
+    apply_texture_export_names(slots.get("shader"), name_by_path)
     paths = slots.get("texture_paths")
     if not isinstance(paths, dict):
         return
@@ -717,7 +719,7 @@ def extract_material_parameters(material, collected_textures=None):
         parameters["texture_paths"][slot] = _path_of(tex)
 
     def _assign_traced(tex, roles):
-        for role in ("albedo", "normal"):
+        for role in ("albedo", "normal", "emissive"):
             if role in roles and parameters[role + "_texture"] is None:
                 _set_slot(role + "_texture", tex)
         channels = {r: _OUTPUT_CHANNELS.get(roles[r], 0)
@@ -749,7 +751,7 @@ def extract_material_parameters(material, collected_textures=None):
             if not packed:
                 return
         elif role and role.replace("_texture", "") in ("albedo", "normal", "roughness",
-                                                       "metallic") \
+                                                       "metallic", "emissive") \
                 and role.replace("_texture", "") in traced:
             return
         if role == "packed":
@@ -770,11 +772,18 @@ def extract_material_parameters(material, collected_textures=None):
             parameters[key] = value
         assigned.add(key)
 
+    def _reaches_emission(name):
+        """False only when the graph says this parameter never reaches emission."""
+        return (not trace or trace["emissive"] is None
+                or str(name) in trace["emissive"])
+
     def _scalar_key(name):
         """classify_scalar_parameter, corrected by what the graph says."""
         key = classify_scalar_parameter(name)
         if not trace:
             return key
+        if key == "emissive_energy" and not _reaches_emission(name):
+            return None
         for role, names in trace["scalars"].items():
             if str(name) in names:
                 return role
@@ -786,6 +795,9 @@ def extract_material_parameters(material, collected_textures=None):
     def _assign_vector(name, value):
         key = classify_vector_parameter(name)
         if key is None or key in assigned:
+            return
+        # A Blueprint often sets one on every slot, used by the material or not.
+        if key == "emissive_color" and not _reaches_emission(name):
             return
         if key == "albedo_color" and trace and trace["tints"] is not None \
                 and str(name) not in trace["tints"] \
@@ -989,6 +1001,15 @@ def extract_material_parameters(material, collected_textures=None):
             parameters["emissive_energy"] = round(
                 max(0.0, float(parameters.get("emissive_energy", 1.0))) * peak, 4
             )
+
+    # Layers blended by vertex paint: the slots above hold the base layer only.
+    shader, textures = material_shader.build_shader(
+        material, parameters["blend_mode"], parameters["two_sided"],
+        parameters["opacity_mask_clip_value"])
+    if shader:
+        parameters["shader"] = shader
+        if collected_textures is not None:
+            collected_textures.update(textures)
 
     return parameters
 
@@ -1534,6 +1555,7 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
 
     # 4. Extract transforms and static mesh details
     ue2g_common.clear_material_trace_cache()
+    material_shader.clear_cache()
     all_actors = actor_subsystem.get_all_level_actors()
     exported_actors = []
     total_components_count = 0
@@ -1709,6 +1731,16 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
                     spline_data = extract_spline_mesh_params(comp)
                     if spline_data is not None:
                         comp_data["spline_mesh"] = spline_data
+                    paint = None
+                    try:
+                        paint = (material_shader.extract_vertex_paint(comp)
+                                 if isinstance(comp, unreal.StaticMeshComponent) else None)
+                    except Exception as e:
+                        unreal.log_warning(f"Could not read the vertex paint of {actor_label}: {str(e)}")
+                    if paint:
+                        # One placement after another paints the same vertices.
+                        mesh_library[mesh_key].setdefault("paint_points", paint[0])
+                        comp_data["vertex_paint"] = paint[1]
 
                     if comp_tags:
                         comp_data["tags"] = comp_tags
@@ -1751,6 +1783,7 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
         environment_data["height_fog"] = None
         environment_data["sky_light"] = None
         environment_data["has_sky_atmosphere"] = False
+        environment_data["gi_method"] = None
     if not opts.get("decals"):
         environment_data["decals"] = []
     if not opts.get("reflection_probes", True):
@@ -1810,6 +1843,7 @@ def export_level_to_json(save_path=None, show_dialogs=True, godot_project_dir=No
         "height_fog": environment_data.get("height_fog"),
         "sky_light": environment_data.get("sky_light"),
         "has_sky_atmosphere": environment_data.get("has_sky_atmosphere", False),
+        "gi_method": environment_data.get("gi_method"),
         "decals": environment_data.get("decals", []),
         "reflection_probes": environment_data.get("reflection_probes", []),
         "cameras": environment_data.get("cameras", []),
